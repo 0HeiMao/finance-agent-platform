@@ -29,6 +29,7 @@ const NAV_GROUPS = [
   ] },
   { label: '数据管理', items: [
     { name: '数据导入', path: '/financial/import' },
+    { name: '明细更正', path: '/financial/transactions', note: '更正就地改并留审计；冲销不删原行而是加一条负数行' },
   ] },
   { label: '报告导出', items: [
     { name: 'Word 报告', path: '/reports' },

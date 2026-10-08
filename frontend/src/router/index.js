@@ -3,6 +3,7 @@ import Dashboard from '../views/Dashboard.vue'
 import Login from '../views/Login.vue'
 import Register from '../views/Register.vue'
 import FinancialImport from '../views/FinancialImport.vue'
+import FinancialTransactions from '../views/FinancialTransactions.vue'
 import FinancialAnalysis from '../views/FinancialAnalysis.vue'
 import AlertsList from '../views/AlertsList.vue'
 import AlertDetail from '../views/AlertDetail.vue'
@@ -26,6 +27,7 @@ const router = createRouter({ history: createWebHistory(), routes: [
   { path: '/dashboard', component: Dashboard, meta: { requiresAuth: true } },
   { path: '/agent', component: AgentWorkbench, meta: { requiresAuth: true } },
   { path: '/financial/import', component: FinancialImport, meta: { requiresAuth: true } },
+  { path: '/financial/transactions', component: FinancialTransactions, meta: { requiresAuth: true } },
   { path: '/analysis/alerts', component: AlertsList, meta: { requiresAuth: true } },
   // /analysis/:type 必须放在具体的 /analysis/alerts 之后，否则 "alerts" 会被当成 type 捕获
   { path: '/analysis/:type(revenue|cost|profit|summary)', component: FinancialAnalysis, props: true, meta: { requiresAuth: true } },

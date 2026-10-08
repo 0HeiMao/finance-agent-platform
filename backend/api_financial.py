@@ -1,19 +1,21 @@
 from uuid import uuid4
 from pathlib import Path
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 import io
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from hashlib import sha256
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
-from backend import audit
+from backend import audit, transactions
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import FinancialTransaction, User
 from backend.api_analysis import calculate
+from backend.scope import resolve_requested_scope, scope_of, scope_payload
 
 router = APIRouter(prefix="/api/v1/financial", tags=["financial"])
 
@@ -127,6 +129,113 @@ async def import_excel(request: Request, file: UploadFile = File(...),
 def download_template(_: User = Depends(current_user)):
     content = "交易日期,科目编码,科目名称,部门,摘要,收入金额,成本金额,费用金额,现金流入,现金流出\n2026-09-01,6001,示例收入,销售部,示例交易,10000,0,0,10000,0\n"
     return StreamingResponse(io.BytesIO(content.encode('utf-8-sig')), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=financial_import_template.csv"})
+
+
+# ---------------------------------------------------------------------------
+# 明细的单行更正与冲销（⑨）
+#
+# 导入是唯一的写入入口，过去导错一个数字只能整批撤销再重导。这里给两条窄路径：
+# 就地更正（留 before/after）与「负数冲销行 + 原行标记」（不删原行）。
+# 两条路径都由 backend/transactions.py 实现，接口这层只负责权限口径与错误码映射。
+# ---------------------------------------------------------------------------
+
+class TransactionCorrection(BaseModel):
+    """更正请求：只允许出现这些字段（批次号是文件哈希，改了就追溯不上）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_date: str | None = Field(default=None, max_length=40)
+    account_code: str | None = Field(default=None, max_length=50)
+    account_name: str | None = Field(default=None, max_length=200)
+    department: str | None = Field(default=None, max_length=100)
+    description: str | None = Field(default=None, max_length=2000)
+    revenue_amount: str | float | int | None = None
+    cost_amount: str | float | int | None = None
+    expense_amount: str | float | int | None = None
+    cash_in_amount: str | float | int | None = None
+    cash_out_amount: str | float | int | None = None
+
+
+class ReversalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+def _row_error(exc: Exception) -> HTTPException:
+    """把 transactions 里的领域异常映射成状态码（消息直接给使用者看）。"""
+    if isinstance(exc, transactions.RowNotFound):
+        return HTTPException(404, str(exc))
+    if isinstance(exc, transactions.RowForbidden):
+        return HTTPException(403, str(exc))
+    if isinstance(exc, transactions.AlreadyReversed):
+        return HTTPException(409, str(exc))
+    return HTTPException(422, str(exc))
+
+
+@router.get("/transactions")
+def list_transactions(period: str | None = Query(None, max_length=20),
+                      department: str | None = Query(None, max_length=100),
+                      batch: str | None = Query(None, max_length=64),
+                      query: str | None = Query(None, max_length=100),
+                      limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+                      db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """明细分页（更正/冲销的入口）。只列当前账号范围内的行。
+
+    `department` 参数在这里是「口径」而不是普通筛选：不受限账号可以用它按部门查看，
+    多部门账号用它收窄，越界一律 403——这样「看得到的范围」与「改得动的范围」是同一套规则。
+    """
+    scope, error = resolve_requested_scope(user, department)
+    if error:
+        raise HTTPException(403, error)
+    rows, total = transactions.list_rows(db, scope, period=period, batch=batch, query=query,
+                                         limit=limit, offset=offset)
+    return {"data": [transactions.serialize(row) for row in rows], "total": total,
+            "offset": offset, "limit": limit, "periods": transactions.periods_in(db, scope),
+            "scope": scope_payload(scope, requested=department or None)}
+
+
+@router.get("/transactions/{row_id}")
+def get_transaction(row_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """单行详情：前端「更正」弹窗按它填初值，避免用列表里的旧数据覆盖别人的改动。"""
+    scope = scope_of(user)
+    row = db.get(FinancialTransaction, row_id)
+    if row is None:
+        raise HTTPException(404, "明细不存在")
+    if not transactions.row_in_scope(scope, row):
+        raise HTTPException(403, "该明细不在当前账号的数据范围内")
+    return {"data": transactions.serialize(row), "scope": scope_payload(scope)}
+
+
+@router.patch("/transactions/{row_id}")
+def correct_transaction(row_id: int, payload: TransactionCorrection, request: Request,
+                        db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """更正一行明细，并立刻重算受影响的期间（含季/年落库），审计里留 before/after。"""
+    scope = scope_of(user)
+    try:
+        result = transactions.correct(db, row_id, payload.model_dump(exclude_unset=True),
+                                      scope=scope, actor=user.username, request=request)
+    except (transactions.CorrectionError, transactions.RowNotFound, transactions.RowForbidden,
+            transactions.AlreadyReversed) as exc:
+        db.rollback()
+        raise _row_error(exc) from exc
+    return {**result, "scope": scope_payload(scope)}
+
+
+@router.post("/transactions/{row_id}/reverse")
+def reverse_transaction(row_id: int, request: Request, payload: ReversalRequest | None = None,
+                        db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """冲销一行：新增一条金额取负的冲销行，原行只做标记（不删行，账要能对上）。"""
+    scope = scope_of(user)
+    reason = (payload.reason if payload else None)
+    try:
+        result = transactions.reverse(db, row_id, scope=scope, actor=user.username,
+                                      reason=reason, request=request)
+    except (transactions.CorrectionError, transactions.RowNotFound, transactions.RowForbidden,
+            transactions.AlreadyReversed) as exc:
+        db.rollback()
+        raise _row_error(exc) from exc
+    return {**result, "scope": scope_payload(scope)}
 
 @router.post("/preview")
 async def preview_excel(file: UploadFile = File(...), _: User = Depends(current_user)):

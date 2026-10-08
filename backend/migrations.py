@@ -44,6 +44,11 @@ COLUMNS: list[tuple[str, str, str]] = [
     # 多部门账号：权威值是一个 JSON 数组，老的单值列 department 作为回落与展示保留。
     # 已有账号不需要数据迁移：departments 为 NULL 时 scope_of() 会自动回落到 department。
     ("users", "departments", "JSONB"),
+    # 单行更正/冲销：冲销用「负数冲销行 + 原行标记」而不是删行，所以要记清冲的是哪一行。
+    ("financial_transactions", "reversal_of_id", "INTEGER"),
+    ("financial_transactions", "reversed_at", "TIMESTAMP WITH TIME ZONE"),
+    ("financial_transactions", "reversed_by", "VARCHAR(100)"),
+    ("financial_transactions", "corrections", "INTEGER DEFAULT 0 NOT NULL"),
 ]
 
 # 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。

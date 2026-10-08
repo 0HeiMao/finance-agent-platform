@@ -37,7 +37,7 @@ EDGE_CANDIDATES = (
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
 )
 DEFAULT_PAGES = ("/dashboard", "/analysis/revenue", "/analysis/cost", "/analysis/alerts", "/reports",
-                 "/reports/pptx", "/settings", "/financial/import", "/agent",
+                 "/reports/pptx", "/settings", "/financial/import", "/financial/transactions", "/agent",
                  "/admin", "/admin/users", "/admin/batches", "/admin/knowledge", "/admin/departments",
                  "/admin/alert-rules", "/admin/audit")
 # 表格在窄屏本来就要横向滚动，它自己带 .table-wrap 容器，不算页面溢出。

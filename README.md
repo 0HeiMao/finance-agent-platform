@@ -8,7 +8,8 @@
 智能财务分析平台/
 ├── backend/              # FastAPI 应用：按域拆成 api_*.py（看板在 api_dashboard.py，不再内联在 main.py）
 │   ├── periods.py        # 月/季/年口径的纯函数（构成月份、规范写法、同粒度上一期）
-│   └── rollups.py        # 季度/年度合计的落库与读取（financial_rollups 表）
+│   ├── rollups.py        # 季度/年度合计的落库与读取（financial_rollups 表）
+│   └── transactions.py   # 明细单行更正/冲销（不删原行；改完重算受影响期间）
 ├── frontend/             # Vue 3 + Vite 界面；纯函数在 src/utils/，`npm test` 零依赖单测
 │   ├── Dockerfile        # 前端镜像：node 里构建 → nginx 托管静态包并反代 /api
 │   └── nginx.conf        # SPA 回退、/api 反代、SSE 关缓冲
@@ -84,7 +85,7 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下六个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下七个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -94,19 +95,21 @@
 | `verify_financial_agent.py` | Agent 证据层（财务数据 + 知识库 + 重排）、`/rag/*` 鉴权、上传去重、上传落盘目录、真实 SSE 端到端 28 项断言 |
 | `verify_alert_rule_tiers.py` | 预警规则分档 30 项：建期间档/部门+期间档、409 同范围、422 两维都空与非法指标/期间、400 删默认规则、真库重算里三条口径各得三种结果（期间档盖默认、部门+期间档盖期间档）、对照期间不受影响、删掉后回落默认，跑完复原期间并清掉临时规则 |
 | `verify_rollups.py` | 季度/年度落库 24 项：重算季/年落库、季度 `source=stored` 且等于三个月月指标之和、比率按合计重算、年度缺月如实点名、受限账号只读本部门落库行、管理端 403、三种 422、重算某月后季度幂等、没落库的期间现算兜底且不写库、审计留痕 |
+| `verify_transactions.py` | 明细更正/冲销 45 项：按期间/部门口径/关键字/批次筛选与分页、受限账号 403（别的部门与全公司行都不许动）、更正后重算并让指标跟着变、改日期同时重算新旧期间、冲销新增负数行且原行保留（同期间合计为 0）、重复冲销与更正已冲销行 409、非法金额/带时区日期/未知字段 422、审计留 `transaction.update`/`transaction.reverse`，跑完撤销整批探针数据并删临时账号 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
-还有四个不查数据、只查界面的脚本：
+还有五个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
-| `check_pages.py` | 16 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/`。每页先轮询到真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，`--ready-timeout` 默认 20s）再判定：**空白页面天然没有横向溢出，固定 sleep 会把它变成假 PASS**——dev server 冷启动要现编译 chunk，第一次访问 `/admin` 就截到过 5.8KB 的全白图 |
+| `check_pages.py` | 17 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/`。每页先轮询到真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，`--ready-timeout` 默认 20s）再判定：**空白页面天然没有横向溢出，固定 sleep 会把它变成假 PASS**——dev server 冷启动要现编译 chunk，第一次访问 `/admin` 就截到过 5.8KB 的全白图 |
 | `ui_scope_smoke.py` | 在真浏览器里点「查看口径」下拉与导出按钮：下拉选项、切口径后 KPI 与提示条变化、导出文件名/行数。**只有它能发现「控件在但点了没反应」** —— 写它时当场抓到 `ScopeSwitcher` 的 `onMounted` 竞态 |
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
+| `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
 
-四个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
+五个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
 ### 一键自检
 
@@ -249,7 +252,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **138** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样）、
+`tests/` 下三个文件共 **142** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -273,7 +276,12 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 `snapshot()["paths"]` 给出每条的 count/p95/max，且 500 与 200 分开计数→**出口配额**：
 导出打满返回 429 + `Retry-After`、三个导出接口共用一本账（换路径绕不过）、
 问答是另一本账（导出打满仍能问答）、`/rag/search`+`/rag/answer`+`/ai/*` 共用问答配额、
-配额表对未登记名字显式报错且 `reset` 后回到配置默认值）。
+配额表对未登记名字显式报错且 `reset` 后回到配置默认值）→**明细更正与冲销**：列表按期间/部门口径/关键字/批次
+筛选且 `total` 是筛选后总数、受限账号读不到别的部门的行、全公司行只有不受限账号能改、
+更正就地改字段并让该期间指标跟着变（`recalculated`）、改日期会同时重算新期间并清掉腾空的旧期间
+（`cleared`）、冲销不删原行而是新增一条金额取负的冲销行（两行合计为 0、`import_batch` 沿用原批次，
+否则撤销批次只收得回一半）、重复冲销/冲销冲销行/更正已冲销行都是 409、非法金额与带时区的日期 422、
+未知字段被 `extra="forbid"` 在业务代码之前拦下、改完留 `transaction.update`/`transaction.reverse` 审计）。
 异步用例用 **anyio** 插件（`pytestmark = pytest.mark.anyio`，用例 id 显示 `[asyncio]`），
 不依赖未安装的 pytest-asyncio；数据库不可用时自动 `pytest.skip` 而不是失败。
 测试自身在外层事务里跑，结束整体回滚，不会污染库里数据。
@@ -359,6 +367,7 @@ docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesk
 | `/analysis/alerts` | 预警监控（期间/状态筛选、各状态计数、确认/误报/已处理/备注、服务端分页） | `GET /analysis/alerts/all`、`GET /analysis/alerts/stats`、`PATCH /analysis/alerts/{id}` |
 | `/alerts/:id` | 预警明细（最多 200 行） | `GET /analysis/alerts/{id}/transactions` |
 | `/financial/import` | 数据导入（两步：预览校验 → 确认导入） | 财务导入接口 |
+| `/financial/transactions` | 明细更正（按期间/部门口径/关键字/批次筛选、翻页、行内更正、两步冲销） | `GET /financial/transactions`、`PATCH /financial/transactions/{id}`、`POST /financial/transactions/{id}/reverse` |
 | `/reports` | 报告导出（Word `.docx` + Markdown 月报，可复制 / 打印导出 PDF / 下载 `.md`） | `GET /reports/docx`、`GET /reports/monthly?period=YYYY-MM` |
 | `/reports/pptx` | PPT 报告（先看逐页大纲，再下载 `.pptx`） | `GET /reports/pptx/outline`、`GET /reports/pptx` |
 | `/settings` | System 设置（我的部门 + 运行态与配置体检） | `GET /system/status`、`PATCH /auth/me` |
@@ -820,6 +829,33 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
 - 真机验证 `scripts/verify_rollups.py`（24 项）：重算后季度 `source=stored` 且金额等于三个月的月指标
   之和、比率按合计重算、年度 `complete=false` 且点名 5 个月、受限账号只读到本部门落库行、读管理端 403、
   三个 422、重算某个月后季度数字幂等不变、没落库的期间现算兜底且读路径不写库、审计留痕。
+
+## 明细更正与冲销
+
+数据导入之后总会有「这一行录错了」和「这笔不该算」两种需求，它们要的语义完全不同，所以分成两条路径：
+
+- **更正**（`PATCH /financial/transactions/{id}`）就地改字段：`account_code` / `account_name` / `department` /
+  `description` / `transaction_date` / 五个金额列。金额一律以**字符串**收，用导入同一套规则解析
+  （支持千分位与中文逗号、`|v| < 1e16`），前端不做金额运算——否则「前端认为合法、后端拒绝」的双份实现
+  迟早分家。改一次 `corrections` 计数 +1，旧值写进审计 `transaction.update` 的 `detail.before`。
+- **冲销**（`POST /financial/transactions/{id}/reverse`）**不删原行**：新增一条金额取负的冲销行
+  （`reversal_of_id` 指向原行、`description` 前缀「冲销：」），原行只标记 `reversed_at` / `reversed_by`。
+  删行会让「冲销前后的明细条数」与原始凭证对不上，也解释不了这笔钱去哪了；负数行参与合计、数学上自然
+  抵消，指标仍然等于真实账。冲销行的 `import_batch` **沿用原批次**——批次号是文件内容哈希，造假批次会让
+  「撤销批次」只收回一半的行。
+- **改完必须重算**：更正会重算 `{旧期间, 新期间}`，冲销重算该期间；某期已经没有剩余明细时连同
+  `FinancialMetric` / `FinancialAlert` / 季年落库一起清掉（`recalculated` / `cleared` 在响应里如实返回，
+  页面上渲进提示）。`backend/transactions.py::recalculate_periods` 与「撤销导入批次」共用同一段逻辑，
+  避免两套重算慢慢长歪。
+- **坑：`SessionLocal` 是 `autoflush=False`**。数「这一期还剩几行」之前必须先 `db.flush()`，否则刚 `add` /
+  刚改的字段还在内存里，会把有数据的一期当成空的清掉；`correct()` 里的 `old_period` 也必须在改字段**之前**
+  读出来，否则改日期后新旧期间相同，腾空的那个期间永远不会被清理（这两个都是用例当场抓出来的）。
+- **权限与口径**：`department` 为空的行属于「全公司口径」，只有不受限账号能改；受限账号读列表时只看到
+  自己部门（`scope_transactions`），拿别人的行 id 去改是 **403**（`该明细不在当前账号的数据范围内`）。
+  `GET /financial/transactions?department=X` 里的 `department` 是**口径切换**，越界同样 403。
+- **这一页不做删除**：要整批收回请到「导入批次」撤销批次（它会连指标、预警、季年落库一起重算）。
+- 真机验证 `scripts/verify_transactions.py`（45 项）与界面冒烟 `scripts/ui_transactions_smoke.py`（20 项，
+  在真浏览器里点「筛选 → 更正 → 冲销」并核对表格变化）。
 
 ## 检索与 Agent 口径
 

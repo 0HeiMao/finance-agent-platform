@@ -139,12 +139,49 @@ Retry-After: 42
 | GET | `/financial/template` | 下载导入模板（utf-8-sig CSV） |
 | POST | `/financial/preview` | 只校验不落库，返回 `{filename,total,columns,missing,errors,error_count,valid,preview}` |
 | POST | `/financial/import` | 真正入库；文件后缀限 xlsx/xls/csv，大小 ≤10MB；同一 sha256 批次重复提交返回 409 |
+| GET | `/financial/transactions` | 明细列表。参数 `period`、`department`（**口径**，越界 403）、`batch`、`query`（科目/编码/摘要模糊）、`limit`（1..200）、`offset`；返回 `{data,total,offset,limit,periods,scope}`，`total` 是筛选后总数 |
+| GET | `/financial/transactions/{id}` | 单行明细（含 `reversed`/`reversal_of_id`/`is_reversal`/`corrections`） |
+| PATCH | `/financial/transactions/{id}` | 就地更正：`transaction_date`/`account_code`/`account_name`/`department`/`description` + 五个金额列（字符串或数字，按导入同一套规则解析）。未知字段由 `extra="forbid"` 拦成 422 |
+| POST | `/financial/transactions/{id}/reverse` | 冲销：新增金额取负的冲销行并标记原行（body 可选 `{"reason": "…"}`，≤500 字）。不删原行 |
 
 `.xls` 依赖服务端安装 `xlrd`；没装时返回 **400** 并说明两条出路，而不是 500 或一句「无法解析」：
 
 ```json
 {"detail":"旧版 .xls 需要服务端安装 xlrd（pip install \"xlrd>=2.0.1\"）；也可以先在 Excel 里「另存为 .xlsx」再导入"}
 ```
+
+### 明细更正与冲销
+
+两条路径的语义刻意不同：**更正就地改字段**（旧值进审计），**冲销不删原行**而是新增一条金额取负的行，
+两行合计为 0、指标仍然等于真实账。删行会让明细条数与原始凭证对不上，也解释不了这笔钱去哪了。
+
+更正响应（冲销同形，`original` + `reversal`）：
+
+```json
+{
+  "data": {"id": 537600, "period": "2097-03", "revenue_amount": 777.77, "corrections": 1, "reversed": false},
+  "recalculated": ["2097-03"],
+  "cleared": []
+}
+```
+
+- `recalculated`：被重算的期间（改日期会同时重算新旧两个期间）。
+- `cleared`：已无剩余明细、连指标与季年落库一起清掉的期间。
+- 金额一律按导入同一套规则解析（千分位、中文逗号、`|v| < 1e16`）；前端不做金额运算。
+
+错误码：
+
+| 状态 | 触发条件 | detail |
+| --- | --- | --- |
+| 401 | 未登录 | — |
+| 403 | 行的部门不在账号范围内，或受限账号要动 `department` 为空的全公司行 | `该明细不在当前账号的数据范围内` |
+| 403 | `?department=` 切到账号范围外的口径 | `当前账号的数据范围是「部门 018」，不能查看「部门 097」` |
+| 404 | 行不存在 | `没有找到这条明细` |
+| 409 | 重复冲销 / 冲销一条冲销行 / 更正已冲销的行 | `这一行已经冲销过` / `这一行本身就是冲销行，不能再次冲销` / `这一行已经冲销，冲销后再改原行会让账更乱；请先撤销冲销（如果有）或重新导入` |
+| 422 | 未知字段（`extra="forbid"`）、空改动、值与原值一致、非法金额、带时区的日期 | `不认识的字段：nope` / `没有要更正的字段` / `改动的值与原值一致，没有需要保存的内容` / `收入金额不是有效金额：abc` / `交易日期不能包含时区` |
+
+审计：`transaction.update`（`detail` 带 `before`/`after`/`periods`）与 `transaction.reverse`
+（`detail` 带 `period`/`reversal_id`/`reason`/`revenue_amount`）。这一页没有删除接口——要整批收回请撤销导入批次。
 
 ## 指标与预警
 

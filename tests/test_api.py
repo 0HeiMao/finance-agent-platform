@@ -2704,3 +2704,190 @@ async def test_admin_rollup_rebuild_is_audited_and_admin_only(anon_client, api_a
     assert entry is not None, rows
     assert ROLLUP_QUARTER in entry["detail"]["periods"]
     assert entry["detail"]["grains"] == ["quarter", "year"]
+
+
+# ------------------------------------------- 明细单行更正与冲销（⑨）
+
+TX_PERIOD = "2097-12"
+
+
+def _seed_row(db, *, period: str = TX_PERIOD, day: int = 1, department: str | None = "部门-097",
+              revenue: str = "100.00", expense: str = "20.00", batch: str = "pytest-seed",
+              account_name: str = "测试科目", description: str = "pytest 种子"):
+    """插一行明细，返回 ORM 行（id 已 flush，可用于拼 URL）。"""
+    from backend.models import FinancialTransaction
+
+    row = FinancialTransaction(
+        transaction_date=datetime.fromisoformat(f"{period}-{day:02d}"), account_name=account_name,
+        account_code="6001", department=department, description=description,
+        revenue_amount=Decimal(revenue),
+        cost_amount=Decimal("0"), expense_amount=Decimal(expense), cash_in_amount=Decimal("0"),
+        cash_out_amount=Decimal("0"), import_batch=batch,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _company_metric(db, period: str = TX_PERIOD):
+    return db.scalars(select(FinancialMetric).where(
+        FinancialMetric.period == period, FinancialMetric.department.is_(None))).one()
+
+
+async def test_transaction_list_is_scoped_and_filtered(anon_client, api_app, auth_headers, db_session):
+    mine = _seed_row(db_session, day=2, department="部门-097")
+    other = _seed_row(db_session, day=3, department="部门-999", revenue="500.00")
+    company = _seed_row(db_session, day=4, department=None, revenue="700.00")
+
+    listing = await anon_client.get(f"/api/v1/financial/transactions?period={TX_PERIOD}",
+                                    headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["total"] == 3
+    assert {item["id"] for item in body["data"]} == {mine.id, other.id, company.id}
+    assert TX_PERIOD in body["periods"]
+    assert body["scope"]["unrestricted"] is True
+    # 列表里的行要能看出「冲没冲销、改过几次」，前端据此决定按钮状态
+    assert all({"reversed", "is_reversal", "corrections", "period"} <= set(item) for item in body["data"])
+
+    paged = await anon_client.get(f"/api/v1/financial/transactions?query=测试科目&limit=2&offset=0",
+                                  headers=auth_headers)
+    assert paged.json()["total"] == 3, "total 是筛选后的总数，不是当前页长度"
+    assert len(paged.json()["data"]) == 2
+    assert (await anon_client.get("/api/v1/financial/transactions?batch=不存在的批次",
+                                  headers=auth_headers)).json()["total"] == 0
+
+    headers, scoped = await _scoped_headers(anon_client, api_app, "部门-097")
+    try:
+        scoped_list = await scoped.get(f"/api/v1/financial/transactions?period={TX_PERIOD}", headers=headers)
+        assert scoped_list.status_code == 200, scoped_list.text
+        assert [item["id"] for item in scoped_list.json()["data"]] == [mine.id]
+        # 越界口径要 403，而不是安静地返回空列表（空列表会被读成「这个部门没数据」）
+        forbidden = await scoped.get("/api/v1/financial/transactions?department=部门-999", headers=headers)
+        assert forbidden.status_code == 403
+        assert "不能查看" in forbidden.json()["detail"]
+        # 单行详情同样守范围
+        assert (await scoped.get(f"/api/v1/financial/transactions/{other.id}",
+                                 headers=headers)).status_code == 403
+        detail = await scoped.get(f"/api/v1/financial/transactions/{mine.id}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["data"]["id"] == mine.id
+    finally:
+        await scoped.aclose()
+
+    assert (await anon_client.get("/api/v1/financial/transactions/99999999",
+                                  headers=auth_headers)).status_code == 404
+
+
+async def test_transaction_correction_updates_metric_and_is_audited(anon_client, auth_headers, db_session):
+    row = _seed_row(db_session, day=5, department="部门-097", revenue="100.00", expense="20.00")
+    await anon_client.post(f"/api/v1/analysis/calculate?period={TX_PERIOD}", headers=auth_headers)
+    assert Decimal(str(_company_metric(db_session).revenue_amount)) == Decimal("100.00")
+
+    fixed = await anon_client.patch(f"/api/v1/financial/transactions/{row.id}", headers=auth_headers,
+                                    json={"revenue_amount": "250.50", "description": "更正后"})
+    assert fixed.status_code == 200, fixed.text
+    body = fixed.json()
+    assert body["data"]["revenue_amount"] == 250.5
+    assert body["data"]["description"] == "更正后"
+    assert body["data"]["corrections"] == 1
+    assert body["recalculated"] == [TX_PERIOD], "改完必须重算这一期，否则看板还是旧指标"
+
+    db_session.expire_all()
+    assert Decimal(str(_company_metric(db_session).revenue_amount)) == Decimal("250.50")
+
+    rows = await _audit(anon_client, auth_headers, action="transaction.update", limit=10)
+    entry = _find(rows["data"], "transaction.update", str(row.id))
+    assert entry is not None, rows
+    assert entry["detail"]["before"]["revenue_amount"] == "100.00"
+    assert entry["detail"]["after"]["revenue_amount"] == "250.50"
+    assert entry["detail"]["periods"] == [TX_PERIOD]
+
+    # 把日期改到另一期：原期间没数据了要被清掉，新期间要算出来
+    moved = await anon_client.patch(f"/api/v1/financial/transactions/{row.id}", headers=auth_headers,
+                                   json={"transaction_date": "2097-11-03"})
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["data"]["period"] == "2097-11"
+    assert sorted(moved.json()["recalculated"]) == ["2097-11"]
+    assert moved.json()["cleared"] == [TX_PERIOD]
+
+
+async def test_transaction_reversal_adds_negative_row_and_keeps_original(anon_client, auth_headers, db_session):
+    row = _seed_row(db_session, day=6, department="部门-097", revenue="100.00", expense="20.00")
+    await anon_client.post(f"/api/v1/analysis/calculate?period={TX_PERIOD}", headers=auth_headers)
+    me = (await anon_client.get("/api/v1/auth/me", headers=auth_headers)).json()
+
+    response = await anon_client.post(f"/api/v1/financial/transactions/{row.id}/reverse",
+                                      headers=auth_headers, json={"reason": "凭证重复"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    original, reversal = body["original"], body["reversal"]
+    assert original["id"] == row.id and original["reversed"] is True
+    assert original["reversed_by"] == me["username"]
+    assert reversal["revenue_amount"] == -100.0
+    assert reversal["expense_amount"] == -20.0
+    assert reversal["is_reversal"] is True and reversal["reversal_of_id"] == row.id
+    assert reversal["import_batch"] == original["import_batch"], "冲销行要留在原批次里，否则撤销批次只收回一半"
+    assert reversal["description"] == "冲销：pytest 种子"
+
+    # 原行没有被删掉：两行都在，合计抵消成 0
+    listing = await anon_client.get(f"/api/v1/financial/transactions?period={TX_PERIOD}&query=pytest 种子",
+                                   headers=auth_headers)
+    assert listing.json()["total"] == 2
+    db_session.expire_all()
+    assert Decimal(str(_company_metric(db_session).revenue_amount)) == Decimal("0.00")
+
+    # 冲销过的行不能改；冲销行不能再冲销；同一行不能重复冲销
+    blocked = await anon_client.patch(f"/api/v1/financial/transactions/{row.id}", headers=auth_headers,
+                                      json={"revenue_amount": "1.00"})
+    assert blocked.status_code == 409, blocked.text
+    assert "已经冲销" in blocked.json()["detail"]
+    assert (await anon_client.post(f"/api/v1/financial/transactions/{row.id}/reverse",
+                                   headers=auth_headers, json={})).status_code == 409
+    again = await anon_client.post(f"/api/v1/financial/transactions/{reversal['id']}/reverse",
+                                   headers=auth_headers, json={})
+    assert again.status_code == 409, again.text
+    assert "冲销行" in again.json()["detail"]
+
+    rows = await _audit(anon_client, auth_headers, action="transaction.reverse", limit=10)
+    entries = [item for item in rows["data"] if item["target_id"] == str(row.id)]
+    assert len(entries) == 1, f"一次冲销只该留一条审计：{entries}"
+    assert entries[0]["detail"]["reversal_id"] == reversal["id"]
+    assert entries[0]["detail"]["reason"] == "凭证重复"
+
+
+async def test_transaction_correction_permissions_and_validation(anon_client, api_app, auth_headers, db_session):
+    mine = _seed_row(db_session, day=7, department="部门-097")
+    other = _seed_row(db_session, day=8, department="部门-999")
+    company = _seed_row(db_session, day=9, department=None)
+
+    headers, scoped = await _scoped_headers(anon_client, api_app, "部门-097")
+    try:
+        # 别人的部门、以及「没有部门的全公司行」，受限账号都不能动（与读路径同一套口径）
+        assert (await scoped.patch(f"/api/v1/financial/transactions/{other.id}", headers=headers,
+                                   json={"revenue_amount": "1.00"})).status_code == 403
+        assert (await scoped.patch(f"/api/v1/financial/transactions/{company.id}", headers=headers,
+                                   json={"revenue_amount": "1.00"})).status_code == 403
+        assert (await scoped.post(f"/api/v1/financial/transactions/{company.id}/reverse",
+                                  headers=headers, json={})).status_code == 403
+        allowed = await scoped.patch(f"/api/v1/financial/transactions/{mine.id}", headers=headers,
+                                     json={"revenue_amount": "150.00"})
+        assert allowed.status_code == 200, allowed.text
+    finally:
+        await scoped.aclose()
+
+    # 校验类错误一律 422，且消息是给人看的
+    base = f"/api/v1/financial/transactions/{company.id}"
+    bad_amount = await anon_client.patch(base, headers=auth_headers, json={"revenue_amount": "abc"})
+    assert bad_amount.status_code == 422 and "有效金额" in bad_amount.json()["detail"]
+    assert (await anon_client.patch(base, headers=auth_headers, json={})).status_code == 422
+    assert (await anon_client.patch(base, headers=auth_headers,
+                                    json={"transaction_date": "不是日期"})).status_code == 422
+    # 批次号是文件哈希，不允许通过更正改掉
+    assert (await anon_client.patch(base, headers=auth_headers,
+                                    json={"import_batch": "pytest-other"})).status_code == 422
+    same = await anon_client.patch(f"/api/v1/financial/transactions/{mine.id}", headers=auth_headers,
+                                  json={"revenue_amount": "150.00"})
+    assert same.status_code == 422 and "一致" in same.json()["detail"]
+    assert (await anon_client.patch("/api/v1/financial/transactions/99999999", headers=auth_headers,
+                                    json={"revenue_amount": "1.00"})).status_code == 404

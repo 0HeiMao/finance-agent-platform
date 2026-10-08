@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import DateTime, Numeric, String, Text, func
+from sqlalchemy import DateTime, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.db import Base
@@ -36,6 +36,13 @@ class FinancialTransaction(Base):
     cash_out_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
     import_batch: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # 单行更正/冲销。冲销**不删原行**：新增一条金额取负的冲销行（合计自然抵消），原行记
+    # reversed_at/reversed_by 并在界面上显示成「已冲销」——删掉原行的话，冲销前后看板上的
+    # 明细条数与凭证都对不上，也没法解释「这笔钱去哪了」。corrections 是这一行被改过几次。
+    reversal_of_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reversed_by: Mapped[str | None] = mapped_column(String(100))
+    corrections: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 class FinancialMetric(Base):
     __tablename__ = "financial_metrics"

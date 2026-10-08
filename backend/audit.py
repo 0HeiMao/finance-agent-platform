@@ -38,6 +38,8 @@ ACTIONS: dict[str, str] = {
     "user.delete": "删除账号",
     "data.import": "导入财务数据",
     "data.export": "导出数据",
+    "transaction.update": "更正明细",
+    "transaction.reverse": "冲销明细",
     "metrics.calculate": "重算指标",
     "rollups.rebuild": "重算季/年落库",
     "batch.revert": "撤销导入批次",
