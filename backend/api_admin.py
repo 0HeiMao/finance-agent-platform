@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit, batch_ops, jobs, rollups
+from backend import audit, batch_ops, jobs, lockout, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.api_analysis import calculate
 from backend.auth import current_user, revoke_tokens, token_version_of
@@ -336,6 +336,12 @@ def list_users(
                 "created_at": user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else None,
                 # 会话版本号：0 表示「从没退出/被踢过」，>0 表示历史上有过多少次作废动作
                 "token_version": token_version_of(user),
+                # 登录失败锁定（backend/lockout.py）：失败次数与「还剩几秒解锁」都要给出去，
+                # 否则管理员只看到「登不上」，分不清是密码错还是被锁了。
+                "failed_attempts": int(user.failed_attempts or 0),
+                "locked_until": (user.locked_until.astimezone(timezone.utc).isoformat()
+                                 if user.locked_until else None),
+                "locked": bool(lockout.locked_for(user)),
                 "is_self": user.id == me.id,
             }
             for user in users
@@ -421,6 +427,27 @@ def force_logout_user(user_id: int, request: Request, db: Session = Depends(get_
                          "effect": "该账号此前签发的所有令牌立即失效"}, request=request)
     db.commit()
     return {"id": target.id, "username": target.username, "token_version": version, "logged_out": True}
+
+
+@router.post("/users/{user_id}/unlock")
+def unlock_user(user_id: int, request: Request, db: Session = Depends(get_db),
+                me: User = Depends(admin_user)):
+    """提前解除某个账号的登录失败锁定（把失败次数与锁定时间清掉）。
+
+    什么时候需要它：账号被爆破打锁了，本人即使记得密码也只能等到 `locked_until` 才登得上
+    （`max_seconds` 默认封顶 900 秒，但值班的人往往希望立刻放行）。**不需要**它是「重置密码」
+    ——这里一个字都不碰口令与会话版本：解锁不等于让人换密码，也不等于踢人下线。
+    """
+    target = _target_user(db, user_id, me)
+    info = lockout.unlock(target)
+    db.add(target)
+    audit.record(db, me, "user.unlock", target_type="user", target_id=target.id,
+                 detail={"username": target.username, "cleared_attempts": info["cleared_attempts"],
+                         "was_locked_for": info["was_locked_for"],
+                         "effect": "该账号可以立刻再次尝试登录"}, request=request)
+    db.commit()
+    return {"id": target.id, "username": target.username, "failed_attempts": 0,
+            "locked_until": None, "locked": False, "cleared_attempts": info["cleared_attempts"]}
 
 
 @router.get("/departments")

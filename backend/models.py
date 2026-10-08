@@ -24,6 +24,12 @@ class User(Base):
     # 加一 = 该账号**所有**已发出的令牌立刻失效（退出登录、管理员强制下线都走它）。
     # 默认 0 而不是 1：上线前签发的令牌没有 `ver` 声明，按 0 处理，所以升级不会把所有人踢下线。
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # 登录失败锁定（账号级、落库而不是放内存）：`failed_attempts` 是「静默期内连续失败了几次」，
+    # `locked_until` 是锁到什么时候，`last_failed_at` 用来判断上一串失败是不是已经过去太久、
+    # 该从 0 重新数。退避公式与阈值见 backend/lockout.py；只有登录、成功登录、管理员解锁会改它们。
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class FinancialTransaction(Base):

@@ -133,6 +133,25 @@ async function forceLogout(user) {
   }
 }
 
+async function unlock(user) {
+  busyId.value = user.id
+  error.value = ''
+  notice.value = ''
+  try {
+    const response = await apiFetch(`/admin/users/${user.id}/unlock`, { method: 'POST' })
+    const updated = await response.json()
+    user.failed_attempts = updated.failed_attempts
+    user.locked = updated.locked
+    user.locked_until = updated.locked_until
+    notice.value = `已解锁 ${updated.username}：清掉 ${updated.cleared_attempts} 次连续失败记录，现在可以立刻重新登录。`
+      + '（解锁不等于重置口令，也不会让已登录的会话掉线）'
+  } catch (e) {
+    error.value = `解锁失败：${e.message}`
+  } finally {
+    busyId.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -198,7 +217,7 @@ onMounted(load)
             <table>
               <thead>
                 <tr>
-                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>会话</th><th>创建时间</th><th>操作</th>
+                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>登录</th><th>会话</th><th>创建时间</th><th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -223,6 +242,15 @@ onMounted(load)
                     >
                   </td>
                   <td>
+                    <span v-if="user.locked" class="level high" :title="user.locked_until || ''">
+                      已锁定
+                    </span>
+                    <span v-else-if="user.failed_attempts" class="level medium">
+                      失败 {{ user.failed_attempts }} 次
+                    </span>
+                    <span v-else class="muted">正常</span>
+                  </td>
+                  <td>
                     <span v-if="!user.token_version" class="muted">未作废过</span>
                     <span v-else>已作废 {{ user.token_version }} 次</span>
                   </td>
@@ -234,6 +262,12 @@ onMounted(load)
                         :disabled="user.is_self || busyId === user.id"
                         @click="saveDepartment(user)"
                       >保存部门</button>
+                      <button
+                        class="btn"
+                        :disabled="!user.locked || busyId === user.id"
+                        title="提前解除登录失败锁定：清掉失败次数与锁定时间（不重置口令，也不会让已登录的会话掉线）"
+                        @click="unlock(user)"
+                      >解锁</button>
                       <button
                         class="btn"
                         :disabled="user.is_self || busyId === user.id"
@@ -259,6 +293,8 @@ onMounted(load)
             删除账号只移除登录凭据；财务数据按导入批次存在，需要清理请到「导入批次」撤销对应批次。
             令牌是无状态的（签出去就收不回来），所以「强制下线」的做法是把该账号的<strong>会话版本 +1</strong>：
             它此前签发的每一份令牌立刻作废，对方下次请求就掉线，重新登录即可继续用——数据不会被改动。
+            登录连续失败会按次数指数退避地锁定账号（默认第 5 次起 60 秒、之后翻倍、最多 900 秒），
+            锁着的时候<strong>口令正确也进不来</strong>：「登录」列显示「已锁定」，点「解锁」可以立刻放行。
           </p>
         </section>
       </template>

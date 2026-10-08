@@ -12,7 +12,7 @@ from backend.models import User
 from backend.scope import departments_of
 from backend.config import get_settings
 from backend.ratelimit import get_login_limiter
-from backend import audit
+from backend import audit, lockout, passwords
 
 SECRET_KEY = get_settings().auth_secret_key
 ALGORITHM = "HS256"
@@ -61,8 +61,25 @@ def revoke_tokens(user: User) -> int:
 
 @router.post("/register")
 def register(payload: Credentials, request: Request, db: Session = Depends(get_db)):
+    """注册。弱口令在这里就被挡住（400），不留半条记录——见 `backend/passwords.py`。
+
+    为什么强度检查放在接口而不是 `Credentials` 模型上：登录用的是同一个模型，模型的
+    `min_length=6` 必须继续放宽（老账号、演示账号的密码都比新规则短），所以「新密码要多强」
+    只能是注册/改密码这条路径上的事，否则老用户第二天就登不进来了。
+
+    为什么先查重名再查强度：老账号（含演示账号）的密码本来就弱，重新注册同一个名字时
+    应该还是「用户名已存在」这句老话——否则一次性脚本/种子脚本会突然收到「密码太弱」，
+    让人以为账号建错了。重名 409 本来就已经暴露用户名，顺序上不多漏任何东西。
+    """
     if db.scalar(select(User).where(User.username == payload.username)):
         raise HTTPException(409, "用户名已存在")
+    issues = passwords.problems(payload.password, payload.username)
+    if issues:
+        # 被拒的注册也要留痕：连续被拒是这个接口上最明显的攻击/试探信号。
+        audit.record(db, payload.username, "user.register_rejected", target_type="user",
+                     detail={"username": payload.username, "problems": issues},
+                     request=request, commit=True)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "；".join(issues))
     user = User(username=payload.username, password_hash=pwd_context.hash(payload.password))
     db.add(user)
     try:
@@ -78,7 +95,12 @@ def register(payload: Credentials, request: Request, db: Session = Depends(get_d
 
 @router.post("/login")
 def login(payload: Credentials, request: Request, db: Session = Depends(get_db)):
-    """登录。失败尝试按「用户名 + 来源」限速，超限返回 429（见 backend/ratelimit.py）。"""
+    """登录。两道闸：按「用户名 + 来源」的进程内限流（见 backend/ratelimit.py），
+    以及按**账号**的失败锁定 + 指数退避（落库，见 backend/lockout.py）。
+
+    两道闸的 429 文案**故意一模一样**，且不回显「账号存在但被锁了」：否则拿 401 与 429 的
+    差别就能问出哪些账号存在，这个接口就顺带成了用户名枚举接口。
+    """
     limiter = get_login_limiter()
     client = request.client.host if request.client else "unknown"
     key = f"{payload.username.strip().lower()}@{client}"
@@ -93,15 +115,49 @@ def login(payload: Credentials, request: Request, db: Session = Depends(get_db))
             headers={"Retry-After": str(decision.retry_after)},
         )
     user = db.scalar(select(User).where(User.username == payload.username))
-    if not user or not verify_password(payload.password, user.password_hash):
-        audit.record(db, payload.username, "user.login_failed", target_type="user",
-                     detail={"username": payload.username, "reason": "用户名或密码错误"},
+    remaining = lockout.locked_for(user) if user else 0
+    if remaining:
+        audit.record(db, user, "user.login_locked", target_type="user", target_id=user.id,
+                     detail={"reason": "账号已锁定（连续失败次数超阈值）", "retry_after": remaining,
+                             "failed_attempts": int(user.failed_attempts or 0)},
                      request=request, commit=True)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"登录尝试过于频繁，请在 {remaining} 秒后重试",
+            headers={"Retry-After": str(remaining)},
+        )
+    if not user or not verify_password(payload.password, user.password_hash):
+        detail: dict = {"username": payload.username, "reason": "用户名或密码错误"}
+        locked = 0
+        if user:
+            info = lockout.register_failure(user)
+            locked = info["locked_for"]
+            db.add(user)
+            detail |= {"failed_attempts": info["failed_attempts"], "lock_seconds": locked,
+                       "locked_until": info["locked_until"]}
+            if locked:
+                detail["reason"] = (f"用户名或密码错误（连续失败 {info['failed_attempts']} 次，"
+                                    f"账号锁定 {locked} 秒）")
+        audit.record(db, user or payload.username, "user.login_failed", target_type="user",
+                     target_id=user.id if user else None, detail=detail,
+                     request=request, commit=True)
+        if locked:
+            # 与 login_failed 分开记一条：一条是「这次密码错了」，一条是「这个账号被锁上了」，
+            # 值班的人按动作筛就能直接看到「哪些账号正在被爆破」。
+            audit.record(db, user, "user.login_locked", target_type="user", target_id=user.id,
+                         detail={"reason": "连续失败达到阈值，账号锁定", "lock_seconds": locked,
+                                 "failed_attempts": detail["failed_attempts"],
+                                 "locked_until": detail["locked_until"]},
+                         request=request, commit=True)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
     limiter.reset(key)
+    cleared = lockout.clear_failures(user)
+    db.add(user)
     audit.record(db, user, "user.login", target_type="user", target_id=user.id,
-                 detail={"username": user.username}, request=request, commit=True)
-    return {"access_token": token_for(user), "token_type": "bearer", "token_version": token_version_of(user)}
+                 detail={"username": user.username, "failures_cleared": cleared},
+                 request=request, commit=True)
+    return {"access_token": token_for(user), "token_type": "bearer",
+            "token_version": token_version_of(user), "failures_cleared": cleared}
 
 def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     """解析令牌并核对**会话版本号**：版本不一致就当作令牌已作废。

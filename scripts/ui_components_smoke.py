@@ -15,6 +15,10 @@
 5. System 设置的「登录与令牌」卡片与用户管理的「会话」列 / 「强制下线」按钮（③）：只核对渲染与
    禁用态，**不点「退出登录」**——那会真的把 demo 账号的会话版本推进一版。点它的是
    `scripts/verify_session_revocation.py`，用的是临时账号。
+6. 用户管理的「登录」列 / 「解锁」按钮（④）与注册页的口令规则提示：同样只核对渲染与禁用态
+   （演示库现在没人被锁，所以「解锁」应当是禁用的），**不点解锁、不真的注册**——点它的是
+   `scripts/verify_login_lockout.py`，用的是临时账号；注册页是 `guestOnly`，这里先清掉本地令牌
+   再打开，只填一个 6 位口令点「注册」，核对前端把它拦下并提示「至少 10 位」。
 
 用法（要求后端 8000 与前端 dev server 5173 在跑）：
 
@@ -453,6 +457,82 @@ async def drive(ws_url: str, base: str, api: str, keep_open: bool) -> int:
         mine = [row for row in sessions if row["is_self"]]
         check("用户管理：自己那行的「强制下线」是禁用的（管理接口也拒绝自踢，这是第二道）",
               bool(mine) and all(row["kick_disabled"] for row in mine), f"自己那行：{mine[:1]}")
+
+        # ---------- 账号锁定与口令强度：用户管理的「登录」列 / 解锁、注册页提示（④） ----------
+        # ④ 的机制在服务端（失败次数落库、指数退避、锁着时口令正确也 429），真机行为由
+        # scripts/verify_login_lockout.py 用临时账号验。这里只看界面面：列在不在、状态文案对不对、
+        # 「解锁」在没被锁的时候必须是禁用的——**不点它**，演示库现在没人被锁，点了只会白跑一趟接口。
+        logins_head = await wait_js(cdp, session, """
+        (() => {
+          const ths = [...document.querySelectorAll('table thead th')].map(x => x.textContent.trim());
+          return ths.includes('登录') ? JSON.stringify(ths) : '';
+        })()
+        """, timeout=20)
+        check("用户管理：表头有「登录」列", bool(logins_head), f"表头：{logins_head}")
+        lock_rows = await evaluate(cdp, session, """
+        (() => {
+          const rows = [...document.querySelectorAll('table tbody tr')];
+          return JSON.stringify(rows.map(tr => {
+            const cell = [...tr.querySelectorAll('td')]
+              .find(td => /^(正常|失败 \\d+ 次|已锁定)$/.test(td.innerText.trim()));
+            const unlock = [...tr.querySelectorAll('button')]
+              .find(b => b.textContent.trim() === '解锁');
+            return { state: cell ? cell.innerText.trim() : '',
+                     unlock: !!unlock, unlock_disabled: unlock ? unlock.disabled : null,
+                     is_self: /当前账号/.test(tr.innerText) };
+          }));
+        })()
+        """)
+        lock_rows = json.loads(lock_rows) if lock_rows else []
+        check("用户管理：每行都有登录状态（正常 / 失败 N 次 / 已锁定）",
+              bool(lock_rows) and all(row["state"] for row in lock_rows),
+              f"{len(lock_rows)} 行，示例：{[row['state'] for row in lock_rows[:3]]}")
+        check("用户管理：每行都有「解锁」按钮",
+              bool(lock_rows) and all(row["unlock"] for row in lock_rows), f"{len(lock_rows)} 行")
+        unlocked_now = [row for row in lock_rows if row["state"] != "已锁定"]
+        check("用户管理：演示库当前没有账号被锁，所以「解锁」全部处于禁用态",
+              bool(unlocked_now) and all(row["unlock_disabled"] for row in unlocked_now),
+              f"未锁定 {len(unlocked_now)} 行，其中可点的：{[r['state'] for r in unlocked_now if not r['unlock_disabled']]}")
+
+        # 注册页是 guestOnly：同一个标签页里先清掉本地令牌，否则会被守卫送回 /dashboard
+        await evaluate(cdp, session, "localStorage.removeItem('access_token'); true")
+        await cdp.navigate(f"{base}/register", session)
+        await wait_ready(cdp, session)
+        hint = await wait_js(cdp, session, """
+        (() => {
+          const p = document.querySelector('.auth-hint');
+          const pw = [...document.querySelectorAll('input')].find(i => i.type === 'password');
+          if (!p || !pw) return '';
+          return JSON.stringify({ hint: p.innerText.replace(/\\s+/g, ' ').trim(), placeholder: pw.placeholder });
+        })()
+        """, timeout=20)
+        hint = json.loads(hint) if hint else {}
+        check("注册页：口令规则提示写到「至少 10 位」并点名弱口令（服务端仍是权威）",
+              "至少 10 位" in hint.get("hint", "") and "弱口令" in hint.get("hint", ""),
+              f"提示：{hint.get('hint', '')[:120]}")
+        check("注册页：密码框 placeholder 也写明「至少 10 位」",
+              hint.get("placeholder") == "至少 10 位", f"placeholder={hint.get('placeholder')!r}")
+        await evaluate(cdp, session, """
+        (() => {
+          const inputs = [...document.querySelectorAll('input')];
+          const set = (el, v) => { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); };
+          set(inputs[0], 'uihint_probe');
+          const pw = inputs.find(i => i.type === 'password');
+          set(pw, 'short1');
+          const btn = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === '注册');
+          if (btn) btn.click();
+          return true;
+        })()
+        """)
+        client_error = await wait_js(cdp, session, """
+        (() => {
+          const err = [...document.querySelectorAll('.el-form-item__error')]
+            .map(x => x.textContent.trim()).find(t => t.includes('至少 10 位'));
+          return err || '';
+        })()
+        """, timeout=10)
+        check("注册页：6 位口令点「注册」被前端当场拦下（提示「至少 10 位」，连请求都不发）",
+              bool(client_error), f"表单错误：{client_error!r}")
 
     return finish(keep_open)
 

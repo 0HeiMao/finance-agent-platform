@@ -121,7 +121,8 @@ async def main() -> int:
     ok = True
     try:
         seed(SessionLocal(), marker)
-        username, password = marker, "agent_password_2026"
+        # 口令要过 backend/passwords.py 的强度规则（含 "password" 的会被拒）。
+        username, password = marker, "agent-verify-2026"
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(base_url="http://testserver", transport=transport, trust_env=False) as client:
             r = await client.post("/api/v1/auth/register", json={"username": username, "password": password})

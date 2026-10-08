@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -557,3 +557,103 @@ def test_lock_periods_takes_sorted_unique_locks_in_one_batch():
     empty = FakeSession()
     assert locks.lock_periods(empty, []) == []
     assert empty.keys == [], "没有期间就不该发语句"
+
+
+# ------------------------------------------------- 登录失败锁定与弱口令（④）
+
+def _lockout_settings(**overrides):
+    """一套确定的锁定参数：单测不该被 `.env` 里的阈值改动带跑。"""
+    base = dict(login_lockout_threshold=5, login_lockout_base_seconds=60,
+                login_lockout_max_seconds=900, login_failure_ttl_seconds=900,
+                password_min_length=10)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_lockout_backoff_doubles_from_threshold_and_caps(monkeypatch):
+    """退避序列：阈值以下不锁，到阈值从 60s 起翻倍，封顶 900s。"""
+    from backend import lockout
+
+    monkeypatch.setattr(lockout, "get_settings", lambda: _lockout_settings())
+    assert [lockout.lock_seconds(n) for n in (1, 4)] == [0, 0]
+    assert [lockout.lock_seconds(n) for n in (5, 6, 7, 8)] == [60, 120, 240, 480]
+    assert lockout.lock_seconds(9) == 900, "60×2^4=960 要封顶到 900"
+    assert lockout.lock_seconds(200) == 900, "指数不能溢出成天文数字"
+
+
+def test_lockout_counts_failures_locks_then_restarts_after_silence(monkeypatch):
+    """累计失败到阈值就上锁；静默期一过，计数从 0 重新数（慢慢试的爆破不被永久累积）。"""
+    from backend import lockout
+    from backend.models import User
+
+    monkeypatch.setattr(lockout, "get_settings", lambda: _lockout_settings())
+    now = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+    user = User(username="lock-probe")  # 没落库：failed_attempts 还是 None，必须按 0 处理
+    assert user.failed_attempts is None
+
+    states = [lockout.register_failure(user, now=now) for _ in range(5)]
+    assert [s["failed_attempts"] for s in states] == [1, 2, 3, 4, 5]
+    assert [s["locked_for"] for s in states[:4]] == [0, 0, 0, 0]
+    assert states[-1]["locked_for"] == 60
+    assert lockout.locked_for(user, now=now) == 60
+    assert lockout.is_locked(user, now=now) is True
+
+    # 静默期之外重新开始：这一串失败与被锁的那一串无关
+    later = now + timedelta(seconds=901)
+    fresh = lockout.register_failure(user, now=later)
+    assert fresh["failed_attempts"] == 1
+    assert fresh["locked_for"] == 0
+    assert lockout.locked_for(user, now=later) == 0
+    assert user.locked_until is None, "没到阈值就不该留下一个「锁到过去」的时间"
+
+
+def test_locked_for_accepts_naive_datetime_and_clears_nothing(monkeypatch):
+    """数据库/手写数据可能是 naive 时间：按 UTC 处理，不能因为缺 tzinfo 就当成已解锁。"""
+    from backend import lockout
+    from backend.models import User
+
+    naive = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=120)
+    user = User(username="naive-probe", locked_until=naive, failed_attempts=6)
+    assert 115 <= lockout.locked_for(user) <= 120
+    assert lockout.is_locked(user) is True
+    assert lockout.locked_for(User(username="clean")) == 0
+
+
+def test_unlock_clears_counter_and_reports_previous_state():
+    """管理员解锁：计数与锁定时间清空，返回值里带上「清掉了几次、当时还剩多久」。"""
+    from backend import lockout
+    from backend.models import User
+
+    now = datetime.now(timezone.utc)
+    user = User(username="unlock-probe", failed_attempts=7,
+                locked_until=now + timedelta(seconds=300), last_failed_at=now)
+    info = lockout.unlock(user)
+    assert info["cleared_attempts"] == 7
+    assert info["was_locked_for"] >= 295 and info["unlocked"] is True
+    assert user.failed_attempts == 0 and user.locked_until is None and user.last_failed_at is None
+    assert lockout.locked_for(user) == 0
+
+
+def test_password_rules_reject_weak_and_accept_strong():
+    """弱口令判据：黑名单、l33t 变体、键盘序、纯数字、同字符重复、长度、含用户名。"""
+    from backend import passwords
+
+    for weak in ("pytest-password-2026", "P@ssword-2026", "1234567890", "aaaaaaaaaa",
+                 "qwertyuiop12", "Abcdefghij", "short", "短密码", "secret"):
+        assert passwords.problems(weak), f"{weak} 应该被拒"
+    for strong in ("correct-horse-battery", "TierSmoke#2026", "verify-session-2026", "pytest-login-2026"):
+        assert passwords.problems(strong) == [], f"{strong} 应该被接受"
+    # 口令里含自己的用户名：改成大小写/加数字都不算换了
+    assert passwords.problems("demo_analyst-2026", "demo_analyst")
+    assert any("10" in problem for problem in passwords.problems("nine-char"))
+
+
+def test_password_normalize_undoes_leet_and_trailing_digits():
+    """归一化是判据的第一步：去大小写、还原 l33t、去非字母数字、去掉末尾纯数字。"""
+    from backend import passwords
+
+    assert passwords.normalize("P@SSW0RD") == "password"
+    assert passwords.normalize("Passw0rd") == "password"
+    assert passwords.normalize("Demo_Analyst") == "demoanalyst"
+    assert passwords.normalize("password99") == "password"
+    assert passwords.normalize("") == ""

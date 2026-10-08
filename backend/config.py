@@ -148,6 +148,14 @@ if BaseSettings is not None:
         # 登录限流（进程内滑动窗口）：同一用户名+来源在窗口内超过次数就 429。
         login_max_attempts: int = 10
         login_window_seconds: int = 300
+        # 登录失败锁定（账号级、落库）：连续失败到阈值才锁，锁定时长按 2 的幂增长并封顶。
+        # 与上面的滑动窗口是两道闸——限流挡「打不中的海量尝试」，这里保证账号本身被锁上。
+        login_lockout_threshold: int = 5
+        login_lockout_base_seconds: int = 60
+        login_lockout_max_seconds: int = 900
+        login_failure_ttl_seconds: int = 900
+        # 密码强度：注册时的长度下限（弱口令黑名单见 backend/passwords.py）。
+        password_min_length: int = 10
         # 生产环境启动时校验配置（占位密钥、CORS 通配）；development 只记日志不拦。
         strict_config: bool = False
         embedding_model: str = ""
@@ -239,6 +247,11 @@ else:
         access_token_expire_minutes = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(12 * 60)))
         login_max_attempts = int(os.getenv("LOGIN_MAX_ATTEMPTS", "10"))
         login_window_seconds = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))
+        login_lockout_threshold = int(os.getenv("LOGIN_LOCKOUT_THRESHOLD", "5"))
+        login_lockout_base_seconds = int(os.getenv("LOGIN_LOCKOUT_BASE_SECONDS", "60"))
+        login_lockout_max_seconds = int(os.getenv("LOGIN_LOCKOUT_MAX_SECONDS", "900"))
+        login_failure_ttl_seconds = int(os.getenv("LOGIN_FAILURE_TTL_SECONDS", "900"))
+        password_min_length = int(os.getenv("PASSWORD_MIN_LENGTH", "10"))
         strict_config = os.getenv("STRICT_CONFIG", "").strip().lower() in {"1", "true", "yes", "on"}
         embedding_model = os.getenv("EMBEDDING_MODEL", "")
         rerank_model = os.getenv("RERANK_MODEL", "")

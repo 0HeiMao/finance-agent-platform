@@ -88,7 +88,9 @@ async def anon_client(api_app):
 
 @pytest.fixture
 def credentials() -> dict:
-    return {"username": f"pytest_{uuid.uuid4().hex[:10]}", "password": "pytest-password-2026"}
+    # 口令要过 backend/passwords.py 的强度规则（含 "password" 这种弱口令词会被拒），
+    # 所以字面量里不能再出现它。
+    return {"username": f"pytest_{uuid.uuid4().hex[:10]}", "password": "pytest-login-2026"}
 
 
 @pytest.fixture

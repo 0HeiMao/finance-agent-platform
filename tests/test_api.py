@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -673,7 +674,7 @@ async def test_admin_endpoints_require_token(anon_client):
 
 async def test_admin_rejects_department_scoped_account(anon_client, api_app):
     """部门不为空的账号必须 403，而不是拿到空数据（否则"看不到"会被误读成"没有"）。"""
-    credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
     token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
 
@@ -758,7 +759,7 @@ async def test_slow_path_alert_is_reported_by_observability_endpoint(anon_client
 
 
 async def test_admin_user_department_update_and_self_protection(anon_client, auth_headers, credentials):    # credentials 夹具已经通过 auth_headers 注册并登录（该账号部门为空 → 管理员）
-    target = {"username": f"managed_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    target = {"username": f"managed_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=target)).status_code == 200
 
     listing = await anon_client.get("/api/v1/admin/users", headers=auth_headers)
@@ -999,7 +1000,7 @@ async def _scoped_headers(anon_client, api_app, department: str) -> tuple[dict, 
     注意这个客户端已经在 PATCH /auth/me 时被用过，httpx 不允许再 `async with` 它
     （RuntimeError: Cannot open a client instance more than once），用完 `await aclose()`。
     """
-    credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
     token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
@@ -1130,7 +1131,7 @@ async def test_login_limiter_resets_after_success(anon_client, credentials):  # 
     from backend.ratelimit import SlidingWindowLimiter, reset_login_limiter
 
     username = f"reset_{uuid.uuid4().hex[:8]}"
-    password = "pytest-password-2026"
+    password = "pytest-login-2026"
     assert (await anon_client.post("/api/v1/auth/register",
                                    json={"username": username, "password": password})).status_code == 200
     limiter = SlidingWindowLimiter(limit=3, window_seconds=60)
@@ -1255,7 +1256,7 @@ async def test_multi_department_account_can_narrow_its_own_scope(anon_client, ap
     而它恰恰是最需要在两个部门之间来回收窄的那个账号。
     """
     _seed_scoped_period(db_session, SCOPE_PERIOD)
-    credentials = {"username": f"multi_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    credentials = {"username": f"multi_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
     token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
@@ -1813,7 +1814,7 @@ async def test_audit_log_records_admin_and_data_writes(anon_client, auth_headers
     assert rule.status_code == 200, rule.text
 
     # 2) 改他人部门 + 3) 删账号（另外造一个账号，避免动到自己）
-    victim = {"username": f"audit_{uuid.uuid4().hex[:8]}", "password": "audit-password-2026"}
+    victim = {"username": f"audit_{uuid.uuid4().hex[:8]}", "password": "audit-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=victim)).status_code == 200
     victim_id = db_session.scalar(select(User.id).where(User.username == victim["username"]))
     changed = await anon_client.patch(f"/api/v1/admin/users/{victim_id}",
@@ -1945,7 +1946,7 @@ def test_audit_scrub_drops_sensitive_keys():
     from backend import audit
 
     cleaned = audit._scrub({
-        "password": "pytest-password-2026",
+        "password": "pytest-login-2026",
         "access_token": "eyJhbGciOi",
         "api_key": "sk-xxx",
         "nested": {"token": "should-be-stringified"},
@@ -3247,7 +3248,7 @@ async def test_legacy_token_without_version_claim_stays_valid_until_bumped(anon_
 async def test_admin_can_force_logout_another_account(anon_client, auth_headers):
     """管理员把人踢下线：目标账号的令牌立刻失效，管理员自己的令牌照旧可用。"""
     # 刻意用与 auth_headers 不同的账号：那是夹具自己注册的账号，再注册同名会 409
-    victim = {"username": f"kick_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    victim = {"username": f"kick_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=victim)).status_code == 200
     target_token = (await anon_client.post("/api/v1/auth/login", json=victim)).json()["access_token"]
     target_me = await anon_client.get("/api/v1/auth/me", headers=_bearer(target_token))
@@ -3285,7 +3286,7 @@ async def test_force_logout_guards_self_non_admin_and_unknown(anon_client, auth_
     assert "自己" in self_kick.json()["detail"]
     assert (await anon_client.post("/api/v1/admin/users/99999999/logout", headers=auth_headers)).status_code == 404
 
-    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=scoped)).status_code == 200
     token = (await anon_client.post("/api/v1/auth/login", json=scoped)).json()["access_token"]
     # 新注册账号是没有部门的，而「无部门」在这个项目里就等于财务管理员 —— 必须先收窄成部门账号，
@@ -3301,4 +3302,151 @@ async def test_force_logout_guards_self_non_admin_and_unknown(anon_client, auth_
     assert listing.status_code == 200, listing.text
     for item in listing.json()["data"]:
         assert isinstance(item["token_version"], int), item
+
+
+# ---------------------------------------------------------------------------
+# 登录失败锁定、指数退避与弱口令（④）
+# ---------------------------------------------------------------------------
+
+
+async def _wrong_login(client, username: str, times: int = 1):
+    """连着用错密码登录 `times` 次，返回最后一次响应（每次都必须还是 401）。"""
+    response = None
+    for _ in range(times):
+        response = await client.post("/api/v1/auth/login",
+                                     json={"username": username, "password": "wrong-password-2026"})
+        assert response.status_code == 401, response.text
+    return response
+
+
+async def test_lockout_blocks_even_the_correct_password_until_manager_unlocks(
+        anon_client, auth_headers, db_session):
+    """连续失败到阈值后，**密码正确也进不来**；管理员解锁后立刻恢复。"""
+    from backend.models import User
+
+    threshold = get_settings().login_lockout_threshold
+    victim = {"username": f"lock_{uuid.uuid4().hex[:8]}", "password": "victim-login-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=victim)).status_code == 200
+
+    await _wrong_login(anon_client, victim["username"], times=threshold)
+    row = db_session.scalar(select(User).where(User.username == victim["username"]))
+    db_session.refresh(row)
+    assert row.failed_attempts == threshold, row.failed_attempts
+    assert row.locked_until is not None
+
+    # 这一步是这个功能的意义所在：口令是对的，但账号被锁着，所以还是 429
+    blocked = await anon_client.post("/api/v1/auth/login", json=victim)
+    assert blocked.status_code == 429, blocked.text
+    assert "登录尝试过于频繁" in blocked.json()["detail"]
+    assert blocked.headers.get("Retry-After")
+    # 与「限流」同一句文案、且不提锁定与用户名：否则 429/401 的差别就成了账号枚举接口
+    detail = blocked.json()["detail"]
+    assert "锁" not in detail and victim["username"] not in detail
+
+    # 留痕：失败若干条 + 锁上那一条（不含任何口令字样）
+    failed = [r for r in (await _audit(anon_client, auth_headers, action="user.login_failed"))["data"]
+              if r["actor"] == victim["username"]]
+    assert len(failed) == threshold, len(failed)
+    assert all("password" not in json.dumps(r["detail"], ensure_ascii=False).lower() for r in failed)
+    locked_rows = [r for r in (await _audit(anon_client, auth_headers, action="user.login_locked"))["data"]
+                   if r["actor"] == victim["username"]]
+    assert {r["action_label"] for r in locked_rows} == {"账号锁定"}
+    reasons = " ".join(r["detail"]["reason"] for r in locked_rows)
+    assert "连续失败达到阈值" in reasons and "已锁定" in reasons
+
+    # 管理员解锁：清计数与锁定时间，但**不碰**会话版本（解锁 ≠ 踢人）
+    before_version = row.token_version
+    unlocked = await anon_client.post(f"/api/v1/admin/users/{row.id}/unlock", headers=auth_headers)
+    assert unlocked.status_code == 200, unlocked.text
+    body = unlocked.json()
+    assert body["failed_attempts"] == 0 and body["locked"] is False and body["locked_until"] is None
+    assert body["cleared_attempts"] == threshold, body
+    db_session.refresh(row)
+    assert row.token_version == before_version
+
+    # 解锁后同一份口令立刻可用，而且不会误报「刚清掉一堆失败」
+    back = await anon_client.post("/api/v1/auth/login", json=victim)
+    assert back.status_code == 200, back.text
+    assert back.json()["failures_cleared"] == 0
+
+    unlock_row = _find((await _audit(anon_client, auth_headers, action="user.unlock"))["data"],
+                       "user.unlock", row.id)
+    assert unlock_row is not None, "解锁要留痕"
+    assert unlock_row["action_label"] == "解除账号锁定"
+    assert unlock_row["detail"]["cleared_attempts"] == threshold
+
+    # 名单接口把锁定状态给出来，管理页才分得清「密码错」与「被锁了」
+    listing = (await anon_client.get("/api/v1/admin/users", headers=auth_headers)).json()["data"]
+    item = next(u for u in listing if u["id"] == row.id)
+    assert item["failed_attempts"] == 0 and item["locked"] is False
+
+
+async def test_lockout_counter_restarts_after_the_silence_window(anon_client, db_session):
+    """静默期过后计数从 0 重数：慢慢试的爆破不会被永久累积成一次锁定。"""
+    from backend.models import User
+
+    ttl = get_settings().login_failure_ttl_seconds
+    victim = {"username": f"silent_{uuid.uuid4().hex[:8]}", "password": "silent-login-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=victim)).status_code == 200
+    await _wrong_login(anon_client, victim["username"], times=2)
+    row = db_session.scalar(select(User).where(User.username == victim["username"]))
+    db_session.refresh(row)
+    assert row.failed_attempts == 2
+
+    # 把「上次失败」挪到静默期之外：这一次失败应当算第 1 次，而不是第 3 次
+    row.last_failed_at = datetime.now(timezone.utc) - timedelta(seconds=ttl + 60)
+    db_session.flush()
+    await _wrong_login(anon_client, victim["username"], times=1)
+    db_session.refresh(row)
+    assert row.failed_attempts == 1, row.failed_attempts
+
+
+async def test_registration_rejects_weak_passwords_and_leaves_a_trail(anon_client, auth_headers, db_session):
+    """弱口令在注册口就被挡住（400）：不建账号，但留一条「注册被拒」的痕。"""
+    from backend import audit
+    from backend.models import User
+
+    username = f"weak_{uuid.uuid4().hex[:8]}"
+    for weak in ("pytest-password-2026", "1234567890", "aaaaaaaaaaa"):
+        rejected = await anon_client.post("/api/v1/auth/register",
+                                          json={"username": username, "password": weak})
+        assert rejected.status_code == 400, f"{weak} 不该被接受：{rejected.text}"
+        assert rejected.json()["detail"], rejected.text
+        assert db_session.scalar(select(User).where(User.username == username)) is None
+
+    # 用户名没被「占坑」：换成够强的口令就能注册
+    strong = await anon_client.post("/api/v1/auth/register",
+                                    json={"username": username, "password": "strong-login-2026"})
+    assert strong.status_code == 200, strong.text
+
+    rows = [r for r in (await _audit(anon_client, auth_headers, action="user.register_rejected"))["data"]
+            if r["actor"] == username]
+    assert len(rows) == 3, rows
+    assert rows[0]["action_label"] == "注册被拒（弱口令）"
+    assert rows[0]["detail"]["problems"], rows[0]
+    assert "user.register_rejected" in audit.ACTIONS
+
+    # 已经存在的用户名重注册还是「用户名已存在」：老账号（含演示账号）的弱口令不该在这里被翻出来说
+    existing = await anon_client.post("/api/v1/auth/register",
+                                      json={"username": username, "password": "pytest-password-2026"})
+    assert existing.status_code == 409, existing.text
+
+
+async def test_unlock_guards_self_non_admin_and_unknown(anon_client, auth_headers):
+    """解锁走的是管理接口：自己走 /auth/me、非管理员 403、不存在的账号 404。"""
+    me = (await anon_client.get("/api/v1/auth/me", headers=auth_headers)).json()
+    self_unlock = await anon_client.post(f"/api/v1/admin/users/{me['id']}/unlock", headers=auth_headers)
+    assert self_unlock.status_code == 400, self_unlock.text
+    assert "自己" in self_unlock.json()["detail"]
+    assert (await anon_client.post("/api/v1/admin/users/99999999/unlock",
+                                   headers=auth_headers)).status_code == 404
+
+    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "scoped-login-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=scoped)).status_code == 200
+    token = (await anon_client.post("/api/v1/auth/login", json=scoped)).json()["access_token"]
+    narrowed = await anon_client.patch("/api/v1/auth/me", json={"departments": ["部门A"]},
+                                       headers=_bearer(token))
+    assert narrowed.status_code == 200 and narrowed.json()["unrestricted"] is False, narrowed.text
+    denied = await anon_client.post(f"/api/v1/admin/users/{me['id']}/unlock", headers=_bearer(token))
+    assert denied.status_code == 403, denied.text
 

@@ -23,8 +23,8 @@ Authorization: Bearer <access_token>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/auth/register` | 请求 `{"username","password"}`；用户名重复返回 409 |
-| POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type","token_version"}` |
+| POST | `/auth/register` | 请求 `{"username","password"}`；**先查重名（409）再查口令强度**（顺序反了会让种子脚本重注册同名演示账号时突然报「密码太弱」）；弱口令 400 并给出中文原因，留 `user.register_rejected` 审计 |
+| POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type","token_version"}`，成功时若清掉过失败计数还带 `failures_cleared`。失败 401 / 被锁或限流 429，见下 |
 | POST | `/auth/logout` | 退出登录：把该账号的会话版本 +1（此前签发的**每一份**令牌立即失效，含其它设备），返回 `{"username","token_version","logged_out":true}`；留 `user.logout` 审计 |
 | GET | `/auth/me` | 返回 `{id,username,department,departments,unrestricted}`；**权威值是数组 `departments`**，`department` 只是它的第一个元素（回落用），`departments` 为空表示不受限（财务管理员） |
 | PATCH | `/auth/me` | 请求 `{"departments": ["018","097"]}`（字符串形式 `{"department":"018"}` 仍兼容，≤100 字；`[]` 与空串等于清空）；部门只由服务端记录 **`User.departments`** 决定，最多 20 个 |
@@ -57,6 +57,39 @@ Retry-After: 213
 `AUTH_SECRET_KEY` 留空或仍是占位值 `change-this-secret-in-env` 时，进程启动会用 `secrets.token_urlsafe(48)`
 生成一个并**就地写回 `.env`**（保留其它行、不重复追加键）：占位密钥意味着任何人都能自己签一个合法 JWT。
 副作用是密钥一变，之前签发的 token 全部失效，客户端需要重新登录。
+
+### 账号锁定与口令强度（落库的那一半）
+
+滑动窗口限流按「用户名 + 来源 IP」分桶，**换 IP 就能绕、多 worker 各记一份**，所以连续失败还会落库：
+
+- `users` 上三列：`failed_attempts`（`NOT NULL DEFAULT 0`）、`locked_until`、`last_failed_at`。
+  配置项 `LOGIN_LOCKOUT_THRESHOLD=5`、`LOGIN_LOCKOUT_BASE_SECONDS=60`、`LOGIN_LOCKOUT_MAX_SECONDS=900`、
+  `LOGIN_FAILURE_TTL_SECONDS=900`、`PASSWORD_MIN_LENGTH=10`。
+- 第 n 次失败（n ≥ 阈值）锁 `base · 2^(n−阈值)` 秒，**封顶 900**：
+  `5→60s / 6→120 / 7→240 / 8→480 / 9 起→900`。没到阈值时 `locked_until` 一律清成 `NULL`
+  （留着一个未来的时间会让「第几次失败」和「还剩多久」互相打架）。
+- 失败 401 的 detail 带 `failed_attempts` / `lock_seconds` / `locked_until`，前端能直接显示还差几次；
+  **口令正确但账号锁着也是 429**，且与限流那条**文案一字不差**：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+
+{"detail":"登录尝试过于频繁，请在 60 秒后重试"}
+```
+
+  两句一样是故意的：回显「你被锁了」等于告诉爆破方「这个用户名存在」。这条 429 不含用户名、
+  不含「锁」、不含「密码」——`scripts/verify_login_lockout.py` 专门断言了这三点。
+- `last_failed_at` 距今超过 `LOGIN_FAILURE_TTL_SECONDS` 就从 0 重新数（静默期归零）；登录成功清零。
+  `last_failed_at` 在库里可能是 naive datetime，比较时**按 UTC 补时区**再算。
+- 管理员解锁：`POST /admin/users/{id}/unlock` 把计数与锁定时间清空、返回
+  `{"id","username","failed_attempts":0,"locked_until":null,"locked":false,"cleared_attempts":N}`，
+  **不碰口令、也不碰 `token_version`**（解锁 ≠ 踢下线：正锁着的账号解锁后不改口令就能立刻登录）。
+  「原先锁了多久」只在审计 detail 的 `was_locked_for` 里（响应体不返回它）。
+- 口令强度规则**不挂在 Pydantic 模型上**：`Credentials` 是登录与注册共用的，挂上去会把老用户的
+  正常登录也一起判死。规则走 `backend/passwords.py` 的 `problems(password, username)`，
+  按「精确弱口令 / 分词后的弱口令词 / 弱口令子串 / 键盘连打 / l33t 还原后再比一遍」逐层判。
+- `GET /admin/users` 每条多出 `failed_attempts` / `locked_until`（ISO UTC 或 `null`）/ `locked`。
 
 ### 出口配额（除了登录，还有两组）
 
@@ -471,8 +504,9 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测（含**慢接口告警** `observability.slow_paths`） |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
-| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
+| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、登录态三个字段 `failed_attempts`/`locked_until`/`locked`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
 | PATCH | `/admin/users/{id}` | `{"department":"财务部"}`；空字符串＝清空（升级为管理员） |
+| POST | `/admin/users/{id}/unlock` | 解除账号锁定：清掉 `failed_attempts` 与 `locked_until`，返回 `{"id","username","failed_attempts":0,"locked_until":null,"locked":false,"cleared_attempts":N}`；留 `user.unlock` 审计（detail 含 `cleared_attempts`、`was_locked_for`、`effect`）。**不动口令、不动 `token_version`** |
 | POST | `/admin/users/{id}/logout` | 强制下线：把该账号的会话版本 +1（它此前签发的令牌全部立刻失效），返回 `{"id","username","token_version","logged_out":true}`；留 `user.force_logout` 审计（含 `from_version`/`to_version`）。对自己操作复用 `_target_user()` 的 **400**（想让自己下线用 `/auth/logout`，两者审计语义不同） |
 | DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据） |
 | GET | `/admin/batches?limit=&offset=` | 按 `import_batch` 分组的批次列表（`total` 是批次个数，`limit` 上限 200） |
