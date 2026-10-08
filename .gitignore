@@ -1,0 +1,33 @@
+# 密钥与本地环境
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# 测试与工具残渣（pytest / pip / torch 会在仓库根目录随手建目录）
+.pytest_cache/
+pytest-of-*/
+pip-*/
+pip-build-tracker-*/
+pip-install-*/
+pip-ephem-wheel-cache-*/
+torchinductor_*/
+
+# 前端依赖与构建产物
+node_modules/
+frontend/dist/
+
+# 编辑器/IDE 的本地工程文件
+.idea/
+.vscode/
+
+# 运行期生成物：验收截图每次都会被 check_pages.py 覆盖，报告也随时可重新导出
+output/charts/
+output/reports/
+output/_*
+
+# 上传件（导入的表格、知识库文档）不是原始数据，不入库；data/raw 的原始文件仍然要提交
+data/uploads/
+data/index/
+data/models/

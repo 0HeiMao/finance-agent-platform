@@ -1,0 +1,13 @@
+# 统一按 LF 存库、按 LF 检出：这个仓库在 Windows 上开发，但 .githooks/pre-commit 是 shell 脚本，
+# 行尾多一个 CR 就会让 shebang 变成 `/bin/sh\r`，钩子直接报「bad interpreter」而不是跑自检。
+* text=auto eol=lf
+
+# 二进制文件别做任何行尾/编码转换
+*.png binary
+*.jpg binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
+*.xls binary
+*.csv text

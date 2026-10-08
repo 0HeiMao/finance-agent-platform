@@ -1,0 +1,311 @@
+from datetime import datetime, timezone
+from decimal import Decimal
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import extract, func, select, delete
+from sqlalchemy.orm import Session
+from backend import audit
+from backend.auth import current_user
+from backend.alert_rules import ensure_rules, evaluate, metric_values
+from backend.db import get_db
+from backend.models import AlertRule, FinancialAlert, FinancialMetric, FinancialTransaction, User
+from backend.scope import (resolve_requested_scope, scope_alert, scope_metric, scope_of,
+                           scope_payload, scope_transactions)
+
+router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
+
+
+def _scoped(user: User, requested: str | None) -> tuple[str | None, dict, str | None]:
+    """解析部门参数，返回 (生效口径, 提示条载荷, 越权说明)。"""
+    department, violation = resolve_requested_scope(user, requested)
+    explicit = department if (department and scope_of(user) is None) else None
+    return department, scope_payload(department, requested=explicit), violation
+
+
+# 处理闭环的状态机：pending（待处理）/ confirmed（已确认，确实异常）/ false_positive（误报）/
+# resolved（已处理完，含补数与后续动作）。不做任意字符串——状态是前端按钮和统计口径的输入。
+REVIEW_STATUSES = ("pending", "confirmed", "false_positive", "resolved")
+STATUS_LABELS = {"pending": "待处理", "confirmed": "已确认", "false_positive": "误报", "resolved": "已处理"}
+
+
+class ReviewInput(BaseModel):
+    """处理一条预警的入参。`note` 在「误报」时必填（理由见端点里的判断）。"""
+    status: str = Field(..., description="pending / confirmed / false_positive / resolved")
+    note: str | None = Field(None, max_length=2000)
+
+
+def _alert_json(row: FinancialAlert) -> dict:
+    """预警的统一序列化：列表页、明细页、处理动作都返回同一形状。"""
+    return {
+        "id": row.id, "period": row.period, "type": row.alert_type, "description": row.description,
+        "level": row.level, "metric": row.metric_name, "department": row.department or "",
+        "current_value": str(row.current_value if row.current_value is not None else 0),
+        "threshold_value": str(row.threshold_value if row.threshold_value is not None else 0),
+        "status": row.review_status or "pending",
+        "status_label": STATUS_LABELS.get(row.review_status or "pending", row.review_status),
+        "note": row.review_note or "",
+        "reviewed_by": row.reviewed_by or "",
+        "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else "",
+        "needs_human_review": bool(row.needs_human_review),
+    }
+
+
+def _find_alert(db: Session, alert_id: int, user: User) -> FinancialAlert:
+    """取预警并做口径校验：受限账号只能动本部门的预警（越权返回 404 语义之外的 403）。"""
+    row = db.get(FinancialAlert, alert_id)
+    if row is None:
+        raise HTTPException(404, "预警不存在")
+    own = scope_of(user)
+    if own and (row.department or "") != own:
+        raise HTTPException(403, f"当前账号的数据范围是「部门 {own}」，不能处理「{row.department or '全公司'}」的预警")
+    return row
+
+
+
+def _build(period: str, department: str | None, rows: list[FinancialTransaction],
+           rules: list[AlertRule] | None = None):
+    """按给定的一批明细构造一条指标行与它触发的预警（部门口径与全公司口径共用同一套规则）。
+
+    预警由 `alert_rules` 表里的规则驱动（`backend/alert_rules.py`），不再是写死的两个 if。
+    """
+    revenue = sum((r.revenue_amount or 0 for r in rows), Decimal(0))
+    cost = sum((r.cost_amount or 0 for r in rows), Decimal(0))
+    expense = sum((r.expense_amount or 0 for r in rows), Decimal(0))
+    gross = revenue - cost; net = gross - expense
+    metric = FinancialMetric(
+        period=period, department=department,
+        revenue_amount=revenue, cost_amount=cost, expense_amount=expense,
+        gross_profit_amount=gross, net_profit_amount=net,
+        gross_profit_ratio=(gross / revenue if revenue else 0),
+        net_profit_ratio=(net / revenue if revenue else 0))
+    alerts = []
+    values = metric_values(metric)
+    for rule in rules or []:
+        current = evaluate(rule, values)
+        if current is None:
+            continue
+        alerts.append(FinancialAlert(
+            period=period, department=department, alert_type=rule.alert_type,
+            description=rule.description or rule.alert_type, level=rule.level,
+            metric_name=rule.metric_name, current_value=current,
+            threshold_value=rule.threshold_value))
+    return metric, alerts
+
+
+def _review_state(db: Session, period: str) -> dict[tuple[str, str, str], dict]:
+    """取该期间已有的处理状态，键为 (部门, 预警类型, 指标名)。
+
+    重算是「先删后建」，不继承的话用户点过的「已处理/误报」和备注会在下一次导入或撤销批次后
+    无声消失——这正是原来 `needs_human_review` 只写默认值的后果。
+    """
+    rows = db.scalars(select(FinancialAlert).where(FinancialAlert.period == period)).all()
+    return {(row.department or "", row.alert_type, row.metric_name): {
+        "review_status": row.review_status,
+        "review_note": row.review_note,
+        "reviewed_by": row.reviewed_by,
+        "reviewed_at": row.reviewed_at,
+        "needs_human_review": row.needs_human_review,
+    } for row in rows if row.review_status != "pending" or row.review_note}
+
+
+def calculate(db: Session, period: str, commit: bool = True):
+    """重算某期间的指标与预警：**全公司一行 + 每个出现的部门各一行**。
+
+    部门权限要求受限账号只看到本部门口径，而全公司口径不能靠累加部门行得到（部门为空的行不归
+    任何部门），所以两种口径都落库。返回值仍是全公司那一条，保持既有调用方的行为不变。
+    """
+    year, month = map(int, period.split("-"))
+    datetime(year, month, 1)
+    db.flush()
+    rules = ensure_rules(db)
+    previous = _review_state(db, period)
+    db.execute(delete(FinancialMetric).where(FinancialMetric.period == period))
+    db.execute(delete(FinancialAlert).where(FinancialAlert.period == period))
+    rows = db.scalars(select(FinancialTransaction).where(extract("year", FinancialTransaction.transaction_date) == year, extract("month", FinancialTransaction.transaction_date) == month)).all()
+    departments = sorted({(row.department or "").strip() for row in rows} - {""})
+    metric = None
+    alerts: list[FinancialAlert] = []
+    for department in [None, *departments]:
+        subset = rows if department is None else [r for r in rows if (r.department or "").strip() == department]
+        item, item_alerts = _build(period, department, subset, rules)
+        db.add(item)
+        for alert in item_alerts:
+            # 继承处理状态：口径 + 类型 + 指标名三者相同才算同一条预警
+            keep = previous.get((department or "", alert.alert_type, alert.metric_name))
+            if keep:
+                for field, value in keep.items():
+                    setattr(alert, field, value)
+            else:
+                alert.review_status = "pending"
+                alert.needs_human_review = True
+            alert.needs_human_review = alert.review_status == "pending"
+        db.add_all(item_alerts)
+        if department is None:
+            metric, alerts = item, item_alerts
+    if commit: db.commit()
+    else: db.flush()
+    db.refresh(metric)
+    return metric, alerts
+
+@router.post("/calculate")
+def calculate_metrics(request: Request, period: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                      db: Session = Depends(get_db), user: User = Depends(current_user)):
+    metric, alerts = calculate(db, period, commit=False)
+    # 重算会删掉并重建该期间的指标与预警（处理状态按口径继承），属于写操作，留痕
+    audit.record(db, user, "metrics.calculate", target_type="period", target_id=period,
+                 detail={"period": period, "alerts": len(alerts)}, request=request)
+    db.commit()
+    return {"period": period, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "expense_amount": float(metric.expense_amount), "gross_profit_amount": float(metric.gross_profit_amount), "net_profit_amount": float(metric.net_profit_amount), "gross_profit_ratio": float(metric.gross_profit_ratio), "net_profit_ratio": float(metric.net_profit_ratio), "alerts": len(alerts)}
+
+@router.get("/alerts")
+def alerts(period: str, department: str | None = Query(None, max_length=100), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    scope, payload, violation = _scoped(user, department)
+    if violation: raise HTTPException(403, violation)
+    rows = db.scalars(scope_alert(select(FinancialAlert).where(FinancialAlert.period == period), scope)).all()
+    return {"scope": payload, "data": [_alert_json(x) for x in rows]}
+
+@router.get("/alerts/all")
+def all_alerts(period: str | None = None, status: str | None = Query(None, max_length=20),
+               limit: int = Query(50, ge=1, le=500), row_offset: int = Query(0, ge=0, alias="offset"),
+               department: str | None = Query(None, max_length=100),
+               db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """跨期间预警列表，供看板「查看全部」与预警监控页使用。period 为空则返回全部期间。
+
+    带 `total` 是为了分页：`total` 是不受 limit 影响的满足条件行数，前端据此翻页。
+    `status` 也要在**这里**过滤（而不是前端拿一页数据再筛）：筛选必须发生在分页之前，
+    否则「只看误报」只能看到恰好落在当前这一页里的误报，第 2 页的误报会被静默漏掉。
+    """
+    scope, payload, violation = _scoped(user, department)
+    if violation: raise HTTPException(403, violation)
+    if status and status not in REVIEW_STATUSES:
+        raise HTTPException(422, f"状态只能是 {'/'.join(REVIEW_STATUSES)}")
+    condition = scope_alert(select(FinancialAlert), scope)
+    if period:
+        condition = condition.where(FinancialAlert.period == period)
+    if status:
+        condition = condition.where(FinancialAlert.review_status == status)
+    total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
+    statement = condition.order_by(FinancialAlert.period.desc(), FinancialAlert.id.desc()).limit(limit).offset(row_offset)
+    rows = db.scalars(statement).all()
+    periods = [p for p in db.scalars(scope_metric(select(FinancialMetric.period), scope).order_by(FinancialMetric.period.desc())).all()]
+    return {
+        "scope": payload,
+        "data": [_alert_json(x) for x in rows],
+        "periods": periods,
+        "total": total,
+        "offset": row_offset,
+        "limit": limit,
+    }
+
+@router.get("/alerts/stats")
+def alert_stats(period: str | None = None, department: str | None = Query(None, max_length=100),
+                db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """按处理状态统计预警条数，供列表页顶部与看板显示「还剩几条没处理」。"""
+    scope, payload, violation = _scoped(user, department)
+    if violation: raise HTTPException(403, violation)
+    condition = scope_alert(select(FinancialAlert.review_status, func.count()), scope)
+    if period:
+        condition = condition.where(FinancialAlert.period == period)
+    counts = {status: 0 for status in REVIEW_STATUSES}
+    for status, total in db.execute(condition.group_by(FinancialAlert.review_status)).all():
+        counts[status or "pending"] = int(total)
+    counts["total"] = sum(counts[status] for status in REVIEW_STATUSES)
+    return {"scope": payload, "period": period or "", "counts": counts,
+            "labels": STATUS_LABELS, "statuses": list(REVIEW_STATUSES)}
+
+
+@router.patch("/alerts/{alert_id}")
+def review_alert(alert_id: int, payload: ReviewInput, request: Request,
+                 db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """处理一条预警：确认 / 误报 / 已处理 / 退回待处理，可带备注。
+
+    这是原来完全缺失的环节——`needs_human_review` 建行时写 True，之后没有任何接口能改它，
+    预警列表读起来永远像「没人看过」。状态会由 `calculate()` 继承，重算不会抹掉处理结果。
+    """
+    if payload.status not in REVIEW_STATUSES:
+        raise HTTPException(422, f"状态只能是 {'、'.join(REVIEW_STATUSES)} 之一")
+    row = _find_alert(db, alert_id, user)
+    note = (payload.note or "").strip()
+    if payload.status == "false_positive" and not note:
+        # 判成误报却不写理由，等于把「为什么不是问题」这件事丢了，后续没人能复核
+        raise HTTPException(422, "标记为误报时必须填写原因")
+    previous_status = row.review_status
+    row.review_status = payload.status
+    row.review_note = note or None
+    row.needs_human_review = payload.status == "pending"
+    if payload.status == "pending":
+        row.reviewed_by = None
+        row.reviewed_at = None
+    else:
+        row.reviewed_by = user.username
+        row.reviewed_at = datetime.now(timezone.utc)
+    # 「这条预警被谁判成了误报」是事后复盘的核心事实，必须留痕（备注截断到 200 字以内）
+    audit.record(db, user, "alert.review", target_type="alert", target_id=row.id,
+                 detail={"period": row.period, "alert_type": row.alert_type, "department": row.department or "全公司",
+                         "from": previous_status, "to": payload.status, "note": note},
+                 request=request)
+    db.commit()
+    db.refresh(row)
+    return _alert_json(row)
+
+
+def _department_items(db: Session, names: set[str]) -> list[dict]:
+    """把部门名整理成下拉选项：名称 + 展示标签 + 明细行数（数量帮用户判断哪个部门有数据）。
+
+    **只统计传入的部门**：受限账号的名字集合里只有自己那一个，如果这里顺手把全库部门
+    都 group by 出来，下拉里就会泄露别的部门名（这正是要防的事情）。
+    """
+    keys = sorted({name.strip() for name in names if name and name.strip()})
+    if not keys:
+        return []
+    counts = {
+        (name or "").strip(): int(total)
+        for name, total in db.execute(
+            select(FinancialTransaction.department, func.count())
+            .where(FinancialTransaction.department.in_(keys))
+            .group_by(FinancialTransaction.department)
+        ).all()
+    }
+    return [{"name": key, "label": f"部门 {key}", "transactions": counts.get(key, 0)} for key in keys]
+
+
+@router.get("/departments")
+def departments(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """可切换的数据口径列表（看板/分析页的「查看口径」下拉）。
+
+    不受限账号拿到全部部门，受限账号只拿到自己那一个——避免受限账号从下拉里
+    看到别的部门名字，也避免它误以为能切过去（后端另有 403 兜底）。
+    """
+    own = scope_of(user)
+    if own:
+        names = {own}
+    else:
+        found = {(row or "").strip() for row in db.scalars(select(FinancialTransaction.department).distinct()).all()}
+        found |= {(row or "").strip() for row in db.scalars(select(FinancialMetric.department).distinct()).all()}
+        found |= {(row or "").strip() for row in db.scalars(select(FinancialAlert.department).distinct()).all()}
+        names = {name for name in found if name}
+    return {"scope": scope_payload(own), "departments": _department_items(db, names), "switchable": own is None}
+
+
+@router.get("/alerts/{alert_id}/transactions")
+def alert_transactions(alert_id: int, limit: int = Query(200, ge=1, le=2000), row_offset: int = Query(0, ge=0, alias="offset"),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
+    department = scope_of(user)
+    alert = db.get(FinancialAlert, alert_id)
+    if not alert: return {"data": [], "message": "预警不存在"}
+    # 预警本身也带口径：受限账号拿到全公司预警的 id 时要挡住，否则等于绕开范围看明细。
+    if (alert.department or None) != (department or None):
+        return {"data": [], "message": "该预警不在当前账号的数据范围内", "scope": scope_payload(department)}
+    year, month = map(int, alert.period.split("-"))
+    condition = scope_transactions(select(FinancialTransaction).where(extract("year", FinancialTransaction.transaction_date) == year, extract("month", FinancialTransaction.transaction_date) == month), department)
+    total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
+    rows = db.scalars(condition.order_by(FinancialTransaction.transaction_date.desc(), FinancialTransaction.id.desc()).limit(limit).offset(row_offset)).all()
+    return {"alert": _alert_json(alert), "scope": scope_payload(department), "total": total, "offset": row_offset, "limit": limit, "data": [{"id": x.id, "date": x.transaction_date.strftime("%Y-%m-%d"), "account": x.account_name, "department": x.department, "revenue": float(x.revenue_amount or 0), "cost": float(x.cost_amount or 0), "expense": float(x.expense_amount or 0), "description": x.description} for x in rows]}
+
+@router.get("/summary")
+def summary(period: str, department: str | None = Query(None, max_length=100), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    scope, payload, violation = _scoped(user, department)
+    if violation: raise HTTPException(403, violation)
+    metric = db.scalar(scope_metric(select(FinancialMetric).where(FinancialMetric.period == period), scope).order_by(FinancialMetric.id.desc()))
+    if not metric: return {"has_data": False, "revenue_amount": 0, "cost_amount": 0, "net_profit_amount": 0, "net_profit_ratio": 0, "scope": payload}
+    return {"has_data": True, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "net_profit_amount": float(metric.net_profit_amount), "net_profit_ratio": float(metric.net_profit_ratio), "department": metric.department or "", "scope": payload}

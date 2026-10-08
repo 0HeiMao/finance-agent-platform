@@ -1,0 +1,19 @@
+#!/bin/sh
+# 提交前自检（版本化在 .githooks/ 里，用 `git config core.hooksPath .githooks` 生效，
+# `scripts/init_git.py` 会把这条配置一起设好）。
+#
+# 这个目录不是 GitHub 上的项目，没有 CI 服务可挂，所以把「编码 + 语法 + 后端用例 + 前端用例」
+# 这道闸门放在本地钩子上——正是这四件事先后翻过车（PowerShell 往返把源文件写成 mojibake、
+# 迁移漏列导致 UndefinedColumn、页面上看不出哪个接口慢），不能只靠人记得跑。
+set -e
+
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PYTHON=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+else
+    PYTHON="python"
+fi
+
+echo "[pre-commit] $PYTHON scripts/check_all.py --quick"
+"$PYTHON" scripts/check_all.py --quick
