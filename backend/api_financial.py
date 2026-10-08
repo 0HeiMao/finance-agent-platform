@@ -1,20 +1,22 @@
-from uuid import uuid4
+import io
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
+
 import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-import io
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from hashlib import sha256
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+
 from backend import audit, locks, transactions
+from backend.api_analysis import calculate
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import FinancialTransaction, User
-from backend.api_analysis import calculate
 from backend.scope import resolve_requested_scope, scope_of, scope_payload
 
 router = APIRouter(prefix="/api/v1/financial", tags=["financial"])
@@ -94,7 +96,7 @@ async def import_excel(request: Request, file: UploadFile = File(...),
         for index, row in frame.iterrows():
             try:
                 date, amounts = validate_row(row)
-                def amount(name): return amounts[name]
+                def amount(name, amounts=amounts): return amounts[name]
                 rows.append(FinancialTransaction(transaction_date=date, account_name=str(row["科目名称"]), account_code=str(row.get("科目编码", "")), department=str(row.get("部门", "")), description=str(row.get("摘要", "")), revenue_amount=amount("收入金额"), cost_amount=amount("成本金额"), expense_amount=amount("费用金额"), cash_in_amount=amount("现金流入"), cash_out_amount=amount("现金流出"), import_batch=batch))
             except Exception as exc: errors.append({"row": int(index) + 2, "error": str(exc)})
         if errors:

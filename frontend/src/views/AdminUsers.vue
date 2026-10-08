@@ -24,9 +24,7 @@ const drafts = reactive({})
 
 const summary = computed(() => {
   const filtered = query.value || departmentFilter.value
-  return filtered
-    ? `命中 ${total.value} 个账号（筛选后）`
-    : `共 ${total.value} 个账号`
+  return filtered ? `命中 ${total.value} 个账号（筛选后）` : `共 ${total.value} 个账号`
 })
 
 async function load() {
@@ -43,7 +41,9 @@ async function load() {
     total.value = payload.total || 0
     departments.value = payload.departments || []
     unrestrictedCount.value = payload.unrestricted_count || 0
-    users.value.forEach((user) => { drafts[user.id] = departmentsText(user.departments || user.department) })
+    users.value.forEach((user) => {
+      drafts[user.id] = departmentsText(user.departments || user.department)
+    })
   } catch (e) {
     error.value = `读取用户列表失败：${e.message}`
     users.value = []
@@ -79,7 +79,7 @@ async function saveDepartment(user) {
     const wanted = parseDepartments(drafts[user.id])
     const response = await apiFetch(`/admin/users/${user.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ departments: wanted }),
+      body: JSON.stringify({ departments: wanted })
     })
     const updated = await response.json()
     user.department = updated.department
@@ -124,8 +124,9 @@ async function forceLogout(user) {
     const response = await apiFetch(`/admin/users/${user.id}/logout`, { method: 'POST' })
     const updated = await response.json()
     user.token_version = updated.token_version
-    notice.value = `已强制下线 ${updated.username}：它此前签发的令牌全部失效（会话版本 ${updated.token_version}）。`
-      + '对方正在打开的页面下一次请求就会被踢回登录页，重新登录即可继续使用。'
+    notice.value =
+      `已强制下线 ${updated.username}：它此前签发的令牌全部失效（会话版本 ${updated.token_version}）。` +
+      '对方正在打开的页面下一次请求就会被踢回登录页，重新登录即可继续使用。'
   } catch (e) {
     error.value = `强制下线失败：${e.message}`
   } finally {
@@ -143,8 +144,9 @@ async function unlock(user) {
     user.failed_attempts = updated.failed_attempts
     user.locked = updated.locked
     user.locked_until = updated.locked_until
-    notice.value = `已解锁 ${updated.username}：清掉 ${updated.cleared_attempts} 次连续失败记录，现在可以立刻重新登录。`
-      + '（解锁不等于重置口令，也不会让已登录的会话掉线）'
+    notice.value =
+      `已解锁 ${updated.username}：清掉 ${updated.cleared_attempts} 次连续失败记录，现在可以立刻重新登录。` +
+      '（解锁不等于重置口令，也不会让已登录的会话掉线）'
   } catch (e) {
     error.value = `解锁失败：${e.message}`
   } finally {
@@ -165,11 +167,15 @@ onMounted(load)
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>用户管理</h1>
-            <p>部门决定知识库检索与财务数据的可见范围：留空＝不受限制（管理员）；可填多个部门（用「、」分隔），看到的是这些部门的并集。</p>
+            <p>
+              部门决定知识库检索与财务数据的可见范围：留空＝不受限制（管理员）；可填多个部门（用「、」分隔），看到的是这些部门的并集。
+            </p>
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -182,7 +188,10 @@ onMounted(load)
       </section>
 
       <template v-else>
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-else-if="notice" class="state-box notice">{{ notice }}</section>
 
         <section v-if="!users.length" class="state-box empty-state">
@@ -200,7 +209,7 @@ onMounted(load)
           <div class="filter-row">
             <label class="field">
               <span>用户名</span>
-              <input v-model.trim="query" class="select" maxlength="100" placeholder="按用户名模糊搜索">
+              <input v-model.trim="query" class="select" maxlength="100" placeholder="按用户名模糊搜索" />
             </label>
             <label class="field">
               <span>部门</span>
@@ -217,7 +226,14 @@ onMounted(load)
             <table>
               <thead>
                 <tr>
-                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>登录</th><th>会话</th><th>创建时间</th><th>操作</th>
+                  <th>id</th>
+                  <th>用户名</th>
+                  <th>角色</th>
+                  <th>部门（可编辑，多个用「、」分隔）</th>
+                  <th>登录</th>
+                  <th>会话</th>
+                  <th>创建时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -229,7 +245,13 @@ onMounted(load)
                   </td>
                   <td>
                     <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
-                      {{ user.unrestricted ? '管理员' : (user.departments || []).length > 1 ? `限定 ${user.departments.length} 个部门` : '限定部门' }}
+                      {{
+                        user.unrestricted
+                          ? '管理员'
+                          : (user.departments || []).length > 1
+                            ? `限定 ${user.departments.length} 个部门`
+                            : '限定部门'
+                      }}
                     </span>
                   </td>
                   <td>
@@ -239,7 +261,7 @@ onMounted(load)
                       maxlength="500"
                       placeholder="留空＝不受限；多个用「、」分隔"
                       :disabled="user.is_self"
-                    >
+                    />
                   </td>
                   <td>
                     <span v-if="user.locked" class="level high" :title="user.locked_until || ''">
@@ -261,24 +283,34 @@ onMounted(load)
                         class="btn"
                         :disabled="user.is_self || busyId === user.id"
                         @click="saveDepartment(user)"
-                      >保存部门</button>
+                      >
+                        保存部门
+                      </button>
                       <button
                         class="btn"
                         :disabled="!user.locked || busyId === user.id"
                         title="提前解除登录失败锁定：清掉失败次数与锁定时间（不重置口令，也不会让已登录的会话掉线）"
                         @click="unlock(user)"
-                      >解锁</button>
+                      >
+                        解锁
+                      </button>
                       <button
                         class="btn"
                         :disabled="user.is_self || busyId === user.id"
                         title="作废该账号所有已签发的令牌：对方下次请求就会掉线，重新登录即可继续用"
                         @click="forceLogout(user)"
-                      >强制下线</button>
+                      >
+                        强制下线
+                      </button>
                       <template v-if="confirmId !== user.id">
-                        <button class="btn danger" :disabled="user.is_self" @click="confirmId = user.id">删除</button>
+                        <button class="btn danger" :disabled="user.is_self" @click="confirmId = user.id">
+                          删除
+                        </button>
                       </template>
                       <template v-else>
-                        <button class="btn danger" :disabled="busyId === user.id" @click="removeUser(user)">确认删除</button>
+                        <button class="btn danger" :disabled="busyId === user.id" @click="removeUser(user)">
+                          确认删除
+                        </button>
                         <button class="btn" @click="confirmId = null">取消</button>
                       </template>
                     </div>
@@ -287,12 +319,19 @@ onMounted(load)
               </tbody>
             </table>
           </div>
-          <PagePager :total="total" :limit="PAGE_SIZE" :offset="offset" :loading="loading" unit="个账号" @change="turn" />
+          <PagePager
+            :total="total"
+            :limit="PAGE_SIZE"
+            :offset="offset"
+            :loading="loading"
+            unit="个账号"
+            @change="turn"
+          />
 
           <p class="muted">
             删除账号只移除登录凭据；财务数据按导入批次存在，需要清理请到「导入批次」撤销对应批次。
-            令牌是无状态的（签出去就收不回来），所以「强制下线」的做法是把该账号的<strong>会话版本 +1</strong>：
-            它此前签发的每一份令牌立刻作废，对方下次请求就掉线，重新登录即可继续用——数据不会被改动。
+            令牌是无状态的（签出去就收不回来），所以「强制下线」的做法是把该账号的<strong>会话版本 +1</strong
+            >： 它此前签发的每一份令牌立刻作废，对方下次请求就掉线，重新登录即可继续用——数据不会被改动。
             登录连续失败会按次数指数退避地锁定账号（默认第 5 次起 60 秒、之后翻倍、最多 900 秒），
             锁着的时候<strong>口令正确也进不来</strong>：「登录」列显示「已锁定」，点「解锁」可以立刻放行。
           </p>

@@ -18,9 +18,19 @@ from backend.auth import current_user
 from backend.db import get_db
 from backend.files import content_disposition
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (Scope, metric_totals, resolve_requested_scope, scope_alert, scope_label,
-                           scope_metric, scope_of, scope_payload, scope_slug, scope_text,
-                           scope_transactions)
+from backend.scope import (
+    Scope,
+    metric_totals,
+    resolve_requested_scope,
+    scope_alert,
+    scope_label,
+    scope_metric,
+    scope_of,
+    scope_payload,
+    scope_slug,
+    scope_text,
+    scope_transactions,
+)
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
 

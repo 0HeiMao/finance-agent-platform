@@ -3,7 +3,7 @@
 // 后端各个接口都会回传 scope（见 backend/scope.py 的 scope_payload），这里只负责显示，
 // 没有 scope（老接口或不受限账号）时什么都不渲染。
 const props = defineProps({
-  scope: { type: Object, default: null },
+  scope: { type: Object, default: null }
 })
 </script>
 

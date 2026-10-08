@@ -20,8 +20,8 @@ NULL = 全公司汇总行（原有那 7 行正好就是这个语义，不需要�
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from sqlalchemy import delete, func, select
 

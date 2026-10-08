@@ -21,12 +21,17 @@ import json
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_pages import (  # noqa: E402
-    CdpSession, PROJECT_ROOT, _auto_login_page, _browser, _console, _debugger_url, _post_json,
+    PROJECT_ROOT,
+    CdpSession,
+    _auto_login_page,
+    _browser,
+    _console,
+    _debugger_url,
+    _post_json,
 )
 
 BASE_URL = "http://127.0.0.1:5173"

@@ -4,8 +4,8 @@
 `Base.metadata.create_all` 只建**新表**，不会给已存在的表加列。
 """
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from sqlalchemy import text
 
@@ -13,9 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:  # 支持 `python scripts/init_pgvector_db.py`
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from backend import models  # noqa: E402,F401 - 注册用户和财务表模型
 from backend.db import Base, engine  # noqa: E402
 from backend.rag.pgvector_store import DocumentChunk  # noqa: E402,F401 - 注册向量表模型
-from backend import models  # noqa: E402,F401 - 注册用户和财务表模型
 
 # (表, 列, 类型定义)。只允许 ADD COLUMN IF NOT EXISTS 这类幂等语句。
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (

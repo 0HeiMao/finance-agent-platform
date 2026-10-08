@@ -87,7 +87,9 @@
 
 `scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
 （第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
-另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节）：
+另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
+lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `npm run lint`/`npm run format:check` 承担，
+见「代码风格与 lint」一节）：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -115,20 +117,21 @@
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
 | `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
-| `ui_components_smoke.py` | 在真浏览器里点四个自研组件 39 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）、管理概览的慢接口告警区块（标题在、区块不是空白、告警行点名路径与次数，并把这张卡片截到 `output/charts/ui_slow_alerts.png`）、会话版本的两处界面（设置页有「登录与令牌」卡片且会话版本是真数字、有「退出登录」按钮；用户管理表头有「会话」列、每行有会话状态与「强制下线」按钮、自己那行禁用——**刻意不点退出登录**，点了会把 demo 账号的会话版本推进一版）、账号锁定的界面面（用户管理表头有「登录」列、每行登录状态是「正常 / 失败 N 次 / 已锁定」、每行有「解锁」按钮且**演示库没人被锁所以全部禁用**；再清掉本地令牌打开 `guestOnly` 的注册页，核对口令规则提示与 placeholder 都写到「至少 10 位」、填 6 位口令点注册被**前端当场拦下不发请求**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
+| `ui_components_smoke.py` | 在真浏览器里点四个自研组件 40 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）、管理概览的慢接口告警区块（标题在、区块不是空白、告警行点名路径与次数，并把这张卡片截到 `output/charts/ui_slow_alerts.png`）、会话版本的两处界面（设置页有「登录与令牌」卡片且会话版本是真数字、有「退出登录」按钮；用户管理表头有「会话」列、每行有会话状态与「强制下线」按钮、自己那行禁用——**刻意不点退出登录**，点了会把 demo 账号的会话版本推进一版）、账号锁定的界面面（用户管理表头有「登录」列、每行登录状态是「正常 / 失败 N 次 / 已锁定」、每行有「解锁」按钮且**演示库没人被锁所以全部禁用**；再清掉本地令牌打开 `guestOnly` 的注册页，核对口令规则提示与 placeholder 都写到「至少 10 位」、填 6 位口令点注册被**前端当场拦下不发请求**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
 
 六个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
 ### 一键自检
 
-本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检、后端 pytest 与前端
-`npm ci`/`npm test`/`npm run build`（两边各自还带一条覆盖率门槛，见下面「持续集成」一节）；而这台开发机上
-没有 CI 服务可挂，所以「CI」同时落成一个谁都能在本机跑的入口：
+本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检（含 ruff lint）、
+后端 pytest 与前端 `npm ci`/`npm run lint`/`npm run format:check`/`npm test`/`npm run build`（两边各自还带
+一条覆盖率门槛，见下面「持续集成」一节）；而这台开发机上没有 CI 服务可挂，所以「CI」同时落成一个谁都能
+在本机跑的入口：
 
 ```powershell
-# 编码/语法体检 + 后端 pytest + 覆盖率门槛 + 前端 node --test + 覆盖率门槛
+# 编码/语法体检 + 后端 ruff + 后端 pytest + 覆盖率门槛 + 前端 node --test + 覆盖率门槛 + eslint + prettier
 .\.venv\Scripts\python.exe scripts\check_all.py
-# 只做编码与语法体检（几秒钟，适合改完文件先自查）
+# 只做编码/语法体检 + 后端 ruff（几秒钟，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
 # 再加 17 页 × 3 档的真机页面扫描（要求前后端已启动）
 .\.venv\Scripts\python.exe scripts\check_all.py --with-pages
@@ -138,7 +141,8 @@
 用 PowerShell 的 `Get-Content` / `Set-Content -Encoding utf8` 往返源文件时，它按系统 ANSI 代码页
 （本机 cp936）重写内容，结果文件开头多出 BOM、正文变成 mojibake，python 直接报
 `SyntaxError: invalid non-printable character U+FEFF`。**改源文件一律用编辑器/工具链的读写，不要用
-PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨兵。
+PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨兵（顺带带上 ruff —— 它不碰数据库、
+不到一秒，够快才可能次次都跑）。
 
 `npm run build` 在本机沙箱会失败（见下），所以自检不含构建步骤，界面验收走 `--with-pages`。
 
@@ -154,8 +158,9 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 
 - **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
-- **钩子默认只跑 `--quick`**（编码 + 语法，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
-  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 173 项与前端 35 项一起跑。
+- **钩子默认只跑 `--quick`**（编码 + 语法 + ruff，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
+  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 173 项、前端 35 项与两侧的 lint/覆盖率门槛
+  一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
   而钩子是 shell 脚本，行尾多一个 CR 会让 shebang 变成 `/bin/sh\r`，钩子直接报 bad interpreter。
@@ -346,6 +351,7 @@ PPT 的下载用例会真的用 `python-pptx` 打开返回的字节流，断言�
 
 ```powershell
 cd frontend; npm test        # 等价于 node --test --import ./tests/support/register.mjs tests/*.test.mjs
+cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
 35 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
@@ -396,8 +402,8 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 87.93%、分支 87.44% | **87.0% / 86.0%** | 全量 173 项跑完后的 TOTAL 行 |
-| 前端（node `--experimental-test-coverage`） | 平均语句 96.06%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 173 项跑完后的 TOTAL 行 |
+| 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
 
@@ -413,9 +419,40 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 `rag/answer.py`、`rag/rerank.py`），跑完的覆盖表会直接列出缺口行号（满覆盖的文件不打印）。
 
 前端那两个数字是**真的跨 node 版本对齐过**的：本机 node 24（树形表）与 `node:20` 容器（平铺表）的真实
-输出喂给同一份解析，都是 12/12 个模块、平均语句 96.06%、平均分支 88.37% —— 这正是「只算固定名单的
-平均值、不看 `all files`」的原因（`all files` 在两个版本里分别是 97.00% 与 97.95%，因为 node 20 把
-`tests/*.test.mjs` 也算进去了）。
+输出喂给同一份解析，都是 12/12 个模块、平均语句 95.82%、平均分支 88.37% —— 这正是「只算固定名单的
+平均值、不看 `all files`」的原因（`all files` 在两个版本里分别是 95.99% 与 97.13%：node 20 的表把
+`tests/*.test.mjs` 自己也算了进去，node 24 的树形表则根本不列测试文件）。
+
+### 代码风格与 lint
+
+两个方向各有一套工具，配置**都落在仓库里**（规则集写死，不吃工具版本的默认值）：
+
+| 范围 | 工具与配置文件 | 跑法 |
+| --- | --- | --- |
+| 后端 | ruff —— 仓库根 `ruff.toml` | `check_all.py --quick` 里的一步（也就进了 CI 与 pre-commit）；单独跑 `.\.venv\Scripts\ruff.exe check .` |
+| 前端 | eslint —— `frontend/eslint.config.js`；prettier —— `frontend/.prettierrc.json` | `npm run lint` / `npm run format:check`（`npm run format` 就地改写） |
+
+**分工是刻意的：eslint 只管「写错了」，排版全归 prettier。** ESLint 10 的 `recommended` 里带着一批
+排版规则，打开就会和 prettier 互相改来改去 —— 所以 `frontend/eslint.config.js` 只取 `flat/essential`
+（真正会出错的规则：未使用变量、未定义引用、Vue 模板里的明显错误）。前端历史上那 6 个
+`no-unused-vars` 全是真缺陷或真死代码（未使用的 `formatTime` 导入、算了没人用的页码变量），
+不是「风格不合口味」。
+
+`ruff.toml` 的规则集与忽略项也都是显式的（`select = E4/E7/E9/F/I/UP/B/SIM/C4/PIE`）：ruff 各版本的
+默认规则集并不相同 —— 0.16 的无配置运行在一份干净代码上就报出 376 项（含 `RUF` 把中文全角标点当
+「易混淆字符」的误报），靠默认值只会得到「换台机器红绿不同」。没选的（`RUF` 全族、`E501` 行长）与
+ignore 掉的（`E402`、`E701`/`E702`、`B008`、`UP031`）各有理由，都写在配置文件的注释里：
+
+- `E402`：本项目多处需要「先设环境变量 / 先 `sys.path` 再 import」（空库探针要先设 `DATABASE_URL`）。
+- `E701` / `E702`：`if not x: return`、`except Exception: pass` 是既有写法。
+- `B008`：FastAPI 的 `Depends(...)` / `Query(...)` 写在默认参数里是标准写法（全项目 125 处）。
+- `RUF` 全族：`RUF001/002/003` 把中文全角标点当「易混淆字符」批量误报（注释与提示文案全是中文）。
+- `E501`：中文文案本来就长，行宽交给评审（`line-length = 110` 只用于工具自身）。
+- `UP031`：真机脚本里用 `%s` 往浏览器执行的 JS 片段插字面量（片段本身全是 `() => { ... }` 花括号，
+  改 f-string 要到处写双花括号）。
+
+三个配置文件都有守卫：`scripts/verify_ci_workflow.py` 会核对它们存在、CI 里真的跑了 eslint 与
+prettier、并且这一节写明了「写错」与「排版」的边界 —— 否则下一个人把排版规则打开，两套工具就会打架。
 
 ## 持续集成（CI）
 
@@ -423,8 +460,8 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick` → `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ 后端全量 173 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 后端全量 173 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -459,10 +496,11 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 ### 工作流自检（`scripts/verify_ci_workflow.py`）
 
 CI 配置本身没有测试，而它「绿」不等于它真的在测东西，所以这份 YAML 由
-`scripts/verify_ci_workflow.py` 静态核对 32 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
+`scripts/verify_ci_workflow.py` 静态核对 42 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
 没人跑的死代码）。它卡住的都是具体的事：镜像 tag 与 `docker-compose.yml` 漂了、少设 `DATABASE_URL`
 （全 skip）、`continue-on-error` 把失败吞了、环境变量名写错退化成默认值、脚本改名后工作流指向一个不存在的
-路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉。
+路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉、lint 或覆盖率门槛从流水线里
+悄悄消失（含 README 里写的阈值/配置文件与脚本对不上）。
 
 真机等价地跑一遍整条 `backend` job（不需要 GitHub，用空库代替干净的服务）：
 
@@ -478,7 +516,7 @@ Remove-Item Env:\DATABASE_URL      # 记得切回主库，跑完把 finance_ci �
 `frontend` job 同理（容器里没有本机那条 esbuild 限制）：
 
 ```powershell
-docker run --rm -v "${PWD}\frontend:/src:ro" -w /build node:20 sh -c "cp -r /src/. /build/ && npm ci && npm test && npm run build"
+docker run --rm -v "${PWD}\frontend:/src:ro" -w /build node:20 sh -c "cp -r /src/. /build/ && npm ci && npm run lint && npm run format:check && npm test && npm run build"
 .\.venv\Scripts\python.exe scripts\check_frontend_coverage.py   # 覆盖门槛跑同一套用例，只是带 --experimental-test-coverage
 ```
 

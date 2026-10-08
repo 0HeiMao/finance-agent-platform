@@ -18,12 +18,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
-import shutil
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -95,7 +93,7 @@ def write_new_file(payload: bytes, target: Path, force: bool) -> Path:
     if target.exists() and not force:
         raise FileExistsError(f"目标文件已存在，按只读约定不覆盖：{target.name}（如需另存请加 --force）")
     if target.exists() and force:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         target = target.with_name(f"{target.stem}.{stamp}{target.suffix}")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(payload)

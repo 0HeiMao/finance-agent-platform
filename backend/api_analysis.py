@@ -1,17 +1,28 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import extract, func, select, delete
+from sqlalchemy import delete, extract, func, select
 from sqlalchemy.orm import Session
+
 from backend import audit, locks, rollups
-from backend.auth import current_user
 from backend.alert_rules import ensure_rules, evaluate, metric_values, resolve_rules
+from backend.auth import current_user
 from backend.db import get_db
 from backend.models import AlertRule, FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.periods import GRAIN_LABELS
-from backend.scope import (Scope, in_scope, resolve_requested_scope, scope_alert,
-                           scope_label, scope_metric, scope_of, scope_payload, scope_transactions)
+from backend.scope import (
+    Scope,
+    in_scope,
+    resolve_requested_scope,
+    scope_alert,
+    scope_label,
+    scope_metric,
+    scope_of,
+    scope_payload,
+    scope_transactions,
+)
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
@@ -202,7 +213,7 @@ def all_alerts(period: str | None = None, status: str | None = Query(None, max_l
     total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
     statement = condition.order_by(FinancialAlert.period.desc(), FinancialAlert.id.desc()).limit(limit).offset(row_offset)
     rows = db.scalars(statement).all()
-    periods = [p for p in db.scalars(scope_metric(select(FinancialMetric.period), scope).order_by(FinancialMetric.period.desc())).all()]
+    periods = list(db.scalars(scope_metric(select(FinancialMetric.period), scope).order_by(FinancialMetric.period.desc())).all())
     return {
         "scope": payload,
         "data": [_alert_json(x) for x in rows],
@@ -221,7 +232,7 @@ def alert_stats(period: str | None = None, department: str | None = Query(None, 
     condition = scope_alert(select(FinancialAlert.review_status, func.count()), scope)
     if period:
         condition = condition.where(FinancialAlert.period == period)
-    counts = {status: 0 for status in REVIEW_STATUSES}
+    counts = dict.fromkeys(REVIEW_STATUSES, 0)
     for status, total in db.execute(condition.group_by(FinancialAlert.review_status)).all():
         counts[status or "pending"] = int(total)
     counts["total"] = sum(counts[status] for status in REVIEW_STATUSES)
@@ -253,7 +264,7 @@ def review_alert(alert_id: int, payload: ReviewInput, request: Request,
         row.reviewed_at = None
     else:
         row.reviewed_by = user.username
-        row.reviewed_at = datetime.now(timezone.utc)
+        row.reviewed_at = datetime.now(UTC)
     # 「这条预警被谁判成了误报」是事后复盘的核心事实，必须留痕（备注截断到 200 字以内）
     audit.record(db, user, "alert.review", target_type="alert", target_id=row.id,
                  detail={"period": row.period, "alert_type": row.alert_type, "department": row.department or "全公司",

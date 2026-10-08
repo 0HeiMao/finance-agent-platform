@@ -36,9 +36,13 @@ function makeNode(type, text = '') {
     value: '',
     addEventListener() {},
     removeEventListener() {},
-    dispatchEvent() { return true },
+    dispatchEvent() {
+      return true
+    },
     // vModelText 的 beforeUpdate 会问「这个输入框是不是当前焦点」，用 getRootNode 反查 document
-    getRootNode() { return fakeDocument },
+    getRootNode() {
+      return fakeDocument
+    }
   }
 }
 
@@ -63,8 +67,13 @@ const renderer = createRenderer({
   createElement: (type) => makeNode(type),
   createText: (text) => makeNode('#text', text),
   createComment: (text) => makeNode('#comment', text),
-  setText: (node, text) => { node.text = text },
-  setElementText: (node, text) => { node.text = text; node.children = [] },
+  setText: (node, text) => {
+    node.text = text
+  },
+  setElementText: (node, text) => {
+    node.text = text
+    node.children = []
+  },
   insert(child, parent, anchor = null) {
     child.parent = parent
     const index = anchor ? parent.children.indexOf(anchor) : -1
@@ -87,7 +96,7 @@ const renderer = createRenderer({
     el.props[key] = next
     // `v-html` 的记录：对象树不解析 HTML，把它单独存一份给 textOf 用
     if (key === 'innerHTML') el.rawHtml = next
-  },
+  }
 })
 
 // ---------------------------------------------------------------- 环境补丁
@@ -102,10 +111,16 @@ export function installBrowserShims({ env = {}, fetchImpl = null } = {}) {
     setItem: (key, value) => store.set(key, String(value)),
     removeItem: (key) => store.delete(key),
     clear: () => store.clear(),
-    get length() { return store.size },
+    get length() {
+      return store.size
+    }
   }
   globalThis.window = globalThis.window || {}
-  globalThis.window.location = { assign: (url) => { globalThis.window.__redirect = url } }
+  globalThis.window.location = {
+    assign: (url) => {
+      globalThis.window.__redirect = url
+    }
+  }
   // AppSidebar 挂载时读 matchMedia 判断窄屏；测试里一律当宽屏
   globalThis.window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} })
   // saveBlob 里的延迟 revoke：测试里没有必要真的挂 60 秒的定时器（会让 node --test 迟迟不退出）
@@ -115,13 +130,21 @@ export function installBrowserShims({ env = {}, fetchImpl = null } = {}) {
   Object.assign(fakeDocument, {
     body: { appendChild: () => {} },
     createElement: () => ({
-      href: '', download: '', style: {},
-      click() { downloads.push({ href: this.href, download: this.download }) },
-      remove() {},
-    }),
+      href: '',
+      download: '',
+      style: {},
+      click() {
+        downloads.push({ href: this.href, download: this.download })
+      },
+      remove() {}
+    })
   })
   globalThis.document = fakeDocument
-  globalThis.fetch = fetchImpl || (async () => { throw new Error('测试里没有装 fetch') })
+  globalThis.fetch =
+    fetchImpl ||
+    (async () => {
+      throw new Error('测试里没有装 fetch')
+    })
   return { localStorage: globalThis.localStorage, downloads }
 }
 
@@ -154,7 +177,7 @@ export function fakeFetch(routes) {
 export function jsonResponse(body, { status = 200, headers = {} } = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json', ...headers }
   })
 }
 
@@ -175,8 +198,8 @@ export function mount(Component, { props = {}, slots = {}, global = {} } = {}) {
 
   const find = (predicate) => walk(container, predicate)[0] || null
   const all = (predicate) => walk(container, predicate)
-  const byText = (needle, type = null) => find((node) =>
-    (type ? node.type === type : true) && textOf(node).includes(needle))
+  const byText = (needle, type = null) =>
+    find((node) => (type ? node.type === type : true) && textOf(node).includes(needle))
   const buttons = () => all((node) => node.type === 'button')
   const select = () => find((node) => node.type === 'select')
 
@@ -219,7 +242,7 @@ export function mount(Component, { props = {}, slots = {}, global = {} } = {}) {
       else throw new Error('输入框上没有 input 处理器')
       node.value = value
       await nextTick()
-    },
+    }
   }
 }
 

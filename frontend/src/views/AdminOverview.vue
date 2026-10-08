@@ -30,7 +30,7 @@ const COUNT_LABELS = [
   ['alerts', '预警', '条'],
   ['knowledge_chunks', '知识库片段', '条'],
   ['knowledge_sources', '知识库来源', '份'],
-  ['batches', '导入批次', '个'],
+  ['batches', '导入批次', '个']
 ]
 
 // 只看最慢的几条路径：全局 P95 说明整体感受，路径 P95 才指出该去优化谁。
@@ -54,7 +54,17 @@ function isOverThreshold(row) {
 // 季/年落库：正常路径由重算指标自动刷新，这里给「老库回填」和「怀疑数字不对时手工重算」兜底。
 const rebuilding = ref(false)
 const rebuildNotice = ref('')
-const coverage = computed(() => data.value?.rollups || { rows: 0, company_rows: 0, department_rows: 0, quarters: [], years: [], incomplete: [] })
+const coverage = computed(
+  () =>
+    data.value?.rollups || {
+      rows: 0,
+      company_rows: 0,
+      department_rows: 0,
+      quarters: [],
+      years: [],
+      incomplete: []
+    }
+)
 
 async function rebuildRollups() {
   rebuilding.value = true
@@ -88,7 +98,9 @@ onMounted(load)
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -101,7 +113,10 @@ onMounted(load)
       </section>
 
       <template v-else-if="data">
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
 
         <section class="page-card">
           <div class="card-head">
@@ -151,7 +166,9 @@ onMounted(load)
             <div>
               <span>落库合计行</span>
               <strong>{{ coverage.rows }} 行</strong>
-              <small>全公司 {{ coverage.company_rows }} 行 · 部门口径 {{ coverage.department_rows }} 行</small>
+              <small
+                >全公司 {{ coverage.company_rows }} 行 · 部门口径 {{ coverage.department_rows }} 行</small
+              >
             </div>
             <div>
               <span>已落季度 / 年度</span>
@@ -164,10 +181,15 @@ onMounted(load)
           <ul v-else class="dir-list">
             <li v-for="row in coverage.incomplete" :key="`${row.grain}-${row.period}-${row.department}`">
               <div class="dir-head">
-                <strong>{{ row.period_label }}<span v-if="row.department"> · {{ row.department_label }}</span></strong>
+                <strong
+                  >{{ row.period_label
+                  }}<span v-if="row.department"> · {{ row.department_label }}</span></strong
+                >
                 <span class="level high">缺 {{ row.missing_months.length }} 个月</span>
               </div>
-              <small class="quality-hint bad">缺 {{ row.missing_months.join('、') }}；这些月份没有导入数据，合计只覆盖已有的月份</small>
+              <small class="quality-hint bad"
+                >缺 {{ row.missing_months.join('、') }}；这些月份没有导入数据，合计只覆盖已有的月份</small
+              >
             </li>
           </ul>
           <div class="card-actions">
@@ -175,7 +197,9 @@ onMounted(load)
               {{ rebuilding ? '重算中…' : '重算季/年落库' }}
             </button>
             <small v-if="rebuildNotice" class="quality-hint">{{ rebuildNotice }}</small>
-            <small v-else class="quality-hint">重算指标、导入、撤销批次都会自动刷新对应的季与年；这里用于老库回填。</small>
+            <small v-else class="quality-hint"
+              >重算指标、导入、撤销批次都会自动刷新对应的季与年；这里用于老库回填。</small
+            >
           </div>
         </section>
 
@@ -191,8 +215,10 @@ onMounted(load)
                 <strong>{{ batch.short }}…</strong>
                 <span class="level low">{{ batch.rows }} 行</span>
               </div>
-              <small class="quality-hint">{{ batch.first_date }} ~ {{ batch.last_date }} ·
-                {{ batch.periods.length }} 个期间 · 导入于 {{ batch.imported_at }}</small>
+              <small class="quality-hint"
+                >{{ batch.first_date }} ~ {{ batch.last_date }} · {{ batch.periods.length }} 个期间 · 导入于
+                {{ batch.imported_at }}</small
+              >
             </li>
           </ul>
         </section>
@@ -237,11 +263,15 @@ onMounted(load)
                 <span class="level high">超阈值 {{ row.exceeded }} 次</span>
               </div>
               <small class="quality-hint">
-                阈值 {{ row.threshold_ms }} ms · 最慢 {{ row.worst_ms }} ms · 最近 {{ row.last_ms }} ms（{{ row.last_at }}）
+                阈值 {{ row.threshold_ms }} ms · 最慢 {{ row.worst_ms }} ms · 最近 {{ row.last_ms }} ms（{{
+                  row.last_at
+                }}）
               </small>
             </li>
           </ul>
-          <p class="quality-hint">每路径只保留最近 {{ data.observability.samples_per_path }} 次采样；进程重启即清零。</p>
+          <p class="quality-hint">
+            每路径只保留最近 {{ data.observability.samples_per_path }} 次采样；进程重启即清零。
+          </p>
         </section>
 
         <section class="page-card">
@@ -270,7 +300,9 @@ onMounted(load)
               <div class="dir-head">
                 <strong><router-link class="link" to="/admin/audit">审计日志</router-link></strong>
               </div>
-              <small class="quality-hint">导入、撤销批次、删账号、删知识库、改规则、处理预警、导出都会留痕</small>
+              <small class="quality-hint"
+                >导入、撤销批次、删账号、删知识库、改规则、处理预警、导出都会留痕</small
+              >
             </li>
             <li>
               <div class="dir-head">

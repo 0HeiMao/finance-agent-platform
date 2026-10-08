@@ -10,7 +10,13 @@ export function errorMessage(detail, fallback = '请求失败') {
   if (typeof detail === 'string' && detail.trim()) return detail
   if (Array.isArray(detail)) {
     const parts = detail
-      .map((item) => (typeof item === 'string' ? item : item?.msg ? `${(item.loc || []).slice(1).join('.')}：${item.msg}` : ''))
+      .map((item) =>
+        typeof item === 'string'
+          ? item
+          : item?.msg
+            ? `${(item.loc || []).slice(1).join('.')}：${item.msg}`
+            : ''
+      )
       .filter(Boolean)
     if (parts.length) return parts.join('；')
   }
@@ -34,13 +40,34 @@ export async function apiFetch(path, options = {}) {
 }
 
 export async function readSSE(path, body, { onDelta, onDone, onError, signal }) {
-  const response = await apiFetch(path, { method: 'POST', body: JSON.stringify(body), signal, headers: { Accept: 'text/event-stream' } })
-  const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
+  const response = await apiFetch(path, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+    headers: { Accept: 'text/event-stream' }
+  })
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
   try {
     while (true) {
-      const { value, done } = await reader.read(); if (done) break
-      buffer += decoder.decode(value, { stream: true }); const events = buffer.split('\n\n'); buffer = events.pop() || ''
-      for (const raw of events) { const event = raw.match(/^event:\s*(.+)$/m)?.[1] || 'delta'; const data = raw.match(/^data:\s*(.+)$/m)?.[1]; if (!data) continue; const payload = JSON.parse(data); if (event === 'delta') onDelta?.(payload.text || ''); else if (event === 'done') onDone?.(payload); else if (event === 'error') onError?.(payload) }
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const events = buffer.split('\n\n')
+      buffer = events.pop() || ''
+      for (const raw of events) {
+        const event = raw.match(/^event:\s*(.+)$/m)?.[1] || 'delta'
+        const data = raw.match(/^data:\s*(.+)$/m)?.[1]
+        if (!data) continue
+        const payload = JSON.parse(data)
+        if (event === 'delta') onDelta?.(payload.text || '')
+        else if (event === 'done') onDone?.(payload)
+        else if (event === 'error') onError?.(payload)
+      }
     }
-  } catch (error) { onError?.({ message: error.message || '流式连接中断' }); throw error }
+  } catch (error) {
+    onError?.({ message: error.message || '流式连接中断' })
+    throw error
+  }
 }

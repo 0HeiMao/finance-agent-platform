@@ -16,7 +16,7 @@ import csv
 import io
 import logging
 import re
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -27,12 +27,18 @@ from sqlalchemy.orm import Session
 
 from backend import audit, batch_ops, jobs, lockout, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
-from backend.api_analysis import calculate
 from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
 from backend.db import get_db
-from backend.models import (AlertRule, BackgroundJob, FinancialAlert, FinancialMetric, FinancialRollup,
-                            FinancialTransaction, User)
+from backend.models import (
+    AlertRule,
+    BackgroundJob,
+    FinancialAlert,
+    FinancialMetric,
+    FinancialRollup,
+    FinancialTransaction,
+    User,
+)
 from backend.observability import snapshot
 from backend.periods import GRAIN_LABELS, grain_of
 from backend.rag.pgvector_store import DocumentChunk
@@ -339,7 +345,7 @@ def list_users(
                 # 登录失败锁定（backend/lockout.py）：失败次数与「还剩几秒解锁」都要给出去，
                 # 否则管理员只看到「登不上」，分不清是密码错还是被锁了。
                 "failed_attempts": int(user.failed_attempts or 0),
-                "locked_until": (user.locked_until.astimezone(timezone.utc).isoformat()
+                "locked_until": (user.locked_until.astimezone(UTC).isoformat()
                                  if user.locked_until else None),
                 "locked": bool(lockout.locked_for(user)),
                 "is_self": user.id == me.id,
@@ -930,9 +936,8 @@ def update_alert_rule_by_id(rule_id: int, payload: AlertRuleScope, request: Requ
     before = _rule_snapshot(rule)
     department = _clean_text(payload.department) if payload.department is not None else rule.department
     period = _clean_text(payload.period) if payload.period is not None else rule.period
-    if period:
-        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
-            raise HTTPException(422, "期间要写成 YYYY-MM")
+    if period and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+        raise HTTPException(422, "期间要写成 YYYY-MM")
     if payload.metric_name is not None:
         rule.metric_name = _metric_or_422(payload.metric_name, "metric_name")
     if payload.comparator is not None:
@@ -1113,7 +1118,7 @@ def export_audit(
                          "ip": ip or "", "since": str(since or ""), "until": str(until or "")},
                  request=request)
     db.commit()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"audit-{stamp}.csv"
     return Response(
         content="\ufeff" + buffer.getvalue(),

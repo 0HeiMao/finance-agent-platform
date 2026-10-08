@@ -41,7 +41,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from backend.config import clear_settings_cache, get_settings  # noqa: E402
-from backend.db import SessionLocal, engine, get_db
+from backend.db import SessionLocal, engine
 from backend.main import app
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.rag.embeddings import get_embedding_service
@@ -136,8 +136,8 @@ async def main() -> int:
             check(evidence["has_data"] is True, "[证据] has_data=True")
             check(evidence["period"] == TEMP_PERIOD, f"[证据] 识别出问题中的期间 {evidence.get('period')}")
             section = evidence["context"].split("### 当前期间明细")[0]
-            check(TEMP_AMOUNTS <= amounts_of(section), f"[证据] 汇总表含 {sorted(TEMP_AMOUNTS)}")
-            check(TEMP_AMOUNTS <= amounts_of(evidence["context"]), "[证据] 金额按元输出、无千分位（可逐字引用）")
+            check(amounts_of(section) >= TEMP_AMOUNTS, f"[证据] 汇总表含 {sorted(TEMP_AMOUNTS)}")
+            check(amounts_of(evidence["context"]) >= TEMP_AMOUNTS, "[证据] 金额按元输出、无千分位（可逐字引用）")
             check(f"{marker}-部门A" in evidence["context"] and f"{marker}-科目A" in evidence["context"],
                   "[证据] 上下文含部门/科目明细")
             check("验证专用利润异常" in evidence["context"], "[证据] 上下文含本期系统预警")

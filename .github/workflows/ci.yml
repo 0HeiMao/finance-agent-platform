@@ -1,10 +1,11 @@
 # 持续集成：push / PR 时跑「不需要演示数据、不需要向量模型、不需要模型 Key」的那部分门禁。
 #
 # 覆盖（两项，各自完全可复现）：
-#   后端 job — scripts/check_all.py --quick、scripts/verify_ci_workflow.py、
+#   后端 job — scripts/check_all.py --quick（含 ruff lint）、scripts/verify_ci_workflow.py、
 #              scripts/check_coverage.py（覆盖率门槛，内部就是 pytest 全量）
 #   前端 job — npm ci、npm test（node --test 全量）、scripts/check_frontend_coverage.py
-#              （覆盖率门槛，跑同一套用例）、npm run build
+#              （覆盖率门槛，跑同一套用例）、npm run lint（eslint）、npm run format:check
+#              （prettier）、npm run build
 #
 # 有意**不**覆盖（见 README「持续集成（CI）」）：需要演示库 / 470MB 向量模型 / 真模型 API Key 的
 # 真机脚本（scripts/verify_*.py、scripts/check_pages.py、scripts/ui_components_smoke.py）。
@@ -72,7 +73,7 @@ jobs:
         run: pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: 安装依赖
         run: pip install -r requirements.txt
-      - name: 结构门禁（文件编码 + .py 解析）
+      - name: 结构门禁（文件编码 + .py 解析 + ruff lint）
         run: python scripts/check_all.py --quick
       - name: 工作流自检（镜像/环境变量/脚本路径的不变量）
         run: python scripts/verify_ci_workflow.py
@@ -83,7 +84,7 @@ jobs:
         run: python scripts/check_coverage.py
 
   frontend:
-    name: 前端（node --test + 生产构建）
+    name: 前端（lint + node --test + 生产构建）
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -99,6 +100,13 @@ jobs:
       # 也只有在 lockfile 与 package.json 不同步时才会报错（那时本地也该先跑一次 npm install）。
       - name: 安装依赖（按 lockfile）
         run: npm ci
+      # lint 与 format 分开：eslint 只管「写错了」，排版全归 prettier（两边同时管格式会互相打架，
+      # 理由写在 frontend/eslint.config.js 顶部）。两个都是纯静态检查，放在跑用例之前，
+      # 这样「代码格式不对」不会先花掉几分钟测试时间。
+      - name: 前端 lint（eslint）
+        run: npm run lint
+      - name: 前端格式检查（prettier --check）
+        run: npm run format:check
       - name: 前端测试（node --test）
         run: npm test
       # node 自带的覆盖表由脚本自己解析并卡阈值（`--test-coverage-lines` 要 node 22+，

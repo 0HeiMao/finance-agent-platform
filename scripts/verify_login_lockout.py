@@ -24,7 +24,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -135,7 +135,7 @@ def main() -> int:
           ok_columns,
           f"failed_attempts={columns.get('failed_attempts')} locked_until={columns.get('locked_until')}")
 
-    sequence = [lockout.lock_seconds(n) for n in range(0, 11)]
+    sequence = [lockout.lock_seconds(n) for n in range(11)]
     check("退避公式：阈值前不锁，从阈值起翻倍、到顶封住",
           sequence[:5] == [0, 0, 0, 0, 0] and sequence[5:11] == [60, 120, 240, 480, 900, 900],
           f"threshold={SETTINGS.login_lockout_threshold} 序列={sequence}")
@@ -149,7 +149,7 @@ def main() -> int:
 
     threshold = int(SETTINGS.login_lockout_threshold)
     below: list[tuple[int, int, str]] = []
-    for attempt in range(1, threshold):
+    for _ in range(1, threshold):
         status, body, _headers = wrong_login(name_a)
         row = user_row(name_a)
         below.append((status, row["failed_attempts"], str(row["locked_until"])))
@@ -162,7 +162,7 @@ def main() -> int:
     row = user_row(name_a)
     check(f"第 {threshold} 次失败把账号锁上：库里次数到 {threshold}、locked_until 落库、剩余锁定时间在 (0, 60] 秒",
           status == 401 and row["failed_attempts"] == threshold and row["locked_until"] is not None
-          and 0 < (row["locked_until"] - datetime.now(timezone.utc)).total_seconds() <= 60,
+          and 0 < (row["locked_until"] - datetime.now(UTC)).total_seconds() <= 60,
           f"status={status} 次数={row['failed_attempts']} locked_until={row['locked_until']}")
 
     # ---------------------------------------------------------- 锁上之后：口令正确也进不来
@@ -240,7 +240,7 @@ def main() -> int:
     before = user_row(name_b)["failed_attempts"]
     with engine.begin() as conn:
         conn.execute(text("UPDATE users SET last_failed_at = :t WHERE id = :i"),
-                     {"t": datetime.now(timezone.utc)
+                     {"t": datetime.now(UTC)
                       - timedelta(seconds=int(SETTINGS.login_failure_ttl_seconds) + 60), "i": id_b})
     status, _body, _headers = wrong_login(name_b)
     row = user_row(name_b)

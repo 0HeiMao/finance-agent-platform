@@ -1,16 +1,19 @@
 import json
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from backend.auth import current_user
+
 from backend.ai_service import rag_answer
 from backend.api_rag import ChunkScope, retrieve_for_user, user_department_of
+from backend.auth import current_user
 from backend.db import SessionLocal
-from backend.rag.financial_evidence import collect as collect_financial_evidence
-from backend.llm import get_llm
 from backend.limits import ai_quota
+from backend.llm import get_llm
 from backend.models import User
+from backend.rag.financial_evidence import collect as collect_financial_evidence
 from backend.scope import resolve_requested_scope, scope_of, scope_payload
+
 router = APIRouter(prefix="/api/v1/ai", tags=["ai"])
 class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)

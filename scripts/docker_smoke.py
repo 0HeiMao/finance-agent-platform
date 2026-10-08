@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import subprocess
 import sys
@@ -93,10 +94,8 @@ def wait_healthy(deadline: int = 180) -> dict[str, str]:
         for line in (result.stdout or "").splitlines():
             line = line.strip()
             if line.startswith("{"):
-                try:
+                with contextlib.suppress(json.JSONDecodeError):
                     rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
         states = {row.get("Service", "?"): row.get("Health") or row.get("State", "?") for row in rows}
         if len(states) >= 3 and all(value.lower() in {"healthy", "running"} for value in states.values()):
             break

@@ -216,7 +216,7 @@ def scratch_benchmark() -> None:
         check("没索引时是顺序扫（全表）", "Seq Scan" in nodes, f"{before_ms:.2f} ms | {nodes}")
 
         connection.execute(text(
-            f"CREATE INDEX scratch_index_probe_dept_date ON scratch_index_probe (department, transaction_date)"))
+            "CREATE INDEX scratch_index_probe_dept_date ON scratch_index_probe (department, transaction_date)"))
         connection.execute(text("ANALYZE scratch_index_probe"))
         nodes, after_ms = best_of(connection, day_query)
         check("建完复合索引就用上它", "scratch_index_probe_dept_date" in nodes, f"{after_ms:.2f} ms | {nodes}")

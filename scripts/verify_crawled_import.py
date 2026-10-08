@@ -175,12 +175,12 @@ async def verify() -> int:
         fields = list(rows[0].keys())
         for index, row in enumerate(rows):
             row["摘要"] = f"{args.sentinel}-{index}"
-        handle = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8-sig", newline="")
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-        handle.close()
-        temp_csv = Path(handle.name)
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
+                                          encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+            temp_csv = Path(handle.name)
         atexit.register(lambda: temp_csv.unlink(missing_ok=True))
         csv_path = temp_csv
         expected["bytes"] = csv_path.read_bytes()
@@ -379,7 +379,11 @@ async def verify() -> int:
                 print("\n[8] RAG 闭环（本地 384 维模型，事务内回滚）")
                 try:
                     from backend.rag.embeddings import get_embedding_service
-                    from backend.rag.pgvector_store import EMBEDDING_DIMENSION, add_documents, search_documents
+                    from backend.rag.pgvector_store import (
+                        EMBEDDING_DIMENSION,
+                        add_documents,
+                        search_documents,
+                    )
 
                     service = get_embedding_service()
                     model_name = service.model_name

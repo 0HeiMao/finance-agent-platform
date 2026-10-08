@@ -22,7 +22,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from check_pages import CdpSession, OVERFLOW_JS, _auto_login_page, _browser, _debugger_url  # noqa: E402
+from check_pages import OVERFLOW_JS, CdpSession, _auto_login_page, _browser, _debugger_url  # noqa: E402
 
 API = "http://127.0.0.1:8000/api/v1"
 FRONT = "http://127.0.0.1:5173"

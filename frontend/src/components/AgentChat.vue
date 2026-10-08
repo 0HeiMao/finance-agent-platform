@@ -12,7 +12,7 @@ import { renderMarkdown } from '../utils/markdown'
  */
 const props = defineProps({
   full: { type: Boolean, default: false },
-  examples: { type: Array, default: () => [] },
+  examples: { type: Array, default: () => [] }
 })
 
 const input = ref('')
@@ -28,7 +28,7 @@ const KIND_LABEL = {
   financial_metric: '财务汇总表',
   financial_alert: '财务预警',
   financial_transaction: '明细账',
-  knowledge_base: '知识库',
+  knowledge_base: '知识库'
 }
 
 function sourceLabel(source) {
@@ -66,21 +66,25 @@ async function ask(text) {
   await scrollToBottom()
   try {
     // 财务范围只认服务端记录 + 当前选择的口径（请求头自述一律不算，见后端注释）
-    await readSSE(withScope('/ai/agent/chat/stream'), { question }, {
-      signal: controller.signal,
-      onDelta: (chunk) => {
-        answer.text += chunk
-        scrollToBottom()
-      },
-      onDone: (payload) => {
-        answer.sources = payload?.sources || []
-        answer.loading = false
-      },
-      onError: (e) => {
-        answer.loading = false
-        error.value = e.message || 'Agent 暂时无法回答'
-      },
-    })
+    await readSSE(
+      withScope('/ai/agent/chat/stream'),
+      { question },
+      {
+        signal: controller.signal,
+        onDelta: (chunk) => {
+          answer.text += chunk
+          scrollToBottom()
+        },
+        onDone: (payload) => {
+          answer.sources = payload?.sources || []
+          answer.loading = false
+        },
+        onError: (e) => {
+          answer.loading = false
+          error.value = e.message || 'Agent 暂时无法回答'
+        }
+      }
+    )
   } catch (e) {
     answer.loading = false
     if (e.name !== 'AbortError') error.value = e.message || '连接中断'
@@ -135,16 +139,13 @@ function clearSession() {
             class="btn"
             :disabled="loading"
             @click="ask(example)"
-          >{{ example }}</button>
+          >
+            {{ example }}
+          </button>
         </div>
       </div>
 
-      <div
-        v-for="(message, index) in messages"
-        :key="index"
-        class="agent-message"
-        :class="message.role"
-      >
+      <div v-for="(message, index) in messages" :key="index" class="agent-message" :class="message.role">
         <span class="agent-avatar">{{ message.role === 'user' ? '我' : 'AI' }}</span>
         <div class="agent-bubble">
           <!-- 模型回答按 Markdown 渲染（内部先转义再解析），用户提问保持纯文本 -->
@@ -172,7 +173,7 @@ function clearSession() {
         :disabled="loading"
         placeholder="输入财务分析问题，例如「2026-07 的费用异常在哪里？」"
         @keyup.enter="sendMessage"
-      >
+      />
       <button class="btn primary" @click="loading ? stop() : sendMessage()">
         {{ loading ? '停止' : '发送' }}
       </button>

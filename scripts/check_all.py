@@ -1,17 +1,21 @@
-"""一键自检：源文件编码/语法体检 + 后端单元测试 + 前端单元测试（可选：真机页面扫描）。
+"""一键自检：编码/语法/lint 体检 + 后端单元测试 + 前端单元测试（可选：真机页面扫描）。
 
 为什么是这个形态：门禁分两层 —— `.github/workflows/ci.yml` 在 push / PR 时跑「不需要演示数据、
-不需要向量模型、不需要模型 Key」的那部分（编码/语法体检 + 后端 pytest + 前端 `npm ci`/`npm test`/
-`npm run build`）；而这台开发机上没有 CI 服务可挂，所以同一套东西还需要一个谁都能在本机跑的入口，
-就是这个脚本（`--quick` 由 `.githooks/pre-commit` 在每次提交前跑，见 `scripts/init_git.py`）。
+不需要向量模型、不需要模型 Key」的那部分（编码/语法体检 + ruff + 后端 pytest + 前端
+`npm ci`/`npm test`/`eslint`/`prettier --check`/`npm run build`）；而这台开发机上没有 CI 服务可挂，
+所以同一套东西还需要一个谁都能在本机跑的入口，就是这个脚本（`--quick` 由
+`.githooks/pre-commit` 在每次提交前跑，见 `scripts/init_git.py`）。lint 一步也刻意拆开：
+后端交给 ruff（仓库根 `ruff.toml`），前端交给 eslint（`frontend/eslint.config.js`）与
+prettier（`frontend/.prettierrc.json`）——「代码写错了」和「代码长得难看」是两件事，
+所以 eslint 只取 essential，排版全归 prettier，两边不会互相打架。
 它同时兜住一类真实事故 —— 用 PowerShell 的
 `Get-Content` / `Set-Content -Encoding utf8` 往返 UTF-8 源文件，会按系统 ANSI 代码页
 （本机 cp936）重写内容，结果文件开头多出 BOM、正文变成 mojibake（`涓嶄緷璧栨暟鎹簱` 这种），
 python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第一步永远是编码体检。
 
 用法：
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + 后端 + 前端（两边都含覆盖率门槛）
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只体检编码与语法
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + lint + 后端 + 前端（两边都含覆盖率门槛）
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只做编码/语法体检 + 后端 ruff（不碰数据库、不需要 npm）
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描
       （--with-pages 需要后端 127.0.0.1:8000 与前端 127.0.0.1:5173 已启动）
 
@@ -127,6 +131,21 @@ def _venv_python() -> str:
     return sys.executable
 
 
+def _venv_tool(name: str) -> str | None:
+    """venv 里的命令行工具（ruff）：pip 装它落的是独立入口，所以不靠 `python -m`。"""
+    binary = f"{name}.exe" if os.name == "nt" else name
+    candidate = PROJECT_ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / binary
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which(name)
+
+
+def _npm() -> str | None:
+    # Windows 上是 npm.cmd，shutil.which 会按 PATHEXT 找到它（直接写 "npm" 在 CI 上没问题、
+    # 在本机也不一定失败，但显式拿到绝对路径能少一类「本地能跑、换台机器不行」）。
+    return shutil.which("npm") or shutil.which("npm.cmd")
+
+
 def _tail(text: str, lines: int = 15) -> str:
     stripped = [line for line in text.strip().splitlines() if line.strip()]
     return "\n".join(f"    {line}" for line in stripped[-lines:])
@@ -172,6 +191,47 @@ def run_frontend_tests() -> Step:
     return step
 
 
+def check_backend_lint() -> Step:
+    """ruff：规则集与「为什么不选某些规则」都写在仓库根的 ruff.toml 里。"""
+    step = Step("后端 lint（ruff check .）")
+    ruff = _venv_tool("ruff")
+    if ruff is None:
+        step.skip("本机没装 ruff，跳过（pip install -r requirements.txt 会带上它）")
+        return step
+    code, output = _run([ruff, "check", "."], PROJECT_ROOT)
+    if code != 0:
+        step.detail = f"退出码 {code}\n{_tail(output, 20)}"
+        return step
+    step.pass_("ruff check . 无告警（规则集见 ruff.toml）")
+    return step
+
+
+def check_frontend_lint() -> Step:
+    step = Step("前端 lint（npm run lint = eslint .）")
+    if _npm() is None:
+        step.skip("本机没有 npm，跳过")
+        return step
+    code, output = _run([_npm() or "npm", "run", "lint", "--silent"], PROJECT_ROOT / "frontend")
+    if code != 0:
+        step.detail = f"退出码 {code}\n{_tail(output, 20)}"
+        return step
+    step.pass_("eslint 无告警（flat config 见 frontend/eslint.config.js）")
+    return step
+
+
+def check_frontend_format() -> Step:
+    step = Step("前端格式检查（npm run format:check = prettier --check）")
+    if _npm() is None:
+        step.skip("本机没有 npm，跳过")
+        return step
+    code, output = _run([_npm() or "npm", "run", "format:check", "--silent"], PROJECT_ROOT / "frontend")
+    if code != 0:
+        step.detail = f"退出码 {code}（跑 `npm run format` 就地修好）\n{_tail(output, 20)}"
+        return step
+    step.pass_("prettier --check 通过（配置见 frontend/.prettierrc.json）")
+    return step
+
+
 def run_pages() -> Step:
     step = Step("真机页面扫描（17 页 × 3 档）")
     code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_pages.py")], PROJECT_ROOT)
@@ -185,16 +245,18 @@ def run_pages() -> Step:
 
 def main() -> int:
     _console()
-    parser = argparse.ArgumentParser(description="一键自检：编码/语法 + 后端测试 + 前端测试")
-    parser.add_argument("--quick", action="store_true", help="只做编码与语法体检")
+    parser = argparse.ArgumentParser(description="一键自检：编码/语法/lint + 后端测试 + 前端测试")
+    parser.add_argument("--quick", action="store_true", help="只做编码/语法/lint 体检（不碰数据库）")
     parser.add_argument("--with-pages", action="store_true", help="追加真机页面扫描（需前后端已启动）")
     args = parser.parse_args()
 
-    print("一键自检（项目根目录：%s）" % PROJECT_ROOT)
-    steps = [check_encoding(), check_python_syntax()]
+    print(f"一键自检（项目根目录：{PROJECT_ROOT}）")
+    steps = [check_encoding(), check_python_syntax(), check_backend_lint()]
     if not args.quick:
         steps.append(run_pytest())
         steps.append(run_frontend_tests())
+        steps.append(check_frontend_lint())
+        steps.append(check_frontend_format())
     if args.with_pages:
         steps.append(run_pages())
 

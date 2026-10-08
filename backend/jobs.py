@@ -19,8 +19,8 @@ broker 和 worker 都不存在，任务提交不出去、也没人调用 `run_mo
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -103,7 +103,7 @@ def run_job(job_id: int, db: Session | None = None) -> None:
         if job is None or job.status not in ACTIVE_STATUSES:
             return
         job.status = "running"
-        job.started_at = datetime.now(timezone.utc)
+        job.started_at = datetime.now(UTC)
         session.commit()
 
         function = HANDLERS.get(job.kind)
@@ -115,7 +115,7 @@ def run_job(job_id: int, db: Session | None = None) -> None:
         job.status = "succeeded"
         job.result = result or {}
         job.error = None
-        job.finished_at = datetime.now(timezone.utc)
+        job.finished_at = datetime.now(UTC)
         session.commit()
     except Exception as exc:  # noqa: BLE001 —— 任务失败要落库，不能让后台线程静默炸掉
         logger.exception("后台任务 %s 失败", job_id)
@@ -125,7 +125,7 @@ def run_job(job_id: int, db: Session | None = None) -> None:
             job.status = "failed"
             # 只留前 500 字：异常文本可能很长，而这张表是给人看的
             job.error = str(exc)[:500]
-            job.finished_at = datetime.now(timezone.utc)
+            job.finished_at = datetime.now(UTC)
             session.commit()
     finally:
         if own_session:
@@ -137,7 +137,7 @@ def reap_stale_jobs(db: Session) -> int:
     result = db.execute(
         update(BackgroundJob)
         .where(BackgroundJob.status.in_(ACTIVE_STATUSES))
-        .values(status="failed", error="进程重启，任务未完成", finished_at=datetime.now(timezone.utc))
+        .values(status="failed", error="进程重启，任务未完成", finished_at=datetime.now(UTC))
     )
     db.commit()
     return result.rowcount or 0

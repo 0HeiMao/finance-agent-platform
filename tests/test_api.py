@@ -10,7 +10,7 @@ import io
 import json
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +27,6 @@ pytestmark = pytest.mark.anyio
 
 from backend.config import get_settings  # noqa: E402
 from backend.models import FinancialAlert, FinancialMetric  # noqa: E402
-
 
 # ---------------------------------------------------------------- 基础
 
@@ -206,6 +205,7 @@ async def test_dashboard_amounts_are_exact_strings(anon_client, auth_headers, db
 
 async def test_dashboard_without_financial_data(anon_client, auth_headers, db_session):
     from sqlalchemy import delete
+
     from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 
     for model in (FinancialAlert, FinancialMetric, FinancialTransaction):
@@ -896,9 +896,10 @@ async def test_admin_knowledge_groups_and_deletes_by_source(anon_client, auth_he
 async def test_admin_knowledge_delete_removes_only_orphan_upload_files(
         anon_client, auth_headers, db_session, tmp_path, monkeypatch):
     """删来源时顺手清理孤儿上传件：还有别的来源引用就不删，引用归零才删，越界路径永不碰。"""
+    from sqlalchemy import func, select
+
     from backend import api_admin
     from backend.rag.pgvector_store import DocumentChunk
-    from sqlalchemy import func, select
 
     upload_dir = tmp_path / "documents"
     upload_dir.mkdir()
@@ -1234,10 +1235,10 @@ async def test_scoped_account_cannot_switch_scope(anon_client, api_app, auth_hea
         assert [item["name"] for item in listing.json()["departments"]] == ["部门A"]
 
         for path in (f"/api/v1/analysis/summary?period={SCOPE_PERIOD}&department=部门B",
-                     f"/api/v1/dashboard?period=month&department=部门B",
+                     "/api/v1/dashboard?period=month&department=部门B",
                      f"/api/v1/reports/monthly?period={SCOPE_PERIOD}&department=部门B",
                      f"/api/v1/reports/pptx/outline?period={SCOPE_PERIOD}&department=部门B",
-                     f"/api/v1/export/transactions?department=部门B"):
+                     "/api/v1/export/transactions?department=部门B"):
             response = await scoped.get(path, headers=headers)
             assert response.status_code == 403, f"{path} -> {response.status_code}"
             assert "不能查看" in response.json()["detail"]
@@ -1330,7 +1331,7 @@ async def test_export_only_contains_callers_scope(anon_client, api_app, auth_hea
     _seed_scoped_period(db_session, SCOPE_PERIOD)
     headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
     try:
-        response = await scoped.get(f"/api/v1/export/transactions?format=csv", headers=headers)
+        response = await scoped.get("/api/v1/export/transactions?format=csv", headers=headers)
         assert response.status_code == 200, response.text
         body = response.content.decode("utf-8-sig")
         assert "部门A" in body and "部门B" not in body
@@ -1345,7 +1346,7 @@ async def test_export_only_contains_callers_scope(anon_client, api_app, auth_hea
 async def test_export_metrics_does_not_add_department_rows_together(anon_client, auth_headers, db_session):
     """管理员导出指标时只能拿到全公司行：两套行混在一起是这套权限模型最危险的失效方式。"""
     _seed_scoped_period(db_session, SCOPE_PERIOD)
-    response = await anon_client.get(f"/api/v1/export/metrics?format=csv", headers=auth_headers)
+    response = await anon_client.get("/api/v1/export/metrics?format=csv", headers=auth_headers)
     assert response.status_code == 200
     text = response.content.decode("utf-8-sig")
     rows = [line for line in text.strip().splitlines() if line][1:]
@@ -1354,7 +1355,7 @@ async def test_export_metrics_does_not_add_department_rows_together(anon_client,
     assert "全公司" in matching[0] and "1000.00" in matching[0]
 
     scoped_export = await anon_client.get(
-        f"/api/v1/export/metrics?format=csv&department=部门B", headers=auth_headers)
+        "/api/v1/export/metrics?format=csv&department=部门B", headers=auth_headers)
     scoped_rows = [line for line in scoped_export.content.decode("utf-8-sig").strip().splitlines() if line][1:]
     scoped_matching = [row for row in scoped_rows if SCOPE_PERIOD in row]
     assert len(scoped_matching) == 1 and "700.00" in scoped_matching[0]
@@ -1805,7 +1806,7 @@ async def test_audit_log_records_register_login_and_failure(anon_client, credent
 
 async def test_audit_log_records_admin_and_data_writes(anon_client, auth_headers, credentials, db_session):
     """七类写操作各写一条：导入/删账号/撤销批次/删知识库/改规则/处理预警/导出。"""
-    from backend.models import AlertRule, FinancialTransaction, User
+    from backend.models import FinancialTransaction, User
     from backend.rag.pgvector_store import DocumentChunk  # chunk 表在 RAG 模块里，不在 models.py
 
     # 1) 改预警规则（旧值/新值都要在 detail 里）
@@ -2014,16 +2015,16 @@ async def test_audit_export_writes_csv_and_leaves_a_trail(anon_client, api_app, 
 
 async def test_audit_purge_respects_retention_and_is_dry_run_first(anon_client, auth_headers, db_session):
     """清理：默认只预览，真删只动过期行，且清理自己留一条 `audit.purge`。"""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from backend import audit
     from backend.models import AuditLog
 
     # 直接在库里造一条 400 天前的旧记录与一条今天的记录（接口不会产生"过去"的时间）
     old = AuditLog(actor="purge-history", action="user.login", target_type="user", target_id="old",
-                   detail={"note": "老到该被清掉"}, ip="", created_at=datetime.now(timezone.utc) - timedelta(days=400))
+                   detail={"note": "老到该被清掉"}, ip="", created_at=datetime.now(UTC) - timedelta(days=400))
     fresh = AuditLog(actor="purge-today", action="user.login", target_type="user", target_id="new",
-                     detail={}, ip="", created_at=datetime.now(timezone.utc))
+                     detail={}, ip="", created_at=datetime.now(UTC))
     db_session.add_all([old, fresh])
     db_session.commit()
 
@@ -2068,7 +2069,7 @@ async def test_audit_purge_respects_retention_and_is_dry_run_first(anon_client, 
 
 async def test_audit_log_filters_by_ip_and_date_range(anon_client, auth_headers, db_session):
     """IP 前缀与日期范围筛选：日期是本地日历日（含首尾），不是"字符串比大小"。"""
-    from datetime import date, datetime, timedelta, timezone
+    from datetime import date, datetime, timedelta
 
     from backend.models import AuditLog
 
@@ -2076,7 +2077,7 @@ async def test_audit_log_filters_by_ip_and_date_range(anon_client, auth_headers,
     # 造一条"三天前"的记录：它必须在三天前的窗口里出现、在今天的窗口里消失
     older = AuditLog(actor="range-history", action="user.login", target_type="user", target_id="old",
                      detail={}, ip="198.51.100.7",
-                     created_at=datetime.now(timezone.utc) - timedelta(days=3))
+                     created_at=datetime.now(UTC) - timedelta(days=3))
     db_session.add(older)
     db_session.commit()
 
@@ -2924,7 +2925,7 @@ async def test_transaction_list_is_scoped_and_filtered(anon_client, api_app, aut
     # 列表里的行要能看出「冲没冲销、改过几次」，前端据此决定按钮状态
     assert all({"reversed", "is_reversal", "corrections", "period"} <= set(item) for item in body["data"])
 
-    paged = await anon_client.get(f"/api/v1/financial/transactions?query=测试科目&limit=2&offset=0",
+    paged = await anon_client.get("/api/v1/financial/transactions?query=测试科目&limit=2&offset=0",
                                   headers=auth_headers)
     assert paged.json()["total"] == 3, "total 是筛选后的总数，不是当前页长度"
     assert len(paged.json()["data"]) == 2
@@ -3250,13 +3251,13 @@ def _legacy_token(user_id: int) -> str:
 
     这类令牌必须继续可用到该账号第一次退出登录为止——否则加这个功能等于把所有人踢下线。
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from jose import jwt as jose_jwt
 
     from backend.auth import ALGORITHM, SECRET_KEY
 
-    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    expires = datetime.now(UTC) + timedelta(minutes=30)
     return jose_jwt.encode({"sub": str(user_id), "username": "legacy", "exp": expires},
                            SECRET_KEY, algorithm=ALGORITHM)
 
@@ -3469,7 +3470,7 @@ async def test_lockout_counter_restarts_after_the_silence_window(anon_client, db
     assert row.failed_attempts == 2
 
     # 把「上次失败」挪到静默期之外：这一次失败应当算第 1 次，而不是第 3 次
-    row.last_failed_at = datetime.now(timezone.utc) - timedelta(seconds=ttl + 60)
+    row.last_failed_at = datetime.now(UTC) - timedelta(seconds=ttl + 60)
     db_session.flush()
     await _wrong_login(anon_client, victim["username"], times=1)
     db_session.refresh(row)

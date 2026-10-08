@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Iterable
+from collections.abc import Iterable
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -35,7 +35,7 @@ NAMESPACE = "finance:recalc"
 
 def lock_key(period: str) -> int:
     """把期间名映射成 advisory lock 的 key：稳定（跨进程、跨重启一致）且落在有符号 64 位内。"""
-    digest = hashlib.sha256(f"{NAMESPACE}:{period}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"{NAMESPACE}:{period}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 

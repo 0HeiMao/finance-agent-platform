@@ -9,7 +9,7 @@ export const JOB_STATUS_LABELS = {
   queued: '排队中',
   running: '运行中',
   succeeded: '已完成',
-  failed: '失败',
+  failed: '失败'
 }
 
 export function statusLabel(status) {
@@ -21,8 +21,10 @@ export function formatTime(value) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '—'
   const pad = (n) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
-    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  )
 }
 
 export function durationText(job) {

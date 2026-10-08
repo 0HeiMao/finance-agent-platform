@@ -3,7 +3,14 @@ import { onMounted, onUnmounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
 import PagePager from '../components/PagePager.vue'
-import { describeResult, durationText, formatTime, periodsText, resultText, statusLabel } from '../utils/format'
+import {
+  describeResult,
+  durationText,
+  formatTime,
+  periodsText,
+  resultText,
+  statusLabel
+} from '../utils/format'
 
 const PAGE_SIZE = 50
 // 后台任务轮询间隔：重算七个期间通常几秒内结束，800ms 足够快地给出反馈，也不至于压满后端。
@@ -28,8 +35,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const response = await apiFetch(
-      `/admin/batches?limit=${PAGE_SIZE}&offset=${offset.value}`)
+    const response = await apiFetch(`/admin/batches?limit=${PAGE_SIZE}&offset=${offset.value}`)
     const payload = await response.json()
     batches.value = payload.data
     total.value = payload.total || 0
@@ -48,7 +54,7 @@ async function loadJobs() {
     const payload = await response.json()
     jobs.value = payload.data
     jobTotal.value = payload.total || 0
-  } catch (e) {
+  } catch {
     // 任务列表读不到不影响撤销主体，不再叠一条错误把人吓一跳
     jobs.value = []
   }
@@ -106,7 +112,7 @@ async function removeBatch(batch) {
   try {
     const response = await apiFetch('/admin/jobs/batch-revert', {
       method: 'POST',
-      body: JSON.stringify({ batch: batch.batch }),
+      body: JSON.stringify({ batch: batch.batch })
     })
     const job = await response.json()
     pendingBatch.value = batch.batch
@@ -138,11 +144,15 @@ onUnmounted(stopPolling)
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>导入批次</h1>
-            <p>每次导入按文件内容哈希记为一个批次；撤销会先删该批明细，再重算受影响期间的指标与预警，重算在后台执行。</p>
+            <p>
+              每次导入按文件内容哈希记为一个批次；撤销会先删该批明细，再重算受影响期间的指标与预警，重算在后台执行。
+            </p>
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -155,7 +165,10 @@ onUnmounted(stopPolling)
       </section>
 
       <template v-else>
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-else-if="notice" class="state-box notice">{{ notice }}</section>
 
         <section v-if="!batches.length" class="state-box empty-state">
@@ -173,12 +186,19 @@ onUnmounted(stopPolling)
             <table>
               <thead>
                 <tr>
-                  <th>批次（前 12 位）</th><th>行数</th><th>日期范围</th><th>涉及期间</th><th>导入时间</th><th>操作</th>
+                  <th>批次（前 12 位）</th>
+                  <th>行数</th>
+                  <th>日期范围</th>
+                  <th>涉及期间</th>
+                  <th>导入时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="batch in batches" :key="batch.batch">
-                  <td :title="batch.batch"><code>{{ batch.short }}…</code></td>
+                  <td :title="batch.batch">
+                    <code>{{ batch.short }}…</code>
+                  </td>
                   <td>{{ batch.rows }}</td>
                   <td>{{ batch.first_date }} ~ {{ batch.last_date }}</td>
                   <td :title="batch.periods.join('、')">{{ periodsText(batch) }}</td>
@@ -189,10 +209,20 @@ onUnmounted(stopPolling)
                         <button class="btn" disabled>撤销中…</button>
                       </template>
                       <template v-else-if="confirmBatch !== batch.batch">
-                        <button class="btn danger" :disabled="busy === batch.batch" @click="confirmBatch = batch.batch">撤销批次</button>
+                        <button
+                          class="btn danger"
+                          :disabled="busy === batch.batch"
+                          @click="confirmBatch = batch.batch"
+                        >
+                          撤销批次
+                        </button>
                       </template>
                       <template v-else>
-                        <button class="btn danger" :disabled="busy === batch.batch" @click="removeBatch(batch)">
+                        <button
+                          class="btn danger"
+                          :disabled="busy === batch.batch"
+                          @click="removeBatch(batch)"
+                        >
                           {{ busy === batch.batch ? '提交中…' : '确认撤销' }}
                         </button>
                         <button class="btn" @click="confirmBatch = ''">取消</button>
@@ -203,7 +233,14 @@ onUnmounted(stopPolling)
               </tbody>
             </table>
           </div>
-          <PagePager :total="total" :limit="PAGE_SIZE" :offset="offset" :loading="loading" unit="个批次" @change="turn" />
+          <PagePager
+            :total="total"
+            :limit="PAGE_SIZE"
+            :offset="offset"
+            :loading="loading"
+            unit="个批次"
+            @change="turn"
+          />
           <p class="muted">
             撤销只删数据库里的行，`data/raw/` 下的原始文件按只读约定保留；重新导入同一文件会重新生成同批次号。
           </p>
@@ -218,14 +255,22 @@ onUnmounted(stopPolling)
             <table>
               <thead>
                 <tr>
-                  <th>任务</th><th>类型</th><th>状态</th><th>提交人</th><th>提交时间</th><th>耗时</th><th>结果</th>
+                  <th>任务</th>
+                  <th>类型</th>
+                  <th>状态</th>
+                  <th>提交人</th>
+                  <th>提交时间</th>
+                  <th>耗时</th>
+                  <th>结果</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="job in jobs" :key="job.id">
                   <td>#{{ job.id }}</td>
                   <td>{{ job.kind_label }}</td>
-                  <td><span class="job-status" :class="job.status">{{ statusLabel(job.status) }}</span></td>
+                  <td>
+                    <span class="job-status" :class="job.status">{{ statusLabel(job.status) }}</span>
+                  </td>
                   <td>{{ job.actor || '—' }}</td>
                   <td>{{ formatTime(job.created_at) }}</td>
                   <td>{{ durationText(job) }}</td>
@@ -244,8 +289,24 @@ onUnmounted(stopPolling)
 </template>
 
 <style scoped>
-.job-status { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: #eef3f9; color: #1a3a5c; }
-.job-status.running { background: #e6f4ff; color: #0958d9; }
-.job-status.succeeded { background: #f6ffed; color: #237804; }
-.job-status.failed { background: #fff2f0; color: #a8071a; }
+.job-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #eef3f9;
+  color: #1a3a5c;
+}
+.job-status.running {
+  background: #e6f4ff;
+  color: #0958d9;
+}
+.job-status.succeeded {
+  background: #f6ffed;
+  color: #237804;
+}
+.job-status.failed {
+  background: #fff2f0;
+  color: #a8071a;
+}
 </style>

@@ -160,13 +160,13 @@ class CdpSession:
                 return
             try:
                 message = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=remaining))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return
             if message.get("method") == "Page.loadEventFired":
                 self._loaded = True
 
 
-async def _wait_ready(cdp: "CdpSession", session: str, timeout: float) -> tuple[bool, dict]:
+async def _wait_ready(cdp: CdpSession, session: str, timeout: float) -> tuple[bool, dict]:
     """轮询到页面真的渲染出内容为止（空白页必须判失败，否则溢出检查是假 PASS）。"""
     deadline = time.time() + timeout
     info: dict = {}

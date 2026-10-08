@@ -27,20 +27,21 @@ test('PagePager 给出「第 x / y 页」与当前区间，并禁用第一页的
 
 test('PagePager 点「下一页」按 limit 步进，点到最后一页就停下', async () => {
   const emitted = []
-  let offset = 0
   const view = mount(PagePager, {
     props: {
-      total: 120, limit: 50, offset: 0,
-      onChange: (value) => { emitted.push(value); offset = value },
-    },
+      total: 120,
+      limit: 50,
+      offset: 0,
+      onChange: (value) => emitted.push(value)
+    }
   })
   // 组件是「props 驱动」的：父组件把新 offset 传回来才算翻页，所以这里手工模拟父组件。
   await view.click('下一页')
   assert.deepEqual(emitted, [50])
-  assert.match(view.text(), /第 1 \/ 3 页/)   // props 没变，视图不该自作主张翻页
+  assert.match(view.text(), /第 1 \/ 3 页/) // props 没变，视图不该自作主张翻页
 
   const second = mount(PagePager, {
-    props: { total: 120, limit: 50, offset: 50, onChange: (value) => emitted.push(value) },
+    props: { total: 120, limit: 50, offset: 50, onChange: (value) => emitted.push(value) }
   })
   assert.match(second.text(), /第 2 \/ 3 页/)
   await second.click('下一页')
@@ -49,7 +50,7 @@ test('PagePager 点「下一页」按 limit 步进，点到最后一页就停下
   // 最后一页：按钮禁用，且组件自己的守卫（100 + 50 >= 120）不会再发事件——
   // 这里直接调处理器，等于绕过浏览器的 disabled，能验到守卫本身
   const last = mount(PagePager, {
-    props: { total: 120, limit: 50, offset: 100, onChange: (value) => emitted.push(value) },
+    props: { total: 120, limit: 50, offset: 100, onChange: (value) => emitted.push(value) }
   })
   assert.equal(last.button('下一页').props.disabled, true)
   assert.equal(last.button('上一页').props.disabled, false)
@@ -73,14 +74,16 @@ test('PagePager 加载中禁用翻页（避免连点连发请求）', () => {
 })
 
 test('DataScopeNotice 只在受限口径下出现，且用后端的 label 与 note', () => {
-  const hidden = mount(DataScopeNotice, { props: { scope: { unrestricted: true, label: '全公司（全部部门）' } } })
+  const hidden = mount(DataScopeNotice, {
+    props: { scope: { unrestricted: true, label: '全公司（全部部门）' } }
+  })
   assert.equal(hidden.text().trim(), '')
 
   const empty = mount(DataScopeNotice, { props: {} })
   assert.equal(empty.text().trim(), '')
 
   const restricted = mount(DataScopeNotice, {
-    props: { scope: { unrestricted: false, label: '部门 018', note: '只统计 018 的明细' } },
+    props: { scope: { unrestricted: false, label: '部门 018', note: '只统计 018 的明细' } }
   })
   assert.match(restricted.text(), /数据范围：部门 018/)
   assert.match(restricted.text(), /只统计 018 的明细/)

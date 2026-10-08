@@ -16,9 +16,9 @@
    （动作 `audit.purge`，detail 里有截止时间与删除条数）。管理员没有任何「清空审计」的入口：
    能随手清掉的审计等于没有审计，保留期是策略而不是后门。
 """
-from datetime import datetime, timedelta, timezone
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -135,7 +135,7 @@ def serialize(row: AuditLog) -> dict:
     at = row.created_at
     return {
         "id": row.id,
-        "at": (at.astimezone(timezone.utc).isoformat() if isinstance(at, datetime) else None),
+        "at": (at.astimezone(UTC).isoformat() if isinstance(at, datetime) else None),
         "actor": row.actor,
         "department": row.actor_department or "",
         "action": row.action,
@@ -179,7 +179,7 @@ def query(db: Session, *, action: str | None = None, actor: str | None = None,
 
 def retention_cutoff(days: int, *, now: datetime | None = None) -> datetime:
     """保留期边界：比它更早的记录才算过期（`days` 天以前的那个时刻）。"""
-    return (now or datetime.now(timezone.utc)) - timedelta(days=max(int(days), 1))
+    return (now or datetime.now(UTC)) - timedelta(days=max(int(days), 1))
 
 
 def count_older_than(db: Session, cutoff: datetime) -> int:

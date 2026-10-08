@@ -91,7 +91,9 @@ watch(activeScope, loadOutline)
             <option v-if="!periods.length" value="">暂无可用期间</option>
             <option v-for="p in periods" :key="p" :value="p">{{ p }}</option>
           </select>
-          <button class="btn" :disabled="loading || !period" @click="loadOutline">{{ loading ? '生成中…' : '↻ 刷新大纲' }}</button>
+          <button class="btn" :disabled="loading || !period" @click="loadOutline">
+            {{ loading ? '生成中…' : '↻ 刷新大纲' }}
+          </button>
         </div>
       </header>
 
@@ -114,8 +116,8 @@ watch(activeScope, loadOutline)
           <div>
             <h2>{{ period }} 演示文稿</h2>
             <p class="muted">
-              来源：<code>GET /api/v1/reports/pptx?period={{ period }}</code>；
-              共 {{ outline.slides.length }} 页，文件名 {{ outline.filename }}。
+              来源：<code>GET /api/v1/reports/pptx?period={{ period }}</code
+              >； 共 {{ outline.slides.length }} 页，文件名 {{ outline.filename }}。
             </p>
           </div>
           <div class="actions">

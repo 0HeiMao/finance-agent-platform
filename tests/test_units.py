@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,12 +17,12 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from backend.api_financial import AMOUNT_COLUMNS, validate_row
-from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of
-from backend.rag.document_parser import extract_text, split_text
 from check_coverage import parse_counts, parse_total
 from check_frontend_coverage import COVERED_MODULES, parse_coverage_table
 
+from backend.api_financial import AMOUNT_COLUMNS, validate_row
+from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of
+from backend.rag.document_parser import extract_text, split_text
 
 # ---------------------------------------------------------------- 导入校验
 
@@ -568,9 +568,9 @@ def test_lock_periods_takes_sorted_unique_locks_in_one_batch():
 
 def _lockout_settings(**overrides):
     """一套确定的锁定参数：单测不该被 `.env` 里的阈值改动带跑。"""
-    base = dict(login_lockout_threshold=5, login_lockout_base_seconds=60,
-                login_lockout_max_seconds=900, login_failure_ttl_seconds=900,
-                password_min_length=10)
+    base = {"login_lockout_threshold": 5, "login_lockout_base_seconds": 60,
+            "login_lockout_max_seconds": 900, "login_failure_ttl_seconds": 900,
+            "password_min_length": 10}
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -592,7 +592,7 @@ def test_lockout_counts_failures_locks_then_restarts_after_silence(monkeypatch):
     from backend.models import User
 
     monkeypatch.setattr(lockout, "get_settings", lambda: _lockout_settings())
-    now = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
     user = User(username="lock-probe")  # 没落库：failed_attempts 还是 None，必须按 0 处理
     assert user.failed_attempts is None
 
@@ -617,7 +617,7 @@ def test_locked_for_accepts_naive_datetime_and_clears_nothing(monkeypatch):
     from backend import lockout
     from backend.models import User
 
-    naive = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=120)
+    naive = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=120)
     user = User(username="naive-probe", locked_until=naive, failed_attempts=6)
     assert 115 <= lockout.locked_for(user) <= 120
     assert lockout.is_locked(user) is True
@@ -629,7 +629,7 @@ def test_unlock_clears_counter_and_reports_previous_state():
     from backend import lockout
     from backend.models import User
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     user = User(username="unlock-probe", failed_attempts=7,
                 locked_until=now + timedelta(seconds=300), last_failed_at=now)
     info = lockout.unlock(user)

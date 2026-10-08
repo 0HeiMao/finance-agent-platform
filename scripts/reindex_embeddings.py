@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import select, text
+
 from backend.db import SessionLocal
 from backend.rag.embeddings import EmbeddingService
 from backend.rag.pgvector_store import DocumentChunk
@@ -22,7 +23,7 @@ def main():
         for start in range(0, len(rows), 32):
             batch = rows[start:start + 32]
             vectors = service.encode([row.content for row in batch])
-            for row, vector in zip(batch, vectors):
+            for row, vector in zip(batch, vectors, strict=False):
                 row.embedding = vector
                 row.metadata_json = {**row.metadata_json, 'embedding_model': service.model_name}
     print(f'Reindexed {len(rows)} chunks; committed; original text preserved.')

@@ -29,6 +29,11 @@
    README 的「持续集成」一节写明（脚本顺手核对，免得文档和流水线各说各话）。
 9. 两个门槛脚本里的阈值必须在 README 的「覆盖率门槛」一节里出现 —— 阈值和文档分开维护时，
    下一个人就会用「把阈值调低」代替「补用例」。
+10. lint 也要进流水线，而且**两边各有各的配置文件**：后端 ruff（仓库根 `ruff.toml`，挂在
+    `check_all.py --quick` 里）、前端 eslint（`frontend/eslint.config.js`）与 prettier
+    （`frontend/.prettierrc.json`）。规则集不写死在配置文件里，「换个机器红绿不同」就要重演。
+11. README 必须有一节把「eslint 只管写错了、排版全归 prettier」这件事写下来 —— 否则下一个人
+    会把 eslint 的排版规则打开，然后和 prettier 互相改来改去。
 """
 from __future__ import annotations
 
@@ -60,6 +65,12 @@ COVERAGE_GATE = "check_coverage.py"
 FRONTEND_COVERAGE_GATE = "check_frontend_coverage.py"
 README_COVERAGE_HEADING = "### 覆盖率门槛"
 THRESHOLD_RE = re.compile(r"^(?:STATEMENT|BRANCH|LINE)_THRESHOLD\s*=\s*([\d.]+)", re.MULTILINE)
+# ⑦ 的 lint 门禁：配置必须落在仓库里（规则集写死），README 必须写明它们的边界。
+RUFF_CONFIG = "ruff.toml"
+ESLINT_CONFIG = "frontend/eslint.config.js"
+PRETTIER_CONFIG = "frontend/.prettierrc.json"
+CHECK_ALL = "check_all.py"
+README_LINT_HEADING = "### 代码风格与 lint"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -155,7 +166,7 @@ def env_names(workflow: dict, jobs: dict) -> None:
     used: dict[str, str] = {}
     for key, value in (workflow.get("env") or {}).items():
         used[str(key)] = str(value)
-    for job_name, job in jobs.items():
+    for job in jobs.values():
         for key, value in job_env(workflow, job).items():
             used.setdefault(key, str(value))
         for step in job.get("steps") or []:
@@ -224,6 +235,53 @@ def commands(data: dict) -> None:
           (PROJECT_ROOT / "frontend" / "package-lock.json").exists())
 
 
+# ------------------------------------------------------------------ lint 门禁（⑦）
+
+def lint_gates(data: dict) -> None:
+    """lint 必须真的挂在流水线上，而且规则集必须落在仓库里的配置文件里。"""
+    backend_runs = job_runs(data["backend"])
+    frontend_runs = job_runs(data["frontend"])
+    quick = next((run.strip() for run in backend_runs if CHECK_ALL in run and "--quick" in run), "")
+    check("后端 job 的 --quick 门禁里带着 ruff", bool(quick), quick or "（没有这一步）")
+    check_all = PROJECT_ROOT / "scripts" / CHECK_ALL
+    check(f"{CHECK_ALL} --quick 真的调了 ruff",
+          check_all.exists() and "ruff" in check_all.read_text(encoding="utf-8"),
+          "在 check_all.py 里应能看到 ruff（_venv_tool(\"ruff\")）")
+    check("ruff 配置在仓库根（规则集显式写死，不靠版本默认值）",
+          (PROJECT_ROOT / RUFF_CONFIG).exists(), RUFF_CONFIG)
+    check("前端跑了 npm run lint（eslint）",
+          any(re.match(r"\s*npm run lint\b", run) for run in frontend_runs),
+          " / ".join(run.strip() for run in frontend_runs))
+    check("前端跑了 npm run format:check（prettier --check）",
+          any(re.match(r"\s*npm run format:check\b", run) for run in frontend_runs),
+          " / ".join(run.strip() for run in frontend_runs))
+    missing = [name for name in (ESLINT_CONFIG, PRETTIER_CONFIG)
+               if not (PROJECT_ROOT / name).exists()]
+    check("eslint 与 prettier 的配置都在仓库里", not missing, "、".join(missing) or
+          f"{ESLINT_CONFIG} + {PRETTIER_CONFIG}")
+
+
+def lint_docs() -> None:
+    """lint 的分工必须写进 README —— 否则下一个人会把排版规则打开，和 prettier 互相改。"""
+    if not README_PATH.exists():
+        check("README 存在", False, str(README_PATH))
+        return
+    text = README_PATH.read_text(encoding="utf-8")
+    index = text.find(README_LINT_HEADING)
+    if index < 0:
+        check(f"README 有「{README_LINT_HEADING}」一节", False,
+              "lint 的分工得写下来，不然 eslint 与 prettier 会互相打架")
+        return
+    rest = text[index + len(README_LINT_HEADING):]
+    end = rest.find("\n#")
+    section = rest if end < 0 else rest[:end]
+    check("README 的 lint 一节写明了三个配置文件",
+          all(name in section for name in (RUFF_CONFIG, ESLINT_CONFIG, PRETTIER_CONFIG)),
+          f"该节 {len(section)} 字符")
+    check("README 的 lint 一节说明了「eslint 只管写错、排版归 prettier」",
+          "排版" in section and "写错" in section, "")
+
+
 # ------------------------------------------------------------------ 「不进 CI」的边界
 
 def live_only_scripts(data: dict) -> None:
@@ -290,8 +348,10 @@ def main() -> int:
         env_names(data["workflow"], data["jobs"])
         referenced_paths(data)
         commands(data)
+        lint_gates(data)
         live_only_scripts(data)
     coverage_docs()
+    lint_docs()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 项通过", flush=True)
     return 0 if passed == len(RESULTS) else 1

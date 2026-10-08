@@ -9,7 +9,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from backend.config import get_settings
 
@@ -60,7 +61,7 @@ def rerank(question: str, chunks: Sequence[Any], top_k: int) -> list[Any]:
     if not order:
         return list(chunks[:top_k])
     picked = [chunks[index] for index in order[:top_k]]
-    taken = {index for index in order[:top_k]}
+    taken = set(order[:top_k])
     for index in range(len(chunks)):  # 重排模型漏掉的候选，按余弦顺序补齐到 top_k
         if len(picked) >= top_k:
             break

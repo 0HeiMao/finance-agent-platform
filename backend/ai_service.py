@@ -1,8 +1,9 @@
-from backend.rag.embeddings import get_embedding_service
-from backend.db import SessionLocal
-from backend.api_rag import retrieve_for_user
-from backend.llm import get_llm
 import logging
+
+from backend.api_rag import retrieve_for_user
+from backend.db import SessionLocal
+from backend.llm import get_llm
+from backend.rag.embeddings import get_embedding_service
 
 logger = logging.getLogger("finance-ai")
 
@@ -16,7 +17,7 @@ def rag_answer(question: str, top_k: int = 5, user_department: str | None = None
         context = "\n".join(f"来源：{x.source}\n内容：{x.content}" for x in results)
         try:
             answer = get_llm().answer(question, context)
-        except Exception as exc:
+        except Exception:
             logger.exception("DeepSeek request failed")
             return {"answer_status": "model_unavailable", "answer": "DeepSeek 当前不可用，请检查网络、API Key 或服务状态。", "sources": [x.source for x in results], "embedding_model": get_embedding_service().model_name, "using_fallback_embedding": get_embedding_service().using_fallback}
         return {"answer_status": "supported", "answer": answer, "sources": [x.source for x in results], "embedding_model": get_embedding_service().model_name, "using_fallback_embedding": get_embedding_service().using_fallback}

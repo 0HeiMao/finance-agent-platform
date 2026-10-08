@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import delete, func, select
@@ -112,7 +112,7 @@ def rollup(db: Session, *, grains: tuple[str, ...] = DEFAULT_GRAINS,
                 gross_profit_amount=gross, net_profit_amount=net,
                 gross_profit_ratio=_ratio(gross, revenue), net_profit_ratio=_ratio(net, revenue),
                 months=present, month_count=len(present), complete=len(present) == len(covered),
-                computed_at=datetime.now(timezone.utc))
+                computed_at=datetime.now(UTC))
             db.add(record)
             written.append(record)
     db.flush()

@@ -19,7 +19,7 @@ import {
   parseDepartments,
   periodsText,
   resultText,
-  statusLabel,
+  statusLabel
 } from '../src/utils/format.js'
 
 test('statusLabel 用中文标签，未知状态原样返回', () => {
@@ -41,8 +41,14 @@ test('formatTime 补零到秒，空值与坏值都显示破折号', () => {
 })
 
 test('durationText 按开始到结束算秒数，缺字段不编造', () => {
-  assert.equal(durationText({ started_at: '2026-10-08T16:00:00', finished_at: '2026-10-08T16:00:00.400' }), '0.4 秒')
-  assert.equal(durationText({ started_at: '2026-10-08T16:00:00', finished_at: '2026-10-08T16:00:51' }), '51.0 秒')
+  assert.equal(
+    durationText({ started_at: '2026-10-08T16:00:00', finished_at: '2026-10-08T16:00:00.400' }),
+    '0.4 秒'
+  )
+  assert.equal(
+    durationText({ started_at: '2026-10-08T16:00:00', finished_at: '2026-10-08T16:00:51' }),
+    '51.0 秒'
+  )
   assert.equal(durationText({}), '—')
   assert.equal(durationText(null), '—')
 })
@@ -50,12 +56,14 @@ test('durationText 按开始到结束算秒数，缺字段不编造', () => {
 test('resultText 只对终态给结论', () => {
   const done = {
     status: 'succeeded',
-    result: { deleted_rows: 8909, recalculated: ['2026-04'], cleared: ['2026-05', '2026-06'] },
+    result: { deleted_rows: 8909, recalculated: ['2026-04'], cleared: ['2026-05', '2026-06'] }
   }
   assert.equal(resultText(done), '删除 8909 行 · 重算 1 期 · 清空 2 期')
   // 没有重算/清空时不显示多余的分段
-  assert.equal(resultText({ status: 'succeeded', result: { deleted_rows: 1, recalculated: [], cleared: [] } }),
-    '删除 1 行')
+  assert.equal(
+    resultText({ status: 'succeeded', result: { deleted_rows: 1, recalculated: [], cleared: [] } }),
+    '删除 1 行'
+  )
   assert.equal(resultText({ status: 'failed', error: '进程重启，任务未完成' }), '进程重启，任务未完成')
   assert.equal(resultText({ status: 'failed' }), '失败原因未记录')
   assert.equal(resultText({ status: 'running' }), '—')
@@ -64,7 +72,7 @@ test('resultText 只对终态给结论', () => {
 test('describeResult 把期间原文列出来，便于离开页面后回看', () => {
   const text = describeResult({
     id: 20,
-    result: { deleted_rows: 1, recalculated: ['2026-10'], cleared: [] },
+    result: { deleted_rows: 1, recalculated: ['2026-10'], cleared: [] }
   })
   assert.equal(text, '后台任务 #20 已完成：删除 1 行明细；重算期间：2026-10。')
 })
@@ -80,8 +88,10 @@ test('periodsText 把连续期间压成区间，避免把操作列挤出视口',
 })
 
 test('periodsText 对不连续期间只列前三个并标总期数', () => {
-  assert.equal(periodsText({ periods: ['2026-01', '2026-04', '2026-07', '2026-10'] }),
-    '2026-01、2026-04、2026-07 等 4 期')
+  assert.equal(
+    periodsText({ periods: ['2026-01', '2026-04', '2026-07', '2026-10'] }),
+    '2026-01、2026-04、2026-07 等 4 期'
+  )
   // 只有两个且不连续：直接列出，不加"等 N 期"
   assert.equal(periodsText({ periods: ['2026-01', '2026-03'] }), '2026-01、2026-03')
 })

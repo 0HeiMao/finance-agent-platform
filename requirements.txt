@@ -17,6 +17,10 @@ pytest-asyncio>=0.24,<2.0
 # 覆盖率门槛（`scripts/check_coverage.py`）：阈值不写进 pytest.ini 的 addopts，
 # 否则 `pytest -k xxx` 这类过滤运行会因为「只跑了一小部分用例」而判失败。
 pytest-cov>=7.0,<8.0
+# 后端 lint（`ruff.toml`，由 `scripts/check_all.py --quick` 调用，也是 CI 的一步）：
+# 规则集与忽略项全部显式写死在 ruff.toml 里 —— ruff 各版本的默认规则集并不相同，
+# 靠默认值会出现「换台机器/换个版本，红绿不同」。
+ruff>=0.16,<0.17
 python-jose[cryptography]>=3.3,<4.0
 passlib[bcrypt]>=1.7,<2.0
 openpyxl>=3.1,<4.0

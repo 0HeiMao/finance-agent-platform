@@ -13,9 +13,7 @@ export function escapeHtml(text) {
 }
 
 function inline(text) {
-  return text
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
+  return text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>')
 }
 
 function isTableRow(line) {
@@ -27,7 +25,12 @@ function isTableSeparator(line) {
 }
 
 function tableCells(line) {
-  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim())
 }
 
 const isBullet = (line) => /^\s*[-*]\s+/.test(line)
@@ -41,7 +44,10 @@ export function renderMarkdown(markdown) {
 
   while (index < lines.length) {
     const line = lines[index]
-    if (!line.trim()) { index += 1; continue }
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
 
     if (isTableRow(line) && isTableSeparator(lines[index + 1] || '')) {
       const head = tableCells(line)

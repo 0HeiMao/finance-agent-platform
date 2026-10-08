@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
 from backend.auth import current_user
 from backend.db import get_db
 from backend.models import FinancialMetric, User
 from backend.scope import metric_totals, scope_metric, scope_of, scope_payload
+
 router = APIRouter(prefix="/api/v1/forecast", tags=["forecast"])
 def trend(values: list[float], periods: int):
     if not values: return [0.0] * periods

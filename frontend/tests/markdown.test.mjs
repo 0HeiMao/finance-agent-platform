@@ -11,8 +11,10 @@ import { test } from 'node:test'
 import { escapeHtml, renderMarkdown } from '../src/utils/markdown.js'
 
 test('escapeHtml 转义五个 HTML 元字符', () => {
-  assert.equal(escapeHtml(`<a href="x" title='y'>&</a>`),
-    '&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;')
+  assert.equal(
+    escapeHtml(`<a href="x" title='y'>&</a>`),
+    '&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;&lt;/a&gt;'
+  )
   assert.equal(escapeHtml(null), '')
   assert.equal(escapeHtml(undefined), '')
 })
@@ -40,8 +42,8 @@ test('renderMarkdown 渲染表格，并把分隔行吃掉', () => {
   const html = renderMarkdown('| 指标 | 金额 |\n| --- | --- |\n| 收入 | 100 |\n| 成本 | 90 |')
   assert.equal(
     html,
-    '<table><thead><tr><th>指标</th><th>金额</th></tr></thead>'
-    + '<tbody><tr><td>收入</td><td>100</td></tr><tr><td>成本</td><td>90</td></tr></tbody></table>',
+    '<table><thead><tr><th>指标</th><th>金额</th></tr></thead>' +
+      '<tbody><tr><td>收入</td><td>100</td></tr><tr><td>成本</td><td>90</td></tr></tbody></table>'
   )
 })
 

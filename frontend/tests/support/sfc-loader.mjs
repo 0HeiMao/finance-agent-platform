@@ -49,7 +49,7 @@ export async function load(url, context, nextLoad) {
       // 给个稳定的 id：不给的话 compiler-sfc 会打「compileTemplate now requires the id option」警告，
       // 并退化成同名 scopeId（组件本身不下载样式，id 只用来消警告）
       id: `test-${path.basename(filename)}`,
-      inlineTemplate: true,
+      inlineTemplate: true
     })
     return { format: 'module', source: compiled.content, shortCircuit: true }
   }
@@ -60,7 +60,7 @@ export async function load(url, context, nextLoad) {
     return {
       format: 'module',
       source: source.replaceAll('import.meta.env', '(globalThis.__VITE_ENV__ || {})'),
-      shortCircuit: true,
+      shortCircuit: true
     }
   }
 

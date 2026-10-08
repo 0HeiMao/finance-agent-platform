@@ -83,7 +83,9 @@ async function copy() {
   try {
     await navigator.clipboard.writeText(markdown.value)
     copied.value = true
-    setTimeout(() => { copied.value = false }, 2000)
+    setTimeout(() => {
+      copied.value = false
+    }, 2000)
   } catch {
     clipboardError.value = true
     error.value = '浏览器拒绝了剪贴板访问（无头/非安全上下文常见），请改用「下载 Markdown」。'
@@ -121,7 +123,9 @@ watch(activeScope, loadReport)
             <option v-if="!periods.length" value="">暂无可用期间</option>
             <option v-for="p in periods" :key="p" :value="p">{{ p }}</option>
           </select>
-          <button class="btn" :disabled="loading || !period" @click="loadReport">{{ loading ? '生成中…' : '↻ 重新生成' }}</button>
+          <button class="btn" :disabled="loading || !period" @click="loadReport">
+            {{ loading ? '生成中…' : '↻ 重新生成' }}
+          </button>
         </div>
       </header>
 
@@ -143,7 +147,10 @@ watch(activeScope, loadReport)
         <div class="card-head">
           <div>
             <h2>{{ period }} 财务分析报告</h2>
-            <p class="muted">来源：<code>GET /api/v1/reports/monthly?period={{ period }}</code>；金额与比率由程序确定性计算，报告只做呈现。</p>
+            <p class="muted">
+              来源：<code>GET /api/v1/reports/monthly?period={{ period }}</code
+              >；金额与比率由程序确定性计算，报告只做呈现。
+            </p>
           </div>
           <div class="actions">
             <button class="btn" @click="copy">{{ copied ? '已复制' : '复制 Markdown' }}</button>
@@ -155,7 +162,7 @@ watch(activeScope, loadReport)
           </div>
         </div>
 
-        <p v-if="docxMessage" class="muted" style="margin:-6px 0 12px">{{ docxMessage }}</p>
+        <p v-if="docxMessage" class="muted" style="margin: -6px 0 12px">{{ docxMessage }}</p>
 
         <section v-if="isPlaceholder" class="state-box notice">
           <strong>该期间没有指标数据</strong>

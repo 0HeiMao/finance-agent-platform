@@ -34,7 +34,7 @@ const STATUS_OPTIONS = [
   { value: 'pending', label: '待处理' },
   { value: 'confirmed', label: '已确认' },
   { value: 'false_positive', label: '误报' },
-  { value: 'resolved', label: '已处理' },
+  { value: 'resolved', label: '已处理' }
 ]
 const empty = computed(() => loaded.value && !items.value.length)
 
@@ -90,7 +90,7 @@ async function review(item, next, note = '') {
   try {
     const response = await apiFetch(`/analysis/alerts/${item.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ status: next, note }),
+      body: JSON.stringify({ status: next, note })
     })
     const updated = await response.json()
     Object.assign(item, updated)
@@ -107,13 +107,16 @@ async function review(item, next, note = '') {
 async function markFalsePositive(item) {
   try {
     // 误报必须写原因：后端也会挡，但在这里先问一句，用户不用先撞一次 422
-    const { value } = await ElMessageBox.prompt('请说明为什么判定为误报（会写入备注并留痕）',
-      `标记「${item.type}」为误报`, {
+    const { value } = await ElMessageBox.prompt(
+      '请说明为什么判定为误报（会写入备注并留痕）',
+      `标记「${item.type}」为误报`,
+      {
         confirmButtonText: '提交',
         cancelButtonText: '取消',
         inputPlaceholder: '例如：该凭证为年末冲销，已在次月冲回',
-        inputValidator: (text) => (text && text.trim().length >= 4) || '请至少写 4 个字',
-      })
+        inputValidator: (text) => (text && text.trim().length >= 4) || '请至少写 4 个字'
+      }
+    )
     await review(item, 'false_positive', value.trim())
   } catch {
     /* 用户取消：什么都不做 */
@@ -122,13 +125,16 @@ async function markFalsePositive(item) {
 
 async function addNote(item) {
   try {
-    const { value } = await ElMessageBox.prompt('备注会保留在预警上，重算期间不会丢失',
-      `「${item.type}」备注`, {
+    const { value } = await ElMessageBox.prompt(
+      '备注会保留在预警上，重算期间不会丢失',
+      `「${item.type}」备注`,
+      {
         confirmButtonText: '保存',
         cancelButtonText: '取消',
         inputValue: item.note || '',
-        inputPlaceholder: '处理说明、后续动作、责任人…',
-      })
+        inputPlaceholder: '处理说明、后续动作、责任人…'
+      }
+    )
     await review(item, item.status === 'pending' ? 'confirmed' : item.status, value.trim())
   } catch {
     /* 取消 */
@@ -180,10 +186,18 @@ watch(status, reload)
           <span>待处理</span>
           <strong class="pending">{{ stats.pending }}</strong>
         </div>
-        <div class="stat"><span>已确认</span><strong>{{ stats.confirmed }}</strong></div>
-        <div class="stat"><span>误报</span><strong>{{ stats.false_positive }}</strong></div>
-        <div class="stat"><span>已处理</span><strong>{{ stats.resolved }}</strong></div>
-        <div class="stat"><span>合计</span><strong>{{ stats.total }}</strong></div>
+        <div class="stat">
+          <span>已确认</span><strong>{{ stats.confirmed }}</strong>
+        </div>
+        <div class="stat">
+          <span>误报</span><strong>{{ stats.false_positive }}</strong>
+        </div>
+        <div class="stat">
+          <span>已处理</span><strong>{{ stats.resolved }}</strong>
+        </div>
+        <div class="stat">
+          <span>合计</span><strong>{{ stats.total }}</strong>
+        </div>
         <p class="muted stat-hint">
           处理状态只记在预警本身上：重算某期间（导入、撤销批次）时会按「口径 + 类型 + 指标」继承，
           已经点过的结论不会因为重算而消失。
@@ -206,15 +220,23 @@ watch(status, reload)
 
         <section v-else-if="empty && status" class="state-box empty-state">
           <strong>该状态下没有预警</strong>
-          <p>当前筛选为「{{ STATUS_OPTIONS.find((o) => o.value === status).label }}」，换个状态或选「全部状态」。</p>
+          <p>
+            当前筛选为「{{
+              STATUS_OPTIONS.find((o) => o.value === status).label
+            }}」，换个状态或选「全部状态」。
+          </p>
         </section>
 
         <div v-else class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>期间</th><th>预警类型</th><th>描述</th><th>级别</th>
-                <th>处理状态</th><th>操作</th>
+                <th>期间</th>
+                <th>预警类型</th>
+                <th>描述</th>
+                <th>级别</th>
+                <th>处理状态</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -231,44 +253,137 @@ watch(status, reload)
                     —— {{ a.reviewed_by }} 于 {{ a.reviewed_at.slice(0, 16).replace('T', ' ') }}
                   </small>
                 </td>
-                <td><span class="level" :class="a.level">● {{ levelText[a.level] || a.level }}</span></td>
-                <td><span class="status-chip" :class="a.status">{{ a.status_label }}</span></td>
+                <td>
+                  <span class="level" :class="a.level">● {{ levelText[a.level] || a.level }}</span>
+                </td>
+                <td>
+                  <span class="status-chip" :class="a.status">{{ a.status_label }}</span>
+                </td>
                 <td class="ops">
-                  <button v-if="a.status !== 'confirmed'" class="link-btn" :disabled="savingId === a.id"
-                          @click="review(a, 'confirmed')">确认异常</button>
-                  <button v-if="a.status !== 'false_positive'" class="link-btn" :disabled="savingId === a.id"
-                          @click="markFalsePositive(a)">误报</button>
-                  <button v-if="a.status !== 'resolved'" class="link-btn" :disabled="savingId === a.id"
-                          @click="review(a, 'resolved')">已处理</button>
+                  <button
+                    v-if="a.status !== 'confirmed'"
+                    class="link-btn"
+                    :disabled="savingId === a.id"
+                    @click="review(a, 'confirmed')"
+                  >
+                    确认异常
+                  </button>
+                  <button
+                    v-if="a.status !== 'false_positive'"
+                    class="link-btn"
+                    :disabled="savingId === a.id"
+                    @click="markFalsePositive(a)"
+                  >
+                    误报
+                  </button>
+                  <button
+                    v-if="a.status !== 'resolved'"
+                    class="link-btn"
+                    :disabled="savingId === a.id"
+                    @click="review(a, 'resolved')"
+                  >
+                    已处理
+                  </button>
                   <button class="link-btn" :disabled="savingId === a.id" @click="addNote(a)">备注</button>
-                  <button v-if="a.status !== 'pending'" class="link-btn" :disabled="savingId === a.id"
-                          @click="review(a, 'pending')">退回</button>
+                  <button
+                    v-if="a.status !== 'pending'"
+                    class="link-btn"
+                    :disabled="savingId === a.id"
+                    @click="review(a, 'pending')"
+                  >
+                    退回
+                  </button>
                   <router-link class="link" :to="`/alerts/${a.id}`">明细 →</router-link>
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
-        <PagePager :total="total" :limit="PAGE_SIZE" :offset="offset" :loading="loading" unit="条预警" @change="turn" />
+        <PagePager
+          :total="total"
+          :limit="PAGE_SIZE"
+          :offset="offset"
+          :loading="loading"
+          unit="条预警"
+          @change="turn"
+        />
       </section>
     </main>
   </div>
 </template>
 
 <style scoped>
-.stat-row { display: flex; flex-wrap: wrap; gap: 18px 28px; align-items: flex-end; }
-.stat { display: flex; flex-direction: column; gap: 2px; min-width: 64px; }
-.stat span { font-size: 12px; color: #718096; }
-.stat strong { font-size: 20px; color: #1f2937; }
-.stat strong.pending { color: #d46b08; }
-.stat-hint { flex-basis: 100%; margin: 0; font-size: 12px; }
-.note-text { display: block; margin-top: 3px; color: #8a6d3b; }
-.status-chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #eef3f9; }
-.status-chip.pending { background: #fff7e6; color: #d46b08; }
-.status-chip.confirmed { background: #fff1f0; color: #cf1322; }
-.status-chip.false_positive { background: #f6ffed; color: #237804; }
-.status-chip.resolved { background: #e6f4ff; color: #0958d9; }
-.ops { display: flex; flex-wrap: wrap; gap: 4px 10px; }
-.link-btn { border: none; background: none; color: #1a5c9c; cursor: pointer; padding: 0; font-size: 13px; }
-.link-btn:disabled { color: #a0aec0; cursor: not-allowed; }
+.stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px 28px;
+  align-items: flex-end;
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 64px;
+}
+.stat span {
+  font-size: 12px;
+  color: #718096;
+}
+.stat strong {
+  font-size: 20px;
+  color: #1f2937;
+}
+.stat strong.pending {
+  color: #d46b08;
+}
+.stat-hint {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 12px;
+}
+.note-text {
+  display: block;
+  margin-top: 3px;
+  color: #8a6d3b;
+}
+.status-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: #eef3f9;
+}
+.status-chip.pending {
+  background: #fff7e6;
+  color: #d46b08;
+}
+.status-chip.confirmed {
+  background: #fff1f0;
+  color: #cf1322;
+}
+.status-chip.false_positive {
+  background: #f6ffed;
+  color: #237804;
+}
+.status-chip.resolved {
+  background: #e6f4ff;
+  color: #0958d9;
+}
+.ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.link-btn {
+  border: none;
+  background: none;
+  color: #1a5c9c;
+  cursor: pointer;
+  padding: 0;
+  font-size: 13px;
+}
+.link-btn:disabled {
+  color: #a0aec0;
+  cursor: not-allowed;
+}
 </style>

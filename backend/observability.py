@@ -7,11 +7,11 @@
 告警按路径限流（默认每路径每分钟最多一条，被压掉的条数累计到下一次里报出来）——
 一个持续几十秒的 SSE 连接会不停产生「慢请求」，不限流会把日志刷满，真出问题时反而看不见。
 """
-from collections import Counter
-from datetime import datetime, timezone
-from threading import Lock
 import logging
 import time
+from collections import Counter
+from datetime import UTC, datetime
+from threading import Lock
 
 logger = logging.getLogger("finance-api.slow")
 
@@ -118,7 +118,7 @@ def record_request(path: str, status_code: int, duration_ms: float) -> None:
             entry["exceeded"] += 1
             entry["worst_ms"] = max(entry["worst_ms"], duration_ms)
             entry["last_ms"] = duration_ms
-            entry["last_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            entry["last_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             now = time.monotonic()
             if now - entry["last_logged"] >= thresholds()["log_seconds"]:
                 # 同样的慢请求连着来时只报第一条，后面的计数攒到下一次告警里一起说。

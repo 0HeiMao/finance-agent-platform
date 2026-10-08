@@ -1,0 +1,7 @@
+# 第三方与构建产物不参与格式化（本来也不该手改）
+node_modules/
+dist/
+.build-tmp/
+
+# lockfile 由 npm 生成，手改它等于下一个人 `npm ci` 时炸掉
+package-lock.json

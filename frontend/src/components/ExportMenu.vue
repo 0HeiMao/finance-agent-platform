@@ -22,12 +22,12 @@ import { withScope } from '../api/scope'
 import { saveBlob } from '../api/download'
 
 const props = defineProps({
-  kind: { type: String, required: true },      // transactions | metrics | alerts
+  kind: { type: String, required: true }, // transactions | metrics | alerts
   period: { type: String, default: '' },
   periodFrom: { type: String, default: '' },
   periodTo: { type: String, default: '' },
   account: { type: String, default: '' },
-  level: { type: String, default: '' },
+  level: { type: String, default: '' }
 })
 
 const busy = ref(false)
@@ -58,8 +58,7 @@ function filenameFrom(response, format) {
     }
   }
   const match = /filename="?([^";]+)"?/i.exec(disposition)
-  if (match && match[1] && !match[1].toLowerCase().startsWith('utf-8'))
-    return match[1]
+  if (match && match[1] && !match[1].toLowerCase().startsWith('utf-8')) return match[1]
   return `${props.kind}-${props.period || 'all'}.${format}`
 }
 
@@ -88,7 +87,17 @@ async function download(format) {
 </script>
 
 <style scoped>
-.export-menu { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.export-msg { font-size: 12px; color: #52c41a; }
-.export-msg.bad { color: #ff4d4f; }
+.export-menu {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.export-msg {
+  font-size: 12px;
+  color: #52c41a;
+}
+.export-msg.bad {
+  color: #ff4d4f;
+}
 </style>

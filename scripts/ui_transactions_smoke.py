@@ -23,8 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import httpx  # noqa: E402
-
-from check_pages import CdpSession, OVERFLOW_JS, _auto_login_page, _browser, _debugger_url  # noqa: E402
+from check_pages import OVERFLOW_JS, CdpSession, _auto_login_page, _browser, _debugger_url  # noqa: E402
 from verify_transactions import CSV_HEADER, login, revert_batch  # noqa: E402
 
 API = "http://127.0.0.1:8000"

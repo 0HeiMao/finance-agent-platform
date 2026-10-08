@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -17,8 +17,7 @@ from sqlalchemy.orm import Session
 
 from backend import periods as period_mod
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
-from backend.scope import (Scope, metric_totals, scope_alert, scope_label, scope_metric,
-                           scope_transactions)
+from backend.scope import Scope, metric_totals, scope_alert, scope_label, scope_metric, scope_transactions
 
 CENT = Decimal("0.01")
 MAX_TABLE_PERIODS = 24

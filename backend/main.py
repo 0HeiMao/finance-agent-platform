@@ -2,31 +2,32 @@ import asyncio
 import json
 import logging
 import time
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
-from backend.api_rag import router as rag_router
-from backend.auth import router as auth_router
-from backend.api_financial import router as financial_router
-from backend.api_analysis import router as analysis_router
+from sqlalchemy.orm import Session
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from backend import observability
+from backend.api_admin import router as admin_router
 from backend.api_ai import router as ai_router
+from backend.api_analysis import router as analysis_router
+from backend.api_dashboard import router as dashboard_router
+from backend.api_export import router as export_router
+from backend.api_financial import router as financial_router
 from backend.api_forecast import router as forecast_router
+from backend.api_rag import router as rag_router
 from backend.api_reports import router as reports_router
 from backend.api_system import router as system_router
-from backend.api_admin import router as admin_router
-from backend.api_export import router as export_router
-from backend.api_dashboard import router as dashboard_router
-from backend.db import engine
-from backend.migrations import ensure_schema, missing_columns, missing_indexes
-from sqlalchemy.orm import Session
-from backend import observability
-from backend.observability import record_request, snapshot
+from backend.auth import router as auth_router
 from backend.config import get_settings
+from backend.db import engine
 from backend.jobs import reap_stale_jobs
+from backend.migrations import ensure_schema, missing_columns, missing_indexes
+from backend.observability import record_request, snapshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("finance-api")

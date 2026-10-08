@@ -20,12 +20,12 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from backend.config import get_settings
 from backend.models import User
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _aware(value: datetime | None) -> datetime | None:

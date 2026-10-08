@@ -20,8 +20,16 @@ from sqlalchemy.orm import Session
 from backend.auth import current_user
 from backend.db import get_db
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (Scope, resolve_requested_scope, scope_alert, scope_label,
-                           scope_metric, scope_of, scope_payload, scope_transactions)
+from backend.scope import (
+    Scope,
+    resolve_requested_scope,
+    scope_alert,
+    scope_label,
+    scope_metric,
+    scope_of,
+    scope_payload,
+    scope_transactions,
+)
 
 router = APIRouter(tags=["dashboard"])
 
@@ -209,7 +217,6 @@ def _totals_by_months(db: Session, months: list[str], scope: Scope = None) -> tu
     revenue = sum((row.revenue_amount or Decimal(0) for row in rows), Decimal(0))
     cost = sum((row.cost_amount or Decimal(0) for row in rows), Decimal(0))
     expense = sum((row.expense_amount or Decimal(0) for row in rows), Decimal(0))
-    gross = sum((row.gross_profit_amount or Decimal(0) for row in rows), Decimal(0))
     net = sum((row.net_profit_amount or Decimal(0) for row in rows), Decimal(0))
     return {
         "revenue": revenue, "cost": cost, "expense": expense, "profit": net,

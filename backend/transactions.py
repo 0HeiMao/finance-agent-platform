@@ -17,14 +17,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
-from backend import audit, locks, periods as period_mod, rollups
+from backend import audit, locks, rollups
+from backend import periods as period_mod
 from backend.api_analysis import calculate
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 from backend.scope import Scope, scope_transactions
@@ -300,7 +301,7 @@ def reverse(db: Session, row_id: int, *, scope: Scope, actor: str, reason: str |
     if row.reversed_at is not None:
         raise AlreadyReversed("这一行已经冲销过")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # 冲销行与原行在同一个月，锁这一期就够；同样要在**改行/加行之前**取锁。
     locks.lock_periods(db, locks.period_lock_set([period_of(row)]))
     reversal = FinancialTransaction(

@@ -3,7 +3,6 @@ import { computed, onMounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
 import PagePager from '../components/PagePager.vue'
-import { formatTime } from '../utils/format'
 
 const PAGE_SIZE = 50
 // 可更正的字段：中文标签 + 输入类型。金额一律按字符串发给后端，由后端用导入那一套规则解析，
@@ -18,7 +17,7 @@ const FIELDS = [
   { key: 'cost_amount', label: '成本金额', type: 'amount' },
   { key: 'expense_amount', label: '费用金额', type: 'amount' },
   { key: 'cash_in_amount', label: '现金流入', type: 'amount' },
-  { key: 'cash_out_amount', label: '现金流出', type: 'amount' },
+  { key: 'cash_out_amount', label: '现金流出', type: 'amount' }
 ]
 
 const sidebarOpen = ref(false)
@@ -84,7 +83,7 @@ async function loadDepartments() {
     const response = await apiFetch('/analysis/departments')
     const payload = await response.json()
     departmentOptions.value = payload.departments || []
-  } catch (e) {
+  } catch {
     // 口径下拉读不到不影响列表主体，静默降级成"全部部门"
     departmentOptions.value = []
   }
@@ -106,7 +105,8 @@ function startEdit(row) {
   for (const field of FIELDS) {
     const value = row[field.key]
     if (field.type === 'date') next[field.key] = (row.transaction_date || '').slice(0, 10)
-    else if (field.type === 'amount') next[field.key] = value === null || value === undefined ? '' : String(value)
+    else if (field.type === 'amount')
+      next[field.key] = value === null || value === undefined ? '' : String(value)
     else next[field.key] = value ?? ''
   }
   draft.value = next
@@ -123,11 +123,12 @@ function changedFields() {
   const row = rows.value.find((item) => item.id === editId.value)
   const changes = {}
   for (const field of FIELDS) {
-    const before = field.type === 'date'
-      ? (row.transaction_date || '').slice(0, 10)
-      : field.type === 'amount'
-        ? String(row[field.key] ?? '')
-        : String(row[field.key] ?? '')
+    const before =
+      field.type === 'date'
+        ? (row.transaction_date || '').slice(0, 10)
+        : field.type === 'amount'
+          ? String(row[field.key] ?? '')
+          : String(row[field.key] ?? '')
     const after = field.type === 'date' ? draft.value[field.key] : draft.value[field.key].trim()
     if (after === '' && field.type === 'amount') continue
     if (after !== before) changes[field.key] = after
@@ -154,7 +155,7 @@ async function saveEdit() {
   try {
     const response = await apiFetch(`/financial/transactions/${editId.value}`, {
       method: 'PATCH',
-      body: JSON.stringify(changes),
+      body: JSON.stringify(changes)
     })
     const payload = await response.json()
     notice.value = `已更正第 ${editId.value} 行，旧值写在审计日志里${describeRefresh(payload)}`
@@ -174,7 +175,7 @@ async function reverse(row) {
   try {
     const response = await apiFetch(`/financial/transactions/${row.id}/reverse`, {
       method: 'POST',
-      body: JSON.stringify(reverseReason.value ? { reason: reverseReason.value } : {}),
+      body: JSON.stringify(reverseReason.value ? { reason: reverseReason.value } : {})
     })
     const payload = await response.json()
     notice.value = `已冲销第 ${row.id} 行：新增冲销行 #${payload.reversal.id}（金额取负），原行保留并标记${describeRefresh(payload)}`
@@ -211,18 +212,22 @@ onMounted(() => {
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
       <section class="filter-card">
-        <label>期间
+        <label
+          >期间
           <select v-model="periodFilter" @change="applyFilters">
             <option value="">全部期间</option>
             <option v-for="item in periods" :key="item" :value="item">{{ item }}</option>
           </select>
         </label>
-        <label>部门（口径）
+        <label
+          >部门（口径）
           <select v-model="departmentFilter" @change="applyFilters">
             <option value="">按当前账号范围</option>
             <option v-for="item in departmentOptions" :key="item.name" :value="item.name">
@@ -230,11 +235,17 @@ onMounted(() => {
             </option>
           </select>
         </label>
-        <label>关键字
+        <label
+          >关键字
           <input v-model.trim="queryFilter" placeholder="科目或摘要" @keyup.enter="applyFilters" />
         </label>
-        <label>批次
-          <input v-model.trim="batchFilter" placeholder="批次号（可只填前几位）" @keyup.enter="applyFilters" />
+        <label
+          >批次
+          <input
+            v-model.trim="batchFilter"
+            placeholder="批次号（可只填前几位）"
+            @keyup.enter="applyFilters"
+          />
         </label>
         <button class="btn primary" @click="applyFilters">筛选</button>
       </section>
@@ -248,7 +259,10 @@ onMounted(() => {
       </section>
 
       <template v-else>
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-else-if="notice" class="state-box notice">{{ notice }}</section>
 
         <section v-if="!rows.length" class="state-box empty-state">
@@ -265,8 +279,17 @@ onMounted(() => {
             <table>
               <thead>
                 <tr>
-                  <th>id</th><th>日期</th><th>科目</th><th>部门</th><th>摘要</th>
-                  <th>收入</th><th>成本</th><th>费用</th><th>批次</th><th>状态</th><th>操作</th>
+                  <th>id</th>
+                  <th>日期</th>
+                  <th>科目</th>
+                  <th>部门</th>
+                  <th>摘要</th>
+                  <th>收入</th>
+                  <th>成本</th>
+                  <th>费用</th>
+                  <th>批次</th>
+                  <th>状态</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -283,7 +306,9 @@ onMounted(() => {
                     <td>{{ amount(row.revenue_amount) }}</td>
                     <td>{{ amount(row.cost_amount) }}</td>
                     <td>{{ amount(row.expense_amount) }}</td>
-                    <td :title="row.import_batch"><code>{{ (row.import_batch || '').slice(0, 8) }}…</code></td>
+                    <td :title="row.import_batch">
+                      <code>{{ (row.import_batch || '').slice(0, 8) }}…</code>
+                    </td>
                     <td>{{ statusOf(row) }}</td>
                     <td>
                       <div class="row-actions">
@@ -291,14 +316,21 @@ onMounted(() => {
                           <span class="muted">—</span>
                         </template>
                         <template v-else-if="confirmReverse === row.id">
-                          <input v-model.trim="reverseReason" class="reason" placeholder="冲销原因（可留空）" maxlength="500" />
+                          <input
+                            v-model.trim="reverseReason"
+                            class="reason"
+                            placeholder="冲销原因（可留空）"
+                            maxlength="500"
+                          />
                           <button class="btn danger" :disabled="busy === row.id" @click="reverse(row)">
                             {{ busy === row.id ? '冲销中…' : '确认冲销' }}
                           </button>
                           <button class="btn" @click="confirmReverse = 0">取消</button>
                         </template>
                         <template v-else>
-                          <button class="btn" :disabled="editId === row.id" @click="startEdit(row)">更正</button>
+                          <button class="btn" :disabled="editId === row.id" @click="startEdit(row)">
+                            更正
+                          </button>
                           <button class="btn danger" @click="confirmReverse = row.id">冲销</button>
                         </template>
                       </div>
@@ -333,7 +365,14 @@ onMounted(() => {
               </tbody>
             </table>
           </div>
-          <PagePager :total="total" :limit="PAGE_SIZE" :offset="offset" :loading="loading" unit="行明细" @change="turn" />
+          <PagePager
+            :total="total"
+            :limit="PAGE_SIZE"
+            :offset="offset"
+            :loading="loading"
+            unit="行明细"
+            @change="turn"
+          />
           <p class="muted">
             这一页不做删除：更正与冲销都会留痕（审计日志里能查到旧值与操作人），
             要整批收回请到「导入批次」撤销批次。
@@ -345,10 +384,29 @@ onMounted(() => {
 </template>
 
 <style scoped>
-tr.reversed td { color: #8a8f99; text-decoration: line-through; }
-tr.reversal td { color: #a8071a; }
-tr.edit-row td { background: #f7fafd; }
-.edit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-.edit-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
-.reason { max-width: 180px; }
+tr.reversed td {
+  color: #8a8f99;
+  text-decoration: line-through;
+}
+tr.reversal td {
+  color: #a8071a;
+}
+tr.edit-row td {
+  background: #f7fafd;
+}
+.edit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.edit-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.reason {
+  max-width: 180px;
+}
 </style>

@@ -1,8 +1,8 @@
-from functools import lru_cache
 import logging
 import os
 import re
 import secrets
+from functools import lru_cache
 from pathlib import Path
 
 # 本机（以及不少 Windows 开发机）会把 NO_PROXY 写成含 IPv6 字面量的形式，例如
@@ -115,7 +115,7 @@ def _is_local_host(host: str) -> bool:
     """本机/内网地址视为开发环境，不参与生产配置校验。"""
     if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
         return True
-    if host.startswith("192.168.") or host.startswith("10.") or host.startswith("172."):
+    if host.startswith(("192.168.", "10.", "172.")):
         return True
     return host.endswith(".local")
 

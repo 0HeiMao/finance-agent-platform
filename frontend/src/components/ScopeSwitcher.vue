@@ -7,7 +7,9 @@
         {{ item.label }}（{{ item.transactions }} 行）
       </option>
     </select>
-    <small v-if="activeScope" class="scope-hint">只看「{{ scopeLabel(activeScope) }}」的明细与据此重算的指标</small>
+    <small v-if="activeScope" class="scope-hint"
+      >只看「{{ scopeLabel(activeScope) }}」的明细与据此重算的指标</small
+    >
   </div>
 </template>
 
@@ -43,9 +45,11 @@ const switchable = computed(() => me.value.unrestricted === true || ownDepartmen
 
 // 「不选任何部门」对不受限账号是全公司，对多部门账号是它自己那几个部门的并集——
 // 文案不能都写「全公司」，否则受限账号会以为自己在看全公司的数。
-const defaultLabel = computed(() => (me.value.unrestricted === true
-  ? '全公司（全部部门）'
-  : `我绑定的 ${ownDepartments.value.length} 个部门（合计）`))
+const defaultLabel = computed(() =>
+  me.value.unrestricted === true
+    ? '全公司（全部部门）'
+    : `我绑定的 ${ownDepartments.value.length} 个部门（合计）`
+)
 
 async function load() {
   if (!switchable.value || loaded.value) return
@@ -55,7 +59,7 @@ async function load() {
     const payload = await response.json()
     options.value = payload.departments || []
     loaded.value = true
-  } catch (error) {
+  } catch {
     // 拿不到列表就退回「不显示选择器」，而不是留一个空下拉让人以为系统坏了。
     options.value = []
   } finally {
@@ -69,14 +73,36 @@ function onChange(event) {
 
 // 必须 watch 而不是 onMounted：挂载时 `/auth/me` 往往还没回来，`switchable` 仍是 false，
 // 那时 load() 会直接 return，之后再没人调用它——表现就是下拉里只有「全公司」一个选项。
-watch(switchable, (value) => {
-  if (value) load()
-}, { immediate: true })
+watch(
+  switchable,
+  (value) => {
+    if (value) load()
+  },
+  { immediate: true }
+)
 </script>
 
 <style scoped>
-.scope-switcher { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.scope-label { font-size: 13px; color: #4a5a6a; }
-.scope-switcher select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; font-size: 13px; max-width: 260px; }
-.scope-hint { font-size: 12px; color: #8a6d3b; }
+.scope-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.scope-label {
+  font-size: 13px;
+  color: #4a5a6a;
+}
+.scope-switcher select {
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13px;
+  max-width: 260px;
+}
+.scope-hint {
+  font-size: 12px;
+  color: #8a6d3b;
+}
 </style>

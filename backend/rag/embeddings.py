@@ -1,9 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
 
-
-from backend.rag.pgvector_store import EMBEDDING_DIMENSION
 from backend.config import get_settings
+from backend.rag.pgvector_store import EMBEDDING_DIMENSION
 
 
 class EmbeddingService:

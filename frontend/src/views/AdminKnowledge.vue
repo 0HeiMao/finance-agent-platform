@@ -68,7 +68,7 @@ async function removeSource(item) {
   notice.value = ''
   try {
     const response = await apiFetch(`/admin/knowledge?source=${encodeURIComponent(item.source)}`, {
-      method: 'DELETE',
+      method: 'DELETE'
     })
     const result = await response.json()
     notice.value = `已删除「${result.source}」的 ${result.deleted_chunks} 条片段。重新导入该材料即可恢复。`
@@ -105,7 +105,9 @@ onMounted(load)
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -118,7 +120,10 @@ onMounted(load)
       </section>
 
       <template v-else>
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-else-if="notice" class="state-box notice">{{ notice }}</section>
 
         <section v-if="!sources.length" class="state-box empty-state">
@@ -139,7 +144,12 @@ onMounted(load)
           <div class="filter-row">
             <label class="field">
               <span>来源</span>
-              <input v-model.trim="sourceFilter" class="select" maxlength="500" placeholder="按来源名模糊搜索">
+              <input
+                v-model.trim="sourceFilter"
+                class="select"
+                maxlength="500"
+                placeholder="按来源名模糊搜索"
+              />
             </label>
             <label class="field">
               <span>文档类型</span>
@@ -158,8 +168,8 @@ onMounted(load)
                 <span class="level low">{{ item.chunks }} 条</span>
               </div>
               <small class="quality-hint">
-                类型：{{ item.document_types.join('、') || '未标注' }} ·
-                入库：{{ item.first_at }} ~ {{ item.last_at }}
+                类型：{{ item.document_types.join('、') || '未标注' }} · 入库：{{ item.first_at }} ~
+                {{ item.last_at }}
               </small>
               <small class="quality-hint">
                 向量模型：{{ item.embedding_models.map(shortModel).join('、') || '未标注（不参与检索）' }}
@@ -178,10 +188,17 @@ onMounted(load)
               </div>
             </li>
           </ul>
-          <PagePager :total="total" :limit="PAGE_SIZE" :offset="offset" :loading="loading" unit="份来源" @change="turn" />
+          <PagePager
+            :total="total"
+            :limit="PAGE_SIZE"
+            :offset="offset"
+            :loading="loading"
+            unit="份来源"
+            @change="turn"
+          />
           <p class="muted">
-            向量模型标注为空或与当前模型不一致的片段不会参与检索（同维度不代表同一向量空间），
-            删除后可用 scripts/reindex_embeddings.py 统一重算。
+            向量模型标注为空或与当前模型不一致的片段不会参与检索（同维度不代表同一向量空间）， 删除后可用
+            scripts/reindex_embeddings.py 统一重算。
           </p>
         </section>
       </template>

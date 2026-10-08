@@ -10,7 +10,7 @@ const props = defineProps({
   limit: { type: Number, default: 50 },
   offset: { type: Number, default: 0 },
   loading: { type: Boolean, default: false },
-  unit: { type: String, default: '条' },
+  unit: { type: String, default: '条' }
 })
 
 const emit = defineEmits(['change'])
@@ -39,6 +39,14 @@ function turn(delta) {
 </template>
 
 <style scoped>
-.pager { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
-.pager .muted { font-size: 12px; }
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.pager .muted {
+  font-size: 12px;
+}
 </style>

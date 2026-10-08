@@ -4,8 +4,8 @@
 """
 
 import hashlib
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
@@ -15,16 +15,16 @@ from sqlalchemy.orm import Session
 
 from backend import audit
 from backend.auth import current_user
+from backend.config import get_settings
 from backend.db import get_db
 from backend.limits import ai_quota
 from backend.models import User
-from backend.scope import departments_of
-from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
+from backend.rag.answer import generate_answer
 from backend.rag.document_parser import extract_text, split_text
 from backend.rag.embeddings import get_embedding_service
-from backend.rag.answer import generate_answer
+from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
 from backend.rag.rerank import rerank
-from backend.config import get_settings
+from backend.scope import departments_of
 
 router = APIRouter(prefix="/api/v1/rag", tags=["rag"])
 

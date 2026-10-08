@@ -31,7 +31,8 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from backend.db import Base, engine as default_engine
+from backend.db import Base
+from backend.db import engine as default_engine
 
 logger = logging.getLogger("finance-api.migrations")
 

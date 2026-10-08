@@ -1,6 +1,7 @@
 """离线中文检索烟雾测试，不调用 DeepSeek、不改数据库。"""
-from pathlib import Path
 import sys
+from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sentence_transformers import SentenceTransformer
 
@@ -12,7 +13,7 @@ def main():
     queries = ['报销需要在几天内提交？', '谁负责批准采购预算？']
     vectors = model.encode(documents + queries, normalize_embeddings=True)
     assert vectors.shape[1] == 384, '数据库维度不匹配'
-    for index, query in enumerate(queries):
+    for index, _query in enumerate(queries):
         scores = vectors[:3] @ vectors[3 + index]
         assert int(scores.argmax()) == index, '中文相关性排序失败'
         print('query', index + 1, 'best_document', int(scores.argmax()) + 1, 'cosine_distance', round(1 - float(scores[index]), 4))

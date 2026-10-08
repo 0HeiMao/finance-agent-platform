@@ -17,21 +17,33 @@ const busyKey = ref('')
 const drafts = reactive({})
 
 const RULES = [
-  { title: '不受限账号（部门留空）', tone: 'ok', items: [
-    '看板、收入/成本分析、预警、Word/PPT 报告、Agent 都是全公司口径（读 department 为空的那行指标）。',
-    '知识库检索返回所有片段；管理入口全部开放。',
-  ] },
-  { title: '限定部门账号', tone: 'warn', items: [
-    '只统计该部门的数据行：指标与预警读该部门的 department 口径行，明细钻取只返回本部门交易。',
-    '报告与 PPT 在标题/封面写明「数据范围：部门 X」，Agent 证据里也会带同一句，避免数字被当公司口径引用。',
-    '知识库只返回该部门与未标注部门的片段；管理接口一律 403。',
-    '部门为空的数据行（未标注部门）归全公司口径，不属于任何部门账号。',
-  ] },
-  { title: '多部门账号（一个账号绑定多个部门）', tone: 'warn', items: [
-    '看到的是这些部门的并集：金额相加、比率按相加后的金额重算（比率不能相加）。',
-    '部门筛选、部门权限页都会把它算进每一个绑定的部门；同名部门只写一次。',
-    '越界的口径切换被拒绝：只能在自己绑定的部门里收窄，切不到没绑定的部门。',
-  ] },
+  {
+    title: '不受限账号（部门留空）',
+    tone: 'ok',
+    items: [
+      '看板、收入/成本分析、预警、Word/PPT 报告、Agent 都是全公司口径（读 department 为空的那行指标）。',
+      '知识库检索返回所有片段；管理入口全部开放。'
+    ]
+  },
+  {
+    title: '限定部门账号',
+    tone: 'warn',
+    items: [
+      '只统计该部门的数据行：指标与预警读该部门的 department 口径行，明细钻取只返回本部门交易。',
+      '报告与 PPT 在标题/封面写明「数据范围：部门 X」，Agent 证据里也会带同一句，避免数字被当公司口径引用。',
+      '知识库只返回该部门与未标注部门的片段；管理接口一律 403。',
+      '部门为空的数据行（未标注部门）归全公司口径，不属于任何部门账号。'
+    ]
+  },
+  {
+    title: '多部门账号（一个账号绑定多个部门）',
+    tone: 'warn',
+    items: [
+      '看到的是这些部门的并集：金额相加、比率按相加后的金额重算（比率不能相加）。',
+      '部门筛选、部门权限页都会把它算进每一个绑定的部门；同名部门只写一次。',
+      '越界的口径切换被拒绝：只能在自己绑定的部门里收窄，切不到没绑定的部门。'
+    ]
+  }
 ]
 
 const scopeCount = computed(() => departments.value.filter((item) => item.user_count).length)
@@ -52,13 +64,18 @@ const editableUsers = computed(() => {
 function short(value) {
   const raw = Number(String(value ?? 0).replace(/,/g, ''))
   if (!Number.isFinite(raw) || raw === 0) return '0.00'
-  if (Math.abs(raw) >= 1e8) return `${(raw / 1e8).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 亿元`
-  if (Math.abs(raw) >= 1e4) return `${(raw / 1e4).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万元`
+  if (Math.abs(raw) >= 1e8)
+    return `${(raw / 1e8).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 亿元`
+  if (Math.abs(raw) >= 1e4)
+    return `${(raw / 1e4).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万元`
   return `${raw.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 元`
 }
 
 function exact(value) {
-  return Number(String(value ?? 0).replace(/,/g, '')).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return Number(String(value ?? 0).replace(/,/g, '')).toLocaleString('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })
 }
 
 async function load() {
@@ -91,7 +108,7 @@ async function saveUser(user) {
   try {
     const response = await apiFetch(`/admin/users/${user.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ departments: parseDepartments(drafts[user.id]) }),
+      body: JSON.stringify({ departments: parseDepartments(drafts[user.id]) })
     })
     const updated = await response.json()
     notice.value = updated.unrestricted
@@ -128,7 +145,9 @@ onMounted(load)
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -141,7 +160,10 @@ onMounted(load)
       </section>
 
       <template v-else>
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-else-if="notice" class="state-box notice">{{ notice }}</section>
 
         <section class="page-card">
@@ -165,10 +187,18 @@ onMounted(load)
             <span>部门不是可新建的表，而是从数据行里长出来的：有明细、有指标、或被账号引用就会出现</span>
           </div>
           <div class="settings-grid">
-            <div><span>数据中出现过的部门</span><strong>{{ summary.departments_with_data }}</strong></div>
-            <div><span>已绑定账号的部门</span><strong>{{ summary.departments_with_users }}</strong></div>
-            <div><span>不受限账号</span><strong>{{ summary.unrestricted_users }}</strong></div>
-            <div><span>账号总数</span><strong>{{ summary.total_users }}</strong></div>
+            <div>
+              <span>数据中出现过的部门</span><strong>{{ summary.departments_with_data }}</strong>
+            </div>
+            <div>
+              <span>已绑定账号的部门</span><strong>{{ summary.departments_with_users }}</strong>
+            </div>
+            <div>
+              <span>不受限账号</span><strong>{{ summary.unrestricted_users }}</strong>
+            </div>
+            <div>
+              <span>账号总数</span><strong>{{ summary.total_users }}</strong>
+            </div>
           </div>
         </section>
 
@@ -180,7 +210,12 @@ onMounted(load)
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>用户名</th><th>当前范围</th><th>部门（可编辑，多个用「、」分隔）</th><th>操作</th></tr>
+                <tr>
+                  <th>用户名</th>
+                  <th>当前范围</th>
+                  <th>部门（可编辑，多个用「、」分隔）</th>
+                  <th>操作</th>
+                </tr>
               </thead>
               <tbody>
                 <tr v-for="user in editableUsers" :key="user.id">
@@ -190,7 +225,11 @@ onMounted(load)
                   </td>
                   <td>
                     <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
-                      {{ user.unrestricted ? '全公司' : `部门 ${departmentsText(user.departments) || user.department}` }}
+                      {{
+                        user.unrestricted
+                          ? '全公司'
+                          : `部门 ${departmentsText(user.departments) || user.department}`
+                      }}
                     </span>
                   </td>
                   <td>
@@ -201,14 +240,16 @@ onMounted(load)
                       maxlength="500"
                       placeholder="留空＝不受限；多个用「、」分隔"
                       :disabled="user.is_self"
-                    >
+                    />
                   </td>
                   <td>
                     <button
                       class="btn"
                       :disabled="user.is_self || busyKey === `user-${user.id}`"
                       @click="saveUser(user)"
-                    >保存</button>
+                    >
+                      保存
+                    </button>
                   </td>
                 </tr>
               </tbody>
@@ -218,7 +259,8 @@ onMounted(load)
             <option v-for="name in knownDepartments" :key="name" :value="name" />
           </datalist>
           <p class="muted">
-            切到受限部门后，该账号的看板、分析、报告、Agent 只统计本部门明细；知识库只返回本部门与未标注部门的片段。
+            切到受限部门后，该账号的看板、分析、报告、Agent
+            只统计本部门明细；知识库只返回本部门与未标注部门的片段。
           </p>
         </section>
 
@@ -241,11 +283,18 @@ onMounted(load)
               <div class="dept-meta">
                 <code>{{ item.transactions }} 行明细</code>
                 <code>指标 {{ item.metric_rows }} 行 / 预警 {{ item.alert_rows }} 条</code>
-                <code>期间 {{ item.periods.length ? `${item.periods[0]} ~ ${item.periods[item.periods.length - 1]}` : '—' }}</code>
+                <code
+                  >期间
+                  {{
+                    item.periods.length
+                      ? `${item.periods[0]} ~ ${item.periods[item.periods.length - 1]}`
+                      : '—'
+                  }}</code
+                >
               </div>
               <small>
-                收入 {{ short(item.revenue_amount) }}（{{ exact(item.revenue_amount) }} 元）
-                · 费用 {{ short(item.expense_amount) }}（{{ exact(item.expense_amount) }} 元）
+                收入 {{ short(item.revenue_amount) }}（{{ exact(item.revenue_amount) }} 元） · 费用
+                {{ short(item.expense_amount) }}（{{ exact(item.expense_amount) }} 元）
               </small>
               <div v-if="item.users.length" class="row-actions">
                 <span v-for="user in item.users" :key="user.id" class="chip">{{ user.username }}</span>

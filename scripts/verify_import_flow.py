@@ -1,20 +1,21 @@
 """真实 PostgreSQL + ASGI 接口回归；数据库外层事务最终回滚，原始文件写入临时目录。"""
 import asyncio
-from contextlib import chdir
 import io
 import os
 import secrets
-import tempfile
-from pathlib import Path
 import sys
+import tempfile
+from contextlib import chdir
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
-from backend.main import app
+
 from backend.db import engine, get_db
-from backend.models import FinancialMetric, FinancialTransaction
+from backend.main import app
+from backend.models import FinancialMetric
 
 
 async def main():

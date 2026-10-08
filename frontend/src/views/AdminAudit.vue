@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
 import PagePager from '../components/PagePager.vue'
@@ -29,8 +29,6 @@ const notice = ref('')
 const loading = ref(false)
 const error = ref('')
 const loaded = ref(false)
-
-const page = computed(() => Math.floor(offset.value / PAGE_SIZE) + 1)
 
 // 筛选条件既给列表用也给导出用：导出的必须是「我看到的这一批」，不是整张表
 function filters() {
@@ -122,7 +120,7 @@ async function previewPurge() {
   try {
     const response = await apiFetch('/admin/audit/purge', {
       method: 'POST',
-      body: JSON.stringify({ keep_days: Number(keepDays.value), dry_run: true }),
+      body: JSON.stringify({ keep_days: Number(keepDays.value), dry_run: true })
     })
     purgePreview.value = await response.json()
   } catch (err) {
@@ -139,7 +137,7 @@ async function confirmPurge() {
   try {
     const response = await apiFetch('/admin/audit/purge', {
       method: 'POST',
-      body: JSON.stringify({ keep_days: Number(keepDays.value), dry_run: false }),
+      body: JSON.stringify({ keep_days: Number(keepDays.value), dry_run: false })
     })
     const payload = await response.json()
     purgePreview.value = null
@@ -184,7 +182,9 @@ onMounted(load)
           <button class="btn" :disabled="exporting || !total" @click="exportCsv">
             {{ exporting ? '导出中…' : '导出 CSV' }}
           </button>
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '加载中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '加载中…' : '↻ 重新读取' }}
+          </button>
           <router-link class="btn" to="/admin">返回管理概览</router-link>
         </div>
       </header>
@@ -243,7 +243,12 @@ onMounted(load)
             <table class="audit-table">
               <thead>
                 <tr>
-                  <th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th><th>来源 IP</th>
+                  <th>时间</th>
+                  <th>操作人</th>
+                  <th>动作</th>
+                  <th>对象</th>
+                  <th>详情</th>
+                  <th>来源 IP</th>
                 </tr>
               </thead>
               <tbody>
@@ -314,24 +319,105 @@ onMounted(load)
 </template>
 
 <style scoped>
-.filter-row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 14px; }
-.field { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.field span { color: #64748b; }
-.select { padding: 6px 8px; border: 1px solid #d7dee8; border-radius: 7px; background: #fff; color: inherit; }
-.days-input { width: 90px; }
-.notice { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; background: #f6ffed; color: #237804; font-size: 13px; }
-.card-head { margin-bottom: 12px; }
-.card-head h2 { margin: 0 0 4px; font-size: 15px; }
-.card-head p { margin: 0; font-size: 12px; }
-.btn.danger { border-color: #ffa39e; color: #a8071a; }
-.audit-table { width: 100%; border-collapse: collapse; min-width: 980px; }
-.audit-table th { text-align: left; font-size: 13px; color: #64748b; font-weight: 500; padding: 6px 10px 6px 0; }
-.audit-table td { padding: 8px 10px 8px 0; vertical-align: top; border-top: 1px solid #eef1f6; font-size: 13px; }
-.audit-table small { display: block; font-size: 11px; }
-.nowrap { white-space: nowrap; }
-.target { display: block; font-family: Consolas, monospace; font-size: 12px; word-break: break-all; }
-.detail { max-width: 420px; color: #475569; overflow-wrap: anywhere; }
-.action-chip { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef3f9; color: #1a3a5c; font-size: 12px; }
-.audit-hint { margin-top: 14px; font-size: 12px; }
-.audit-hint code { font-family: Consolas, monospace; font-size: 12px; }
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.field span {
+  color: #64748b;
+}
+.select {
+  padding: 6px 8px;
+  border: 1px solid #d7dee8;
+  border-radius: 7px;
+  background: #fff;
+  color: inherit;
+}
+.days-input {
+  width: 90px;
+}
+.notice {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f6ffed;
+  color: #237804;
+  font-size: 13px;
+}
+.card-head {
+  margin-bottom: 12px;
+}
+.card-head h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+.card-head p {
+  margin: 0;
+  font-size: 12px;
+}
+.btn.danger {
+  border-color: #ffa39e;
+  color: #a8071a;
+}
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 980px;
+}
+.audit-table th {
+  text-align: left;
+  font-size: 13px;
+  color: #64748b;
+  font-weight: 500;
+  padding: 6px 10px 6px 0;
+}
+.audit-table td {
+  padding: 8px 10px 8px 0;
+  vertical-align: top;
+  border-top: 1px solid #eef1f6;
+  font-size: 13px;
+}
+.audit-table small {
+  display: block;
+  font-size: 11px;
+}
+.nowrap {
+  white-space: nowrap;
+}
+.target {
+  display: block;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.detail {
+  max-width: 420px;
+  color: #475569;
+  overflow-wrap: anywhere;
+}
+.action-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef3f9;
+  color: #1a3a5c;
+  font-size: 12px;
+}
+.audit-hint {
+  margin-top: 14px;
+  font-size: 12px;
+}
+.audit-hint code {
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
 </style>

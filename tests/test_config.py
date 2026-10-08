@@ -91,6 +91,6 @@ def test_startup_check_raises_outside_development(monkeypatch):
 def test_startup_check_noop_when_config_is_clean(monkeypatch):
     from backend import main
 
-    stub = SimpleNamespace(validate=lambda: [], is_development=False, strict_config=True)
+    stub = SimpleNamespace(validate=list, is_development=False, strict_config=True)
     monkeypatch.setattr(main, "get_settings", lambda: stub)
     main.check_startup_config()

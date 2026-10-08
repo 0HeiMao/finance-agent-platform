@@ -16,8 +16,14 @@ from backend.db import get_db
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.rag.embeddings import get_embedding_service
 from backend.rag.pgvector_store import EMBEDDING_DIMENSION, DocumentChunk
-from backend.scope import (departments_of, scope_alert, scope_metric, scope_of, scope_payload,
-                           scope_transactions)
+from backend.scope import (
+    departments_of,
+    scope_alert,
+    scope_metric,
+    scope_of,
+    scope_payload,
+    scope_transactions,
+)
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 

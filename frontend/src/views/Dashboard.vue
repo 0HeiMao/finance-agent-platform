@@ -46,7 +46,11 @@ let observers = []
 const scaleUnit = ref({ name: '万元', divisor: 1e4 })
 
 // 金额列用紧凑单位，避免 20 位大数把卡片撑破；完整数值放在 title 里可悬停核对
-const AMOUNT_UNITS = [['亿元', 1e8], ['万元', 1e4], ['元', 1]]
+const AMOUNT_UNITS = [
+  ['亿元', 1e8],
+  ['万元', 1e4],
+  ['元', 1]
+]
 function brief(kpi) {
   const full = `${kpi.value} ${kpi.unit}`
   if (kpi.unit !== '元') return { value: kpi.value, unit: kpi.unit, full }
@@ -59,7 +63,7 @@ function brief(kpi) {
   return {
     value: scaled.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
     unit,
-    full,
+    full
   }
 }
 function humanTime(value) {
@@ -68,7 +72,10 @@ function humanTime(value) {
   return text.length >= 16 ? text.slice(0, 16) : text
 }
 function wan(value) {
-  return Number((Number(value || 0) / 10000).toFixed(2)).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return Number((Number(value || 0) / 10000).toFixed(2)).toLocaleString('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })
 }
 function fmtTime(value) {
   const d = new Date(value)
@@ -90,7 +97,7 @@ function renderCharts() {
     name: scaleUnit.value.name,
     nameTextStyle: { color: '#9aa9bb', fontSize: 11 },
     splitLine: { lineStyle: { color: '#eef2f6' } },
-    axisLabel: axis.axisLabel,
+    axisLabel: axis.axisLabel
   }
 
   const r = echarts.init(revenueEl.value)
@@ -98,12 +105,25 @@ function renderCharts() {
     color: ['#397fb5'],
     tooltip: { ...tooltip, valueFormatter: (v) => `${v} ${scaleUnit.value.name}` },
     grid: { left: 62, right: 18, top: 30, bottom: 28 },
-    xAxis: { type: 'category', data: tail.value.months, boundaryGap: false, axisLine: axis.axisLine, axisLabel: axis.axisLabel },
+    xAxis: {
+      type: 'category',
+      data: tail.value.months,
+      boundaryGap: false,
+      axisLine: axis.axisLine,
+      axisLabel: axis.axisLabel
+    },
     yAxis,
-    series: [{
-      type: 'line', smooth: true, symbol: 'circle', symbolSize: 6, data: tail.value.revenue.map(scaled),
-      areaStyle: { color: 'rgba(57,127,181,.10)' }, lineStyle: { width: 3 },
-    }],
+    series: [
+      {
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 6,
+        data: tail.value.revenue.map(scaled),
+        areaStyle: { color: 'rgba(57,127,181,.10)' },
+        lineStyle: { width: 3 }
+      }
+    ]
   })
 
   const e = echarts.init(expenseEl.value)
@@ -111,15 +131,38 @@ function renderCharts() {
   const single = expenses.length === 1
   e.setOption({
     color: ['#397fb5', '#52a77b', '#e7a844', '#8e83c4', '#9fb3c8'],
-    tooltip: { trigger: 'item', backgroundColor: '#173b5d', textStyle: { color: '#fff' }, formatter: (p) => `${p.name}<br/>${wan(p.value)} 万元（${p.percent}%）` },
-    legend: single ? { show: false } : { orient: 'vertical', left: 0, top: 'middle', itemWidth: 10, itemHeight: 10, textStyle: { color: '#718096', fontSize: 11 } },
-    series: [{
-      type: 'pie', radius: single ? ['0%', '60%'] : ['45%', '70%'], center: single ? ['50%', '48%'] : ['66%', '48%'],
-      itemStyle: { borderColor: '#fff', borderWidth: 3 },
-      label: { show: true, color: '#5b6b7d', fontSize: 11, formatter: (p) => (p.percent >= 5 ? `${p.percent}%` : '') },
-      labelLine: { length: 6, length2: 6 },
-      data: expenses,
-    }],
+    tooltip: {
+      trigger: 'item',
+      backgroundColor: '#173b5d',
+      textStyle: { color: '#fff' },
+      formatter: (p) => `${p.name}<br/>${wan(p.value)} 万元（${p.percent}%）`
+    },
+    legend: single
+      ? { show: false }
+      : {
+          orient: 'vertical',
+          left: 0,
+          top: 'middle',
+          itemWidth: 10,
+          itemHeight: 10,
+          textStyle: { color: '#718096', fontSize: 11 }
+        },
+    series: [
+      {
+        type: 'pie',
+        radius: single ? ['0%', '60%'] : ['45%', '70%'],
+        center: single ? ['50%', '48%'] : ['66%', '48%'],
+        itemStyle: { borderColor: '#fff', borderWidth: 3 },
+        label: {
+          show: true,
+          color: '#5b6b7d',
+          fontSize: 11,
+          formatter: (p) => (p.percent >= 5 ? `${p.percent}%` : '')
+        },
+        labelLine: { length: 6, length2: 6 },
+        data: expenses
+      }
+    ]
   })
 
   const c = echarts.init(cashEl.value)
@@ -132,15 +175,17 @@ function renderCharts() {
     yAxis,
     series: [
       { name: '流入', type: 'bar', barWidth: 18, data: data.value.cash.inflow.map(scaled) },
-      { name: '流出', type: 'bar', barWidth: 18, data: data.value.cash.outflow.map(scaled) },
-    ],
+      { name: '流出', type: 'bar', barWidth: 18, data: data.value.cash.outflow.map(scaled) }
+    ]
   })
   charts = [r, e, c]
-  observers = [revenueEl, expenseEl, cashEl].filter((el) => el.value).map((el) => {
-    const ob = new ResizeObserver(() => charts.forEach((chart) => chart.resize()))
-    ob.observe(el.value)
-    return ob
-  })
+  observers = [revenueEl, expenseEl, cashEl]
+    .filter((el) => el.value)
+    .map((el) => {
+      const ob = new ResizeObserver(() => charts.forEach((chart) => chart.resize()))
+      ob.observe(el.value)
+      return ob
+    })
 }
 function disposeCharts() {
   observers.forEach((ob) => ob.disconnect())
@@ -194,7 +239,9 @@ const alertRange = computed(() => {
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>财务看板概览</h1>
-            <p>{{ updatedText }}<span v-if="data && data.range"> · 期间 {{ data.range.label }}</span></p>
+            <p>
+              {{ updatedText }}<span v-if="data && data.range"> · 期间 {{ data.range.label }}</span>
+            </p>
           </div>
         </div>
         <div class="actions">
@@ -204,7 +251,9 @@ const alertRange = computed(() => {
             <option value="quarter">本季</option>
             <option value="year">本年</option>
           </select>
-          <button class="btn" :disabled="loading" @click="refresh">{{ loading ? '加载中…' : '↻ 刷新数据' }}</button>
+          <button class="btn" :disabled="loading" @click="refresh">
+            {{ loading ? '加载中…' : '↻ 刷新数据' }}
+          </button>
         </div>
       </header>
 
@@ -226,7 +275,11 @@ const alertRange = computed(() => {
 
       <template v-else>
         <section v-if="loading && !kpis.length" class="kpi-grid">
-          <article v-for="n in 6" :key="n" class="card kpi skeleton"><div class="sk-line w60" /><div class="sk-line w80 tall" /><div class="sk-line w40" /></article>
+          <article v-for="n in 6" :key="n" class="card kpi skeleton">
+            <div class="sk-line w60" />
+            <div class="sk-line w80 tall" />
+            <div class="sk-line w40" />
+          </article>
         </section>
 
         <section v-else-if="!hasData" class="state-box empty-state">
@@ -243,10 +296,16 @@ const alertRange = computed(() => {
 
           <section class="kpi-grid">
             <article v-for="k in kpis" :key="k.label" class="card kpi">
-              <div class="kpi-top"><span>{{ k.label }}</span><span class="kpi-icon">{{ k.icon }}</span></div>
-              <div class="kpi-value" :title="brief(k).full">{{ brief(k).value }} <small>{{ brief(k).unit }}</small></div>
+              <div class="kpi-top">
+                <span>{{ k.label }}</span
+                ><span class="kpi-icon">{{ k.icon }}</span>
+              </div>
+              <div class="kpi-value" :title="brief(k).full">
+                {{ brief(k).value }} <small>{{ brief(k).unit }}</small>
+              </div>
               <div v-if="k.change" class="change" :class="k.dir">
-                {{ k.dir === 'up' ? '↑' : k.dir === 'down' ? '↓' : '' }} {{ compare && compare.type }}{{ k.change }}
+                {{ k.dir === 'up' ? '↑' : k.dir === 'down' ? '↓' : '' }} {{ compare && compare.type
+                }}{{ k.change }}
                 <span v-if="k.compare_value" class="muted">（上期 {{ k.compare_value }}）</span>
               </div>
               <div v-else class="change muted">{{ k.note || '—' }}</div>
@@ -259,17 +318,26 @@ const alertRange = computed(() => {
 
           <section class="chart-grid">
             <article class="card chart-card">
-              <div class="card-head"><h2>收入趋势</h2><span>最近 {{ tail.months.length }} 个月 · {{ scaleUnit.name }}</span></div>
+              <div class="card-head">
+                <h2>收入趋势</h2>
+                <span>最近 {{ tail.months.length }} 个月 · {{ scaleUnit.name }}</span>
+              </div>
               <div ref="revenueEl" class="chart" />
               <p class="chart-note">{{ revenueNote }}</p>
             </article>
             <article class="card chart-card">
-              <div class="card-head"><h2>费用构成</h2><span>按部门 Top 5</span></div>
+              <div class="card-head">
+                <h2>费用构成</h2>
+                <span>按部门 Top 5</span>
+              </div>
               <div ref="expenseEl" class="chart" />
               <p class="chart-note">{{ notes.expenses }}</p>
             </article>
             <article class="card chart-card">
-              <div class="card-head"><h2>现金流对比</h2><span>单位：{{ scaleUnit.name }}</span></div>
+              <div class="card-head">
+                <h2>现金流对比</h2>
+                <span>单位：{{ scaleUnit.name }}</span>
+              </div>
               <div ref="cashEl" class="chart" />
               <p class="chart-note">{{ notes.cash }}</p>
             </article>
@@ -277,21 +345,38 @@ const alertRange = computed(() => {
 
           <section class="card table-card">
             <div class="card-head">
-              <h2>预警摘要<span v-if="alertTotal" class="muted"> · 共 {{ alertTotal }} 条（本期范围）</span></h2>
+              <h2>
+                预警摘要<span v-if="alertTotal" class="muted"> · 共 {{ alertTotal }} 条（本期范围）</span>
+              </h2>
               <ExportMenu kind="alerts" :period-from="alertRange.from" :period-to="alertRange.to" />
               <button class="btn" @click="router.push('/analysis/alerts')">查看全部</button>
             </div>
             <div v-if="!alerts.length" class="state-box notice">
-              <p>所选期间没有触发预警。源数据没有成本科目，「成本率异常」不会触发，只有「利润异常」可能命中。</p>
+              <p>
+                所选期间没有触发预警。源数据没有成本科目，「成本率异常」不会触发，只有「利润异常」可能命中。
+              </p>
             </div>
             <div v-else class="table-wrap">
               <table>
-                <thead><tr><th>预警类型</th><th>描述</th><th>级别</th><th>期间</th><th>发生时间</th><th>操作</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>预警类型</th>
+                    <th>描述</th>
+                    <th>级别</th>
+                    <th>期间</th>
+                    <th>发生时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
                 <tbody>
                   <tr v-for="a in alerts" :key="a.id">
                     <td>{{ a.type }}</td>
                     <td>{{ a.desc }}</td>
-                    <td><span class="level" :class="a.level">● {{ a.level === 'high' ? '高' : a.level === 'medium' ? '中' : '低' }}</span></td>
+                    <td>
+                      <span class="level" :class="a.level"
+                        >● {{ a.level === 'high' ? '高' : a.level === 'medium' ? '中' : '低' }}</span
+                      >
+                    </td>
                     <td>{{ a.period || '—' }}</td>
                     <td>{{ humanTime(a.time) }}</td>
                     <td><router-link class="link" :to="`/alerts/${a.id}`">查看明细 →</router-link></td>

@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
@@ -7,12 +8,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
+from backend import audit, lockout, passwords
+from backend.config import get_settings
 from backend.db import get_db
 from backend.models import User
-from backend.scope import departments_of
-from backend.config import get_settings
 from backend.ratelimit import get_login_limiter
-from backend import audit, lockout, passwords
+from backend.scope import departments_of
 
 SECRET_KEY = get_settings().auth_secret_key
 ALGORITHM = "HS256"
@@ -41,7 +43,7 @@ def token_for(user: User) -> str:
     「令牌里的版本 ≠ 账号当前的版本」来判断（见 `current_user()`）。退出登录与管理员强制下线
     都只是把 `users.token_version` 加一。
     """
-    expires = datetime.now(timezone.utc) + timedelta(minutes=get_settings().access_token_expire_minutes)
+    expires = datetime.now(UTC) + timedelta(minutes=get_settings().access_token_expire_minutes)
     return jwt.encode({"sub": str(user.id), "username": user.username, "ver": token_version_of(user),
                        "exp": expires}, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -86,7 +88,7 @@ def register(payload: Credentials, request: Request, db: Session = Depends(get_d
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(409, "用户名已存在")
+        raise HTTPException(409, "用户名已存在") from None
     db.refresh(user)
     # 只记用户名，不记密码（audit._scrub 还会再兜一层）
     audit.record(db, user, "user.register", target_type="user", target_id=user.id,

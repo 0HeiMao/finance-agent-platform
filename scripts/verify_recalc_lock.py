@@ -70,8 +70,8 @@ def upload(path: str, filename: str, content: bytes, token: str):
     """带鉴权的 multipart 上传（导入接口要的是 form-data 里的 `file`）。"""
     boundary = "----verifyrecalclock"
     head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-            f"filename=\"{filename}\"\r\nContent-Type: text/csv\r\n\r\n").encode("utf-8")
-    body = head + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            f"filename=\"{filename}\"\r\nContent-Type: text/csv\r\n\r\n").encode()
+    body = head + content + f"\r\n--{boundary}--\r\n".encode()
     request = urllib.request.Request(f"{BASE}{path}", data=body, method="POST")
     request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     request.add_header("Authorization", f"Bearer {token}")
@@ -302,7 +302,7 @@ def main() -> int:
     check("请求结束后没有残留的 advisory 锁", advisory_locks() == 0, f"残留 {advisory_locks()} 条")
 
     # ---------------------------------------------------------- 导入路径也抢期间锁
-    csv = ("\n".join([CSV_HEADER, f"2097-12-09,6001,导入锁测试,部门-097,期间锁冒烟,400,0,0,0,0"]) + "\n"
+    csv = ("\n".join([CSV_HEADER, "2097-12-09,6001,导入锁测试,部门-097,期间锁冒烟,400,0,0,0,0"]) + "\n"
            ).encode("utf-8-sig")
     thread = hold_in_thread([PERIOD], HOLD_SHORT)
     started = time.monotonic()

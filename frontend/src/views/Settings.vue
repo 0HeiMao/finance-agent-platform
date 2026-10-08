@@ -36,7 +36,7 @@ async function saveDepartment() {
   try {
     const r = await apiFetch('/auth/me', {
       method: 'PATCH',
-      body: JSON.stringify({ departments: parseDepartments(department.value) }),
+      body: JSON.stringify({ departments: parseDepartments(department.value) })
     })
     const me = await r.json()
     status.value.me = me
@@ -68,11 +68,13 @@ async function logout() {
   try {
     const r = await apiFetch('/auth/logout', { method: 'POST' })
     const payload = await r.json()
-    loggedOut.value = `已退出登录：本账号所有已签发的令牌都已作废（会话版本 ${payload.token_version}），`
-      + '在别的设备/浏览器上打开的那一份也会立刻失效。'
+    loggedOut.value =
+      `已退出登录：本账号所有已签发的令牌都已作废（会话版本 ${payload.token_version}），` +
+      '在别的设备/浏览器上打开的那一份也会立刻失效。'
   } catch (e) {
-    loggedOut.value = `本机已退出，但服务端没有确认作废（${e.message}）：如果这是网络问题，`
-      + '请回到有网的环境再点一次；否则请让管理员在「用户管理」里强制下线。'
+    loggedOut.value =
+      `本机已退出，但服务端没有确认作废（${e.message}）：如果这是网络问题，` +
+      '请回到有网的环境再点一次；否则请让管理员在「用户管理」里强制下线。'
   } finally {
     localStorage.removeItem('access_token')
     loggingOut.value = false
@@ -100,7 +102,9 @@ onMounted(load)
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">{{ loading ? '读取中…' : '↻ 重新读取' }}</button>
+          <button class="btn" :disabled="loading" @click="load">
+            {{ loading ? '读取中…' : '↻ 重新读取' }}
+          </button>
         </div>
       </header>
 
@@ -113,13 +117,13 @@ onMounted(load)
       </section>
 
       <template v-else-if="status">
-        <section v-if="error" class="state-box error-state"><strong>操作未完成</strong><p>{{ error }}</p></section>
+        <section v-if="error" class="state-box error-state">
+          <strong>操作未完成</strong>
+          <p>{{ error }}</p>
+        </section>
         <section v-if="saved" class="state-box notice">{{ saved }}</section>
 
-        <section
-          v-if="status.config_problems.length"
-          class="state-box notice"
-        >
+        <section v-if="status.config_problems.length" class="state-box notice">
           <strong>配置体检发现 {{ status.config_problems.length }} 个问题</strong>
           <ul>
             <li v-for="(problem, index) in status.config_problems" :key="index">{{ problem }}</li>
@@ -134,17 +138,25 @@ onMounted(load)
           <div class="card-head"><h2>我的部门</h2></div>
           <p class="muted">
             留空表示不受限制（财务管理员）；填写后<strong>财务数据与知识库都只按本部门收窄</strong>：
-            看板/分析/报告/Agent 只统计本部门明细（读该部门的指标与预警口径行），知识库检索只返回
-            「本部门 + 未标注部门」的片段，管理接口一律 403。
+            看板/分析/报告/Agent 只统计本部门明细（读该部门的指标与预警口径行），知识库检索只返回 「本部门 +
+            未标注部门」的片段，管理接口一律 403。
             一个账号可以填多个部门（用「、」分隔），看到的是这些部门的<strong>并集</strong>（金额相加、比率按合计重算）。
             部门由服务端记录，不接受请求头自述，避免伪造提权。
           </p>
           <div class="upload-box">
-            <input v-model.trim="department" class="select" maxlength="500" placeholder="例如：018、097（多个用「、」分隔；留空=不受限）">
-            <button class="btn primary" :disabled="saving" @click="saveDepartment">{{ saving ? '保存中…' : '保存' }}</button>
+            <input
+              v-model.trim="department"
+              class="select"
+              maxlength="500"
+              placeholder="例如：018、097（多个用「、」分隔；留空=不受限）"
+            />
+            <button class="btn primary" :disabled="saving" @click="saveDepartment">
+              {{ saving ? '保存中…' : '保存' }}
+            </button>
           </div>
           <p class="muted">
-            当前：<strong>{{ status.me.username }}</strong>（id {{ status.me.id }}）·
+            当前：<strong>{{ status.me.username }}</strong
+            >（id {{ status.me.id }}）·
             {{ status.me.unrestricted ? '不受部门限制' : `限定 ${departmentsText(status.me.departments)}` }}
           </p>
         </section>
@@ -166,7 +178,9 @@ onMounted(load)
             <div>
               <span>本机会话</span>
               <strong>{{ loggedOut ? '已退出' : '有效' }}</strong>
-              <small>{{ loggedOut ? '本机令牌已清除' : '令牌存在浏览器 localStorage（access_token）' }}</small>
+              <small>{{
+                loggedOut ? '本机令牌已清除' : '令牌存在浏览器 localStorage（access_token）'
+              }}</small>
             </div>
           </div>
           <div class="upload-box">
@@ -181,12 +195,24 @@ onMounted(load)
         <section class="page-card">
           <div class="card-head"><h2>运行态</h2></div>
           <div class="settings-grid">
-            <div><span>应用环境</span><strong>{{ status.app.env }}</strong></div>
-            <div><span>严格配置</span><strong>{{ status.app.strict_config ? '开启' : '关闭' }}</strong></div>
-            <div><span>API 前缀</span><strong>{{ status.app.api_prefix }}</strong></div>
-            <div><span>令牌有效期</span><strong>{{ status.app.token_expire_minutes }} 分钟</strong></div>
-            <div><span>允许来源</span><strong>{{ status.app.cors_origins.join('、') || '（空）' }}</strong></div>
-            <div><span>日志级别</span><strong>{{ status.app.log_level }}</strong></div>
+            <div>
+              <span>应用环境</span><strong>{{ status.app.env }}</strong>
+            </div>
+            <div>
+              <span>严格配置</span><strong>{{ status.app.strict_config ? '开启' : '关闭' }}</strong>
+            </div>
+            <div>
+              <span>API 前缀</span><strong>{{ status.app.api_prefix }}</strong>
+            </div>
+            <div>
+              <span>令牌有效期</span><strong>{{ status.app.token_expire_minutes }} 分钟</strong>
+            </div>
+            <div>
+              <span>允许来源</span><strong>{{ status.app.cors_origins.join('、') || '（空）' }}</strong>
+            </div>
+            <div>
+              <span>日志级别</span><strong>{{ status.app.log_level }}</strong>
+            </div>
           </div>
         </section>
 
@@ -195,7 +221,9 @@ onMounted(load)
           <div class="settings-grid">
             <div>
               <span>数据库</span>
-              <strong>{{ status.database.ok ? `连通（PostgreSQL ${status.database.version}）` : '连接失败' }}</strong>
+              <strong>{{
+                status.database.ok ? `连通（PostgreSQL ${status.database.version}）` : '连接失败'
+              }}</strong>
               <small>{{ status.database.url }}</small>
             </div>
             <div>
@@ -205,11 +233,16 @@ onMounted(load)
             <div>
               <span>Embedding 模型</span>
               <strong>{{ status.embedding.model }}</strong>
-              <small>{{ status.embedding.dimension }} 维 · {{ status.embedding.using_fallback ? '使用降级实现' : '本地模型' }}</small>
+              <small
+                >{{ status.embedding.dimension }} 维 ·
+                {{ status.embedding.using_fallback ? '使用降级实现' : '本地模型' }}</small
+              >
             </div>
             <div>
               <span>大模型</span>
-              <strong>{{ status.llm.provider_configured ? status.llm.model : '未配置（仅返回检索依据）' }}</strong>
+              <strong>{{
+                status.llm.provider_configured ? status.llm.model : '未配置（仅返回检索依据）'
+              }}</strong>
               <small>{{ status.llm.base_url || '—' }}</small>
             </div>
             <div>

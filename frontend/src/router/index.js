@@ -20,31 +20,39 @@ import AdminBatches from '../views/AdminBatches.vue'
 import AdminKnowledge from '../views/AdminKnowledge.vue'
 import { loadCurrentUser } from '../api/session'
 
-const router = createRouter({ history: createWebHistory(), routes: [
-  { path: '/', redirect: '/dashboard' },
-  { path: '/login', component: Login, meta: { guestOnly: true } },
-  { path: '/register', component: Register, meta: { guestOnly: true } },
-  { path: '/dashboard', component: Dashboard, meta: { requiresAuth: true } },
-  { path: '/agent', component: AgentWorkbench, meta: { requiresAuth: true } },
-  { path: '/financial/import', component: FinancialImport, meta: { requiresAuth: true } },
-  { path: '/financial/transactions', component: FinancialTransactions, meta: { requiresAuth: true } },
-  { path: '/analysis/alerts', component: AlertsList, meta: { requiresAuth: true } },
-  // /analysis/:type 必须放在具体的 /analysis/alerts 之后，否则 "alerts" 会被当成 type 捕获
-  { path: '/analysis/:type(revenue|cost|profit|summary)', component: FinancialAnalysis, props: true, meta: { requiresAuth: true } },
-  { path: '/alerts/:id', component: AlertDetail, meta: { requiresAuth: true } },
-  { path: '/reports', component: Reports, meta: { requiresAuth: true } },
-  { path: '/reports/pptx', component: ReportsPptx, meta: { requiresAuth: true } },
-  { path: '/settings', component: Settings, meta: { requiresAuth: true } },
-  // 管理入口：meta.admin 由守卫校验（部门为空 = 不受限 = 财务管理员）
-  { path: '/admin', component: AdminOverview, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/users', component: AdminUsers, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/departments', component: AdminDepartments, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/alert-rules', component: AdminAlertRules, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/audit', component: AdminAudit, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/batches', component: AdminBatches, meta: { requiresAuth: true, admin: true } },
-  { path: '/admin/knowledge', component: AdminKnowledge, meta: { requiresAuth: true, admin: true } },
-  { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
-] })
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/', redirect: '/dashboard' },
+    { path: '/login', component: Login, meta: { guestOnly: true } },
+    { path: '/register', component: Register, meta: { guestOnly: true } },
+    { path: '/dashboard', component: Dashboard, meta: { requiresAuth: true } },
+    { path: '/agent', component: AgentWorkbench, meta: { requiresAuth: true } },
+    { path: '/financial/import', component: FinancialImport, meta: { requiresAuth: true } },
+    { path: '/financial/transactions', component: FinancialTransactions, meta: { requiresAuth: true } },
+    { path: '/analysis/alerts', component: AlertsList, meta: { requiresAuth: true } },
+    // /analysis/:type 必须放在具体的 /analysis/alerts 之后，否则 "alerts" 会被当成 type 捕获
+    {
+      path: '/analysis/:type(revenue|cost|profit|summary)',
+      component: FinancialAnalysis,
+      props: true,
+      meta: { requiresAuth: true }
+    },
+    { path: '/alerts/:id', component: AlertDetail, meta: { requiresAuth: true } },
+    { path: '/reports', component: Reports, meta: { requiresAuth: true } },
+    { path: '/reports/pptx', component: ReportsPptx, meta: { requiresAuth: true } },
+    { path: '/settings', component: Settings, meta: { requiresAuth: true } },
+    // 管理入口：meta.admin 由守卫校验（部门为空 = 不受限 = 财务管理员）
+    { path: '/admin', component: AdminOverview, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/users', component: AdminUsers, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/departments', component: AdminDepartments, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/alert-rules', component: AdminAlertRules, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/audit', component: AdminAudit, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/batches', component: AdminBatches, meta: { requiresAuth: true, admin: true } },
+    { path: '/admin/knowledge', component: AdminKnowledge, meta: { requiresAuth: true, admin: true } },
+    { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
+  ]
+})
 router.beforeEach(async (to) => {
   const loggedIn = Boolean(localStorage.getItem('access_token'))
   if (to.meta.requiresAuth && !loggedIn) return { path: '/login', query: { redirect: to.fullPath } }
@@ -56,4 +64,3 @@ router.beforeEach(async (to) => {
   }
 })
 export default router
-

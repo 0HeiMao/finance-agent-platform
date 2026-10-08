@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import httpx  # noqa: E402
 from sqlalchemy import func, select  # noqa: E402
+
 from backend.db import SessionLocal  # noqa: E402
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction  # noqa: E402
 
@@ -272,9 +273,9 @@ async def demo(csv_path: Path, keep: bool) -> int:
     print("=" * 72)
     print(f"  登录账号 : {DEMO_USER}")
     print(f"  登录密码 : {DEMO_PASSWORD}")
-    print(f"  登录地址 : http://localhost:5173/login")
-    print(f"  可看页面 : /dashboard（看板）、/analysis/profit（利润分析）、"
-          f"/analysis/cost（成本费用）、/financial/import（导入）、预警明细")
+    print("  登录地址 : http://localhost:5173/login")
+    print("  可看页面 : /dashboard（看板）、/analysis/profit（利润分析）、"
+          "/analysis/cost（成本费用）、/financial/import（导入）、预警明细")
     if not keep:
         print()
         print("  如需清空本次演示数据，在 psql 里执行：")

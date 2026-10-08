@@ -14,6 +14,7 @@ import io
 import re
 from datetime import datetime
 from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import extract, func, select
@@ -25,8 +26,18 @@ from backend.db import get_db
 from backend.files import content_disposition
 from backend.limits import export_quota
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (Scope, resolve_requested_scope, row_label, scope_alert, scope_metric,
-                           scope_of, scope_payload, scope_slug, scope_text, scope_transactions)
+from backend.scope import (
+    Scope,
+    resolve_requested_scope,
+    row_label,
+    scope_alert,
+    scope_metric,
+    scope_of,
+    scope_payload,
+    scope_slug,
+    scope_text,
+    scope_transactions,
+)
 
 router = APIRouter(prefix="/api/v1/export", tags=["export"])
 

@@ -1,9 +1,12 @@
 from datetime import datetime
 from decimal import Decimal
+
 from sqlalchemy import DateTime, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+
 from backend.db import Base
+
 
 class User(Base):
     __tablename__ = "users"

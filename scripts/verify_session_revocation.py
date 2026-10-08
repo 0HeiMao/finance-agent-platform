@@ -23,7 +23,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -97,7 +97,7 @@ def claims(token: str) -> dict:
 
 def legacy_token(user_id: int, username: str) -> str:
     """老令牌：声明里只有 sub/username/exp —— 没有 `ver`（本功能上线前签发的就是长这样）。"""
-    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    expires = datetime.now(UTC) + timedelta(minutes=30)
     return jose_jwt.encode({"sub": str(user_id), "username": username, "exp": expires},
                            SECRET_KEY, algorithm=ALGORITHM)
 
@@ -238,7 +238,7 @@ def main() -> int:
           status == 403 and "管理员" in str(payload.get("detail")), f"status={status} {payload}")
 
     # ---------------------------------------------------------- 收尾：清干净
-    for user_id, name in ((id_a, name_a), (id_b, name_b)):
+    for user_id, _name in ((id_a, name_a), (id_b, name_b)):
         call("DELETE", f"/admin/users/{user_id}", admin_token)
     left = rows("SELECT id, username FROM users WHERE username LIKE :p", p=f"{PREFIX}%")
     demo_now = scalar("SELECT token_version FROM users WHERE username = :u", u=ADMIN[0])

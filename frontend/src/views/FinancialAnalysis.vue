@@ -26,7 +26,7 @@ const cards = computed(() => {
     { label: '收入', value: money(d.revenue_amount), unit: '元' },
     { label: '成本', value: money(d.cost_amount), unit: '元' },
     { label: '净利润', value: money(d.net_profit_amount), unit: '元' },
-    { label: '净利率', value: `${(Number(d.net_profit_ratio || 0) * 100).toFixed(2)}`, unit: '%' },
+    { label: '净利率', value: `${(Number(d.net_profit_ratio || 0) * 100).toFixed(2)}`, unit: '%' }
   ]
 })
 
@@ -81,7 +81,7 @@ watch(activeScope, load)
         </div>
         <div class="actions">
           <ScopeSwitcher />
-          <input v-model="period" type="month" class="select" @change="load">
+          <input v-model="period" type="month" class="select" @change="load" />
           <ExportMenu kind="transactions" :period="period" />
           <button class="btn" :disabled="loading" @click="load">{{ loading ? '加载中…' : '↻ 刷新' }}</button>
           <button class="btn" @click="router.push('/dashboard')">返回看板</button>
@@ -111,7 +111,9 @@ watch(activeScope, load)
             <strong>{{ card.value }} {{ card.unit }}</strong>
           </div>
         </div>
-        <p v-if="data && data.has_data" class="chart-note">口径：收入/成本/费用均为程序确定性汇总，净利率 = 净利润 ÷ 收入，保留四位小数。</p>
+        <p v-if="data && data.has_data" class="chart-note">
+          口径：收入/成本/费用均为程序确定性汇总，净利率 = 净利润 ÷ 收入，保留四位小数。
+        </p>
       </section>
     </main>
   </div>
