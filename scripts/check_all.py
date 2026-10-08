@@ -1,7 +1,8 @@
 """一键自检：源文件编码/语法体检 + 后端单元测试 + 前端单元测试（可选：真机页面扫描）。
 
-为什么是这个形态：这个目录**不是 git 仓库**（没有 .git，也就没有 .github 可以挂 Actions），
-所以「CI」落到一个谁都能在本机跑的入口上；它同时兜住一类真实事故 —— 用 PowerShell 的
+为什么是这个形态：这个仓库**没有 CI 服务**（没有 .github，也没接别的流水线），所以「CI」落到一个
+谁都能在本机跑的入口上，并且由 `.githooks/pre-commit` 在每次提交前跑 `--quick`（见
+`scripts/init_git.py`）；它同时兜住一类真实事故 —— 用 PowerShell 的
 `Get-Content` / `Set-Content -Encoding utf8` 往返 UTF-8 源文件，会按系统 ANSI 代码页
 （本机 cp936）重写内容，结果文件开头多出 BOM、正文变成 mojibake（`涓嶄緷璧栨暟鎹簱` 这种），
 python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第一步永远是编码体检。

@@ -13,10 +13,12 @@
 │   ├── raw/              # 原始销售、费用、银行流水等 CSV/Excel，只读保存
 │   ├── uploads/          # 知识库上传件的落盘目录（财务导入的临时件处理完即删，不入版本库）
 │   └── processed/        # 清洗、标准化后的数据，供分析脚本使用
-├── scripts/              # 数据处理、分析、RAG 和报告生成脚本
+├── scripts/              # 数据处理、分析、RAG 和报告生成脚本（含 check_all.py 一键自检）
 ├── output/
-│   ├── reports/          # HTML/PDF 等分析报告
-│   └── charts/           # PNG/SVG/交互式图表资源
+│   ├── reports/          # 导出的报告（docx/pptx/md），随时可重新生成，不提交
+│   └── charts/           # check_pages.py 的验收截图，每次覆盖，不提交
+├── .githooks/            # 版本化的提交前钩子（跑 check_all.py --quick）
+├── .gitattributes        # 一律 LF：CRLF 会让 shell 钩子的 shebang 变成 `/bin/sh\r`
 ├── .venv/                # 本地 Python 虚拟环境（不提交到版本库）
 └── README.md
 ```
@@ -99,8 +101,7 @@
 
 ### 一键自检
 
-这个目录**不是 git 仓库**（没有 `.git`，也就没有 `.github` 可以挂 Actions），所以「CI」落成一个
-谁都能在本机跑的入口：
+本目录是 git 仓库（`main` 分支），但**没有 CI 服务**可挂，所以「CI」落成一个谁都能在本机跑的入口：
 
 ```powershell
 # 编码/语法体检 + 后端 pytest + 前端 node --test
@@ -118,6 +119,29 @@
 PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨兵。
 
 `npm run build` 在本机沙箱会失败（见下），所以自检不含构建步骤，界面验收走 `--with-pages`。
+
+### 版本库与提交前钩子
+
+仓库是用 `scripts/init_git.py` 初始化的（可重复执行）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\init_git.py   # git init -b main + 设 core.hooksPath + 体检打印
+```
+
+它一次性把四件事定下来，都是有原因的：
+
+- **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
+  放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
+- **钩子默认只跑 `--quick`**（编码 + 语法，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
+  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 115 个用例与前端 15 个用例一起跑。
+  钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
+- **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
+  而钩子是 shell 脚本，行尾多一个 CR 会让 shebang 变成 `/bin/sh\r`，钩子直接报 bad interpreter。
+- **`.env` 必须被忽略**：`init_git.py` 会用 `git check-ignore -q .env` 确认，没被忽略就报错退出；
+  密钥文件进库比任何 bug 都严重。
+
+`.gitignore` 里另有一批「测试残渣」条目（`pip-*`、`pytest-of-*`、`torchinductor_*`、`node_modules/`、
+`frontend/dist/`、`output/_*`）：pytest 与 pip 会在仓库根目录随手建目录，不挡住就会混进 `git status`。
 
 `verify_crawled_import.py` 有两个使用前提：
 
