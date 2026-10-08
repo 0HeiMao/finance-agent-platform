@@ -10,9 +10,10 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, Response
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend import periods as period_mod
 from backend.auth import current_user
 from backend.db import get_db
 from backend.files import content_disposition
@@ -80,11 +81,13 @@ def _collect(db: Session, period: str, scope: Scope = None,
         .order_by(FinancialAlert.id)).all()
     top_departments: list[tuple[str, Decimal]] = []
     if metric:
-        # 必须按 to_char 归组：transaction_date 是 timestamp，直接和 "2026-10-01" 字符串比较会
-        # 报 `operator does not exist: timestamp without time zone >= character varying`。
+        # 期间用前闭后开区间（`period_mod.period_range`）而不是 `to_char(...) = period`：函数套在列上
+        # 就用不到 `(department, transaction_date)` 索引，而且每一行都要算一次 to_char。
+        # 注意传的必须是 date 对象，字符串会报
+        # `operator does not exist: timestamp without time zone >= character varying`。
         statement = scope_transactions(
             select(FinancialTransaction.department, FinancialTransaction.expense_amount)
-            .where(func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period), scope)
+            .where(period_mod.period_range(FinancialTransaction.transaction_date, period)), scope)
         rows = db.execute(statement).all()
         grouped: dict[str, Decimal] = {}
         for row_department, expense in rows:

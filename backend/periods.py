@@ -16,6 +16,9 @@
 from __future__ import annotations
 
 import re
+from datetime import date
+
+from sqlalchemy import and_, false
 
 MONTH = "month"
 QUARTER = "quarter"
@@ -90,6 +93,49 @@ def months_count(period: str) -> int:
 def containing_periods(month: str) -> tuple[str, str]:
     """一个月落在哪个季度、哪个年度（落库时用来决定要刷新哪两条汇总）。"""
     return quarter_of(month), year_of(month)
+
+
+def month_bounds(month: str) -> tuple[date, date] | None:
+    """月的前闭后开区间 `[本月首日, 次月首日)`；认不出来返回 None。"""
+    if not is_month(month):
+        return None
+    year, month_number = (int(part) for part in month.split("-"))
+    start = date(year, month_number, 1)
+    end = date(year + 1, 1, 1) if month_number == 12 else date(year, month_number + 1, 1)
+    return start, end
+
+
+def period_bounds(period: str) -> tuple[date, date] | None:
+    """期间的前闭后开区间：月/季/年都走 `months_of()`，季与年就是首月首日到末月的次月首日。"""
+    months = months_of(period)
+    if not months:
+        return None
+    first = month_bounds(months[0])
+    last = month_bounds(months[-1])
+    if first is None or last is None:
+        return None
+    return first[0], last[1]
+
+
+def period_range(column, period: str):
+    """「期间」条件写成能走索引的前闭后开区间比较。
+
+    以前到处是 `to_char(transaction_date, 'YYYY-MM') = '2026-10'`：**函数套在列上**，
+    btree 索引对它没用——`(department, transaction_date)` 复合索引的第二列等于白搭，
+    而且每一行都要算一次 `to_char` 才能比较。区间比较是 sargable 的（列单独在一边），
+    语义完全一样：`transaction_date` 存的是当天零点，月末最后一条也在 `[本月首日, 次月首日)` 内。
+
+    好处不只是快：`2026-10-31 23:59:59` 这种带时间的行，旧的字符串相等比较会漏掉（不入任何月份），
+    区间比较把它算进 10 月——这才是「按期间筛选」该有的行为。
+
+    期间串认不出来时返回恒假条件，与旧的相等比较行为一致（一行都不匹配），
+    这样调用方不用为「非法期间」单独写分支（接口层本来就会先做格式校验）。
+    """
+    bounds = period_bounds(period)
+    if bounds is None:
+        return false()
+    start, end = bounds
+    return and_(column >= start, column < end)
 
 
 def period_label(period: str) -> str:

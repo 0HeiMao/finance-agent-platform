@@ -413,6 +413,43 @@ def test_sort_key_keeps_same_grain_in_time_order():
     assert periods.sort_key("坏数据") < periods.sort_key("2026-01")
 
 
+def test_period_bounds_are_half_open_and_cross_year():
+    """期间区间必须是 `[首日, 次期首日)`：12 月要跨到下一年 1 月，季/年取首月与末月。"""
+    from datetime import date
+
+    from backend import periods
+
+    assert periods.month_bounds("2026-10") == (date(2026, 10, 1), date(2026, 11, 1))
+    assert periods.month_bounds("2026-12") == (date(2026, 12, 1), date(2027, 1, 1))
+    assert periods.period_bounds("2026-10") == (date(2026, 10, 1), date(2026, 11, 1))
+    assert periods.period_bounds("2026-Q4") == (date(2026, 10, 1), date(2027, 1, 1))
+    assert periods.period_bounds("2026") == (date(2026, 1, 1), date(2027, 1, 1))
+    assert periods.month_bounds("2026-13") is None
+    assert periods.period_bounds("随便写的") is None
+
+
+def test_period_range_is_sargable_and_never_uses_to_char():
+    """期间条件不许写成 `to_char(transaction_date,'YYYY-MM') = ...`。
+
+    函数套在列上，`(department, transaction_date)` 索引的第二列就用不上，而且每行都要算一次
+    `to_char`；这里直接看编译出来的 SQL 形状，谁改回去谁炸。顺带确认区间是前闭后开
+    （月末最后一天的零点在区间内），以及认不出来的期间退化成「一行都不匹配」而不是报错。
+    """
+    from backend import periods
+    from backend.models import FinancialTransaction
+
+    column = FinancialTransaction.transaction_date
+    sql = str(periods.period_range(column, "2026-10"))
+    assert "to_char" not in sql.lower()
+    assert "transaction_date >= " in sql and "transaction_date < " in sql
+
+    bounds = periods.period_range(column, "2026-Q4").compile().params
+    assert sorted(str(value) for value in bounds.values()) == ["2026-10-01", "2027-01-01"]
+
+    # 「一行都不匹配」：与旧的 to_char 相等比较在非法期间上的行为一致，调用方不用写额外分支
+    assert str(periods.period_range(column, "2026-13")).lower() == "false"
+
+
 def test_combine_sums_amounts_and_recomputes_ratios():
     """季度/年度合计：金额相加、比率用相加后的金额重算。
 

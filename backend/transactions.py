@@ -24,7 +24,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
-from backend import audit, rollups
+from backend import audit, periods as period_mod, rollups
 from backend.api_analysis import calculate
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 from backend.scope import Scope, scope_transactions
@@ -180,7 +180,9 @@ def recalculate_periods(db: Session, periods: set[str] | list[str]) -> dict:
     for period in sorted(set(periods)):
         remaining = db.scalar(
             select(func.count()).select_from(FinancialTransaction).where(
-                func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period)
+                # 用区间而不是 to_char(...)=period：见 period_mod.period_range 的说明
+                # （这个函数名与入参同名，所以这里显式走模块名，避免遮蔽自己）。
+                period_mod.period_range(FinancialTransaction.transaction_date, period))
         ) or 0
         if remaining:
             calculate(db, period, commit=False)
@@ -229,7 +231,7 @@ def list_rows(db: Session, scope: Scope, *, period: str | None = None, departmen
     statement = scope_transactions(select(FinancialTransaction), scope)
     if period:
         statement = statement.where(
-            func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period)
+            period_mod.period_range(FinancialTransaction.transaction_date, period))
     if department:
         statement = statement.where(FinancialTransaction.department == department)
     if batch:

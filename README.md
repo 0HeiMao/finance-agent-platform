@@ -85,7 +85,7 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下八个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下九个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -97,6 +97,7 @@
 | `verify_rollups.py` | 季度/年度落库 24 项：重算季/年落库、季度 `source=stored` 且等于三个月月指标之和、比率按合计重算、年度缺月如实点名、受限账号只读本部门落库行、管理端 403、三种 422、重算某月后季度幂等、没落库的期间现算兜底且不写库、审计留痕 |
 | `verify_transactions.py` | 明细更正/冲销 45 项：按期间/部门口径/关键字/批次筛选与分页、受限账号 403（别的部门与全公司行都不许动）、更正后重算并让指标跟着变、改日期同时重算新旧期间、冲销新增负数行且原行保留（同期间合计为 0）、重复冲销与更正已冲销行 409、非法金额/带时区日期/未知字段 422、审计留 `transaction.update`/`transaction.reverse`，跑完撤销整批探针数据并删临时账号 |
 | `verify_slow_paths.py` | 慢接口告警 16 项：默认阈值 1000ms 且按路径可覆盖、启动日志写明阈值、真发一次 `POST /ai/rag/chat`（检索 + 大模型，实测 16 秒）后 `slow_paths` 里出现该路径且超阈值次数 +1、`worst_ms`/`last_ms`/`last_at` 如实、**后端日志里真有一条 `WARNING 慢接口告警 path=… duration_ms=… threshold_ms=…`**、紧接着再发一次只记账不重复刷日志（`suppressed` = 1）、快请求 `/health` 不被记账、`/admin/overview` 给管理页的同一份观测里也有这条 |
+| `verify_indexes.py` | 明细读路径索引 23 项：`missing_indexes()` 在真库上为空、三条索引的 `indexdef` 与列顺序（`(department, transaction_date)`，顺序反了第二列就用不上）、按期间拉明细结果与旧口径一致（93 行）、管理概览不断、`EXPLAIN (ANALYZE)` 里「部门 + 期间」真的走 `ix_financial_transactions_department_date`、冲销来源/预警状态各走自己的索引、**旧的 `to_char(...)` 形状用不上复合索引**（`Filter` 里逐行算）、80 万行同构临时表上 `Seq Scan` 36.70 ms → 建完复合索引 0.02 ms（1931×）、同结果集的一对写法（1314 行）区间比较 5.1× 且 `Index Cond` 里带日期、跑完 `DROP TABLE` |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -191,21 +192,36 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 
 ### 数据库迁移（不引入 Alembic）
 
-结构变更分三类，各有各的落点，**都不需要 `alembic upgrade head`**：
+结构变更分四类，各有各的落点，**都不需要 `alembic upgrade head`**：
 
 | 变更 | 落点 | 何时生效 |
 | --- | --- | --- |
 | 加表 | `backend/models.py` 里的模型 | 应用启动时 `create_all()` 建缺失的表 |
 | 加列 | `backend/migrations.py` 的 `COLUMNS` 加一行 `(表, 列, DDL)` | 启动时按 `information_schema` 查缺再 `ALTER TABLE`，幂等 |
-| 改列类型 / 加索引 / 装 `vector` 扩展 | `scripts/init_pgvector_db.py` 的 `COLUMN_TYPE_MIGRATIONS` | 手工跑一次该脚本 |
+| 加索引 | 模型里声明（`index=True` 或 `__table_args__` 的 `Index(...)`）**并且**在 `backend/migrations.py` 的 `INDEXES` 加一行 `(表, 索引名, 列清单, 为什么)` | 启动时按 `pg_indexes` 查缺再 `CREATE INDEX IF NOT EXISTS`，幂等；`create_all()` 只在建表时建索引，**老库的表不会被补** |
+| 改列类型 / 装 `vector` 扩展 | `scripts/init_pgvector_db.py` 的 `COLUMN_TYPE_MIGRATIONS` | 手工跑一次该脚本 |
 
 为什么不上 Alembic：这个项目的部署形态是「一个进程 + 一个库」，`ensure_schema()` 在启动时自动补齐；
-多一套「发版前记得跑 `alembic upgrade head`」的运维动作，反而多一个会忘的环节。代价是**加列清单必须手工维护**，
+多一套「发版前记得跑 `alembic upgrade head`」的运维动作，反而多一个会忘的环节。代价是**加列与加索引的清单必须手工维护**，
 而忘了写 `COLUMNS` 的表现是接口 500（`UndefinedColumn: column financial_alerts.review_status does not exist`），
-很容易被当成业务代码写错——项目为此留了两道闸门：
+忘了写 `INDEXES` 则一声不响——查询仍然对，只是退化成顺序扫；项目为此留了三道闸门：
 
 - `missing_columns()` 在启动时对照模型与真库，把缺失的列写进 `ERROR` 日志（不拦启动）；
-- 单元测试 `test_schema_matches_models` 断言 `missing_columns() == []`，漏一行就让回归红。
+- `missing_indexes()` 同样在启动时点名缺的索引（`ERROR 数据库索引与模型不一致，缺失：…`）；
+- 单元测试 `test_schema_matches_models` 断言 `missing_columns() == []` **与 `missing_indexes() == []`**，漏一行就让回归红。
+
+索引这件事在真库上真抓到过：`financial_transactions` 与 `financial_alerts` 都是「先有表、后给模型加了
+`index=True` 的列」，于是补索引之前按状态筛预警、按冲销来源回查原行一直是顺序扫。写进 `INDEXES` 后
+`ensure_schema()` 一次补齐三条（`ix_financial_transactions_department_date`、
+`ix_financial_transactions_reversal_of_id`、`ix_financial_alerts_review_status`）。
+
+> 计划形状的实测证据在 `scripts/verify_indexes.py` 里（23 项，见下表）：80 万行同构临时表上，
+> 无索引 `Seq Scan` 36.70 ms → 建完 `(department, transaction_date)` 复合索引 0.02 ms（**1931×**）。
+>
+> 用 `period_range()` 的模块名会被同名局部变量遮住——`transactions.py` 里就有
+> `recalculate_periods(db, periods)` 这个入参。所以调用方统一 `from backend import periods as period_mod`，
+> 再 `period_mod.period_range(...)`（`rollups.py` 早就是这么写的）；写成 `periods.period_range(...)`
+> 不是语法错误，而是跑到那里才报 `'set' object has no attribute 'period_range'`。
 
 > `create_all()` 只建缺失的**表**，不会给已存在的表补**列**：这是上面这些坑的总根源。
 > 新加一列表看起来跑得通，是因为本地库往往是新库；老库升级时才会炸。
@@ -254,7 +270,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **145** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**）、
+`tests/` 下三个文件共 **149** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -274,7 +290,9 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 **后台任务**：提交后立刻 202 且明细还在（提交 ≠ 执行）、执行成功才删明细并重算、
 审计里带任务 id、不存在的批次 404 且不留任务记录、未注册的任务类型标记失败、
 重启收尸把 queued/running 标成失败、非管理员 403→**结构漂移**：模型里的列都在真库里
-（漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）→**按路径耗时**：`record_request` 后
+（漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）、模型里声明的索引也都在真库里且列顺序不变
+（漏写 `migrations.INDEXES` 时点名）、明细接口发出的 SQL 里期间过滤是区间比较而不是 `to_char`（抓真实
+执行的 SQL 断言）→**按路径耗时**：`record_request` 后
 `snapshot()["paths"]` 给出每条的 count/p95/max，且 500 与 200 分开计数→**出口配额**：
 导出打满返回 429 + `Retry-After`、三个导出接口共用一本账（换路径绕不过）、
 问答是另一本账（导出打满仍能问答）、`/rag/search`+`/rag/answer`+`/ai/*` 共用问答配额、

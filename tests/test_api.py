@@ -2454,11 +2454,80 @@ async def test_schema_matches_models(require_database):
     这是当初 `financial_alerts.review_status`（`UndefinedColumn`）和 `audit_logs`
     （`relation does not exist`）两次翻车的回归闸门：`create_all()` 只建缺失的**表**，
     不会给已存在的表补**列**，所以补列清单必须手工维护 —— 一旦漏了，本用例把列名点出来。
+    索引是同一个坑：`create_all()` 也只在**建表**时建索引，老库上新加的 `index=True` /
+    `Index(...)` 必须写进 `migrations.INDEXES`，否则一直在顺序扫而且不报错。
     """
-    from backend.migrations import ensure_schema, missing_columns
+    from backend.migrations import ensure_schema, missing_columns, missing_indexes
 
     ensure_schema()
     assert missing_columns() == []
+    assert missing_indexes() == []
+
+
+async def test_required_indexes_are_declared_and_present(require_database, db_session):
+    """索引要在三处对齐：模型的 `Index(...)`（新库）、`migrations.INDEXES`（老库）、真库的 `pg_indexes`。
+
+    真跑出来的教训：`ix_financial_alerts_review_status` 与 `ix_financial_transactions_reversal_of_id`
+    都是「先有表、后加 `index=True` 列」，`create_all()` 不会补 → 真库上一直没有这两条索引，
+    按状态筛预警、按冲销来源找原行都在顺序扫（演示库 8909 行时不明显，数据一多就是全表扫）。
+    这里同时卡住列顺序：`(department, transaction_date)` 反了规划器就用不上第二列。
+    """
+    from sqlalchemy import text
+
+    from backend.migrations import INDEXES, missing_indexes
+    from backend.models import FinancialAlert, FinancialTransaction
+
+    declared = {index.name: [column.name for column in index.columns]
+                for index in FinancialTransaction.__table__.indexes}
+    assert declared["ix_financial_transactions_department_date"] == ["department", "transaction_date"]
+
+    # 手工补索引清单必须包含这三条，且列清单与模型一致（不然老库补出来的索引和模型不是一回事）
+    listed = {name: columns for _table, name, columns, _why in INDEXES}
+    assert listed["ix_financial_transactions_department_date"] == "department, transaction_date"
+    assert "ix_financial_transactions_reversal_of_id" in listed
+    assert "ix_financial_alerts_review_status" in listed
+    assert FinancialAlert.__table__.indexes, "预警表也得有索引，否则这条清单没有意义"
+
+    definitions = dict(db_session.execute(text(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema()")).all())
+    transaction_definition = definitions.get("ix_financial_transactions_department_date", "")
+    assert "department" in transaction_definition and "transaction_date" in transaction_definition
+    assert transaction_definition.index("department") < transaction_definition.index("transaction_date")
+    assert "ix_financial_transactions_reversal_of_id" in definitions
+    assert "ix_financial_alerts_review_status" in definitions
+    assert missing_indexes() == []
+
+
+async def test_transaction_list_period_filter_stays_sargable(anon_client, auth_headers, db_session):
+    """明细列表的期间过滤必须发成区间比较，不许退回 `to_char(transaction_date) = '...'`。
+
+    抓接口**实际发出去的 SQL** 来卡形状（不是断言源码里有没有那个词）：函数套在列上，
+    `(department, transaction_date)` 的第二列就用不上，而且每行都要算一次 `to_char`。
+    最后的期间下拉（`periods_in`）仍然按 `to_char` 分组去重 —— 那是取候选值，不是按期间筛行。
+    """
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    _seed_row(db_session, day=6)
+    seen: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _many):
+        seen.append(" ".join(statement.split()))
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        response = await anon_client.get(f"/api/v1/financial/transactions?period={TX_PERIOD}",
+                                         headers=auth_headers)
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+
+    assert response.status_code == 200, response.text
+    listing_sql = [sql for sql in seen if "FROM financial_transactions" in sql
+                   and "ORDER BY financial_transactions.transaction_date DESC" in sql]
+    assert len(listing_sql) == 1, f"没抓到唯一的一条明细列表查询：{listing_sql}"
+    assert "to_char" not in listing_sql[0].lower(), listing_sql[0]
+    assert "financial_transactions.transaction_date >=" in listing_sql[0], listing_sql[0]
+    assert "financial_transactions.transaction_date <" in listing_sql[0], listing_sql[0]
 
 
 # ---------------------------------------------------------------- 出口配额（导出 / 问答）

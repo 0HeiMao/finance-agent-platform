@@ -21,7 +21,7 @@ from backend.api_admin import router as admin_router
 from backend.api_export import router as export_router
 from backend.api_dashboard import router as dashboard_router
 from backend.db import engine
-from backend.migrations import ensure_schema, missing_columns
+from backend.migrations import ensure_schema, missing_columns, missing_indexes
 from sqlalchemy.orm import Session
 from backend import observability
 from backend.observability import record_request, snapshot
@@ -96,6 +96,11 @@ def _validate_config_on_startup() -> None:
         if gaps:
             logger.error("数据库结构与模型不一致，缺失：%s（检查 backend/migrations.py 的 COLUMNS）",
                          "、".join(gaps))
+        # 索引漏了不会报错、只会一直顺序扫，所以同样点名（对应 migrations.INDEXES）。
+        index_gaps = missing_indexes()
+        if index_gaps:
+            logger.error("数据库索引与模型不一致，缺失：%s（检查 backend/migrations.py 的 INDEXES）",
+                         "、".join(index_gaps))
     except Exception as exc:  # noqa: BLE001
         logger.error("schema 迁移失败（数据库可能不可用）：%s", exc)
 

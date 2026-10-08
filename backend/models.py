@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import DateTime, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.db import Base
@@ -43,6 +43,14 @@ class FinancialTransaction(Base):
     reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reversed_by: Mapped[str | None] = mapped_column(String(100))
     corrections: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 受限账号的**每条**查询都要按部门过滤，再按交易日期圈出期间（看板、汇总、指标重算、
+    # 导出都长这样），所以复合索引首列放 department、次列放 transaction_date：
+    # 单查部门能用（最左前缀），部门+期间范围也能用。只有 transaction_date 那一个单列索引时，
+    # 「本部门 2026 年 1~7 月」只能先按日期捞全公司再逐行丢——行数一多就是全表扫。
+    # 注意：`create_all()` 只在**建表**时建索引，老库要补索引得靠 migrations.INDEXES（见那里）。
+    __table_args__ = (
+        Index("ix_financial_transactions_department_date", "department", "transaction_date"),
+    )
 
 class FinancialMetric(Base):
     __tablename__ = "financial_metrics"

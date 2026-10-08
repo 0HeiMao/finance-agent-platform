@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from backend import periods as period_mod
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 from backend.scope import (Scope, metric_totals, scope_alert, scope_label, scope_metric,
                            scope_transactions)
@@ -53,7 +54,9 @@ def _aggregate(db: Session, period: str, column, scope: Scope = None) -> list[tu
     key = func.coalesce(column, "未标注")
     statement = (
         select(key, func.sum(FinancialTransaction.revenue_amount), func.sum(FinancialTransaction.expense_amount), func.count())
-        .where(func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period)
+        # 区间比较（见 period_mod.period_range）：能吃到 (department, transaction_date) 索引，
+        # 而且 23:59:59 这种带时间的行也会被算进本期，不再被 to_char 相等比较漏掉。
+        .where(period_mod.period_range(FinancialTransaction.transaction_date, period))
         .group_by(key)
         .order_by(func.sum(FinancialTransaction.expense_amount).desc())
         .limit(MAX_DETAIL_ROWS)

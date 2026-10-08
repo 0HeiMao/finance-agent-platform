@@ -7,10 +7,14 @@
 
 做法很土但有效：把「需要补的列」写在这里，逐条查 `information_schema` 再 `ALTER TABLE`，
 幂等、可重复调用。表本身的创建仍然交给 `create_all()`。
+索引是同一个坑的另一个面：`create_all()` 只在**建表**时建索引，所以「表已存在 + 模型新加索引」
+同样要手写进 `INDEXES`，否则老库一直在顺序扫描而且不报错。
+
 之所以不上 Alembic：这个项目的部署形态是「一个进程 + 一个库」，`ensure_schema()` 在启动时
 自动补齐，多一套 `alembic upgrade head` 的运维动作反而多一个忘跑的环节；代价是
 **任何加列都必须往 `COLUMNS` 里加一行**，否则老库升级会漏——忘了的表现是接口 500，
-所以 `missing_columns()` 会在启动时把漏掉的列直接点名（见 `backend/main.py` 的启动钩子）。
+所以 `missing_columns()` 会在启动时把漏掉的列直接点名（见 `backend/main.py` 的启动钩子）；
+索引漏了则交给 `missing_indexes()` 点名。
 """
 
 from __future__ import annotations
@@ -70,6 +74,21 @@ PLAIN_INDEXES: list[tuple[str, str, str, str]] = [
      "alert_type 要能一个类型多条（按部门/期间分档），索引保留做前缀查询即可，唯一性必须去掉"),
 ]
 
+# 需要**补上**的索引：(表名, 索引名, 列清单（DDL 片段）, 为什么要它)。
+# 为什么单独列一份：`create_all()` 只在**建表**那一刻顺带建模型的索引。表已经存在时，
+# 往 `models.py` 里新加一个 `Index(...)` 什么都不会发生——本地新库跑得好好的，老库照旧全表扫。
+# 这和「加列」是同一个坑，所以同样按名字查 `pg_indexes` 再 `CREATE INDEX IF NOT EXISTS`。
+# 加这三条不是推测：`missing_indexes()` 在真库上真报出了后两条（都是「先有表、后加 index=True 列」），
+# 也就是说在补上之前，按状态筛预警、按冲销来源找原行都在顺序扫。建索引会短暂锁表（数据量小，够用）。
+INDEXES: list[tuple[str, str, str, str]] = [
+    ("financial_transactions", "ix_financial_transactions_department_date", "department, transaction_date",
+     "受限账号的每条查询都按 department 过滤、再按交易日期圈期间，缺它就是顺序扫全表"),
+    ("financial_transactions", "ix_financial_transactions_reversal_of_id", "reversal_of_id",
+     "⑨ 加列时带的 index=True 没落到老库：冲销行找原行、明细列表标注「已冲销」都要走它"),
+    ("financial_alerts", "ix_financial_alerts_review_status", "review_status",
+     "⑥/⑨ 加列时带的 index=True 没落到老库：预警列表默认按 pending 过滤，缺索引只能顺序扫"),
+]
+
 
 def ensure_schema(engine: Engine | None = None) -> list[str]:
     """建缺失的表 + 补缺失的列 + 去掉过时的唯一约束/唯一索引，返回本次真正执行的 DDL 描述（空列表 = 结构已是最新）。"""
@@ -105,6 +124,15 @@ def ensure_schema(engine: Engine | None = None) -> list[str]:
             connection.execute(text(f"DROP INDEX {name}"))
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
             applied.append(f"{table}.{name}→非唯一")
+        for table, name, columns, _why in INDEXES:
+            exists = connection.scalar(
+                text("SELECT 1 FROM pg_indexes"
+                     " WHERE schemaname = current_schema() AND tablename = :table AND indexname = :name"),
+                {"table": table, "name": name})
+            if exists:
+                continue
+            connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"))
+            applied.append(f"{table}.{name}（索引）")
     return applied
 
 
@@ -125,4 +153,26 @@ def missing_columns(engine: Engine | None = None) -> list[str]:
             continue
         columns = {column["name"] for column in inspector.get_columns(table.name)}
         gaps.extend(f"{table.name}.{column.name}" for column in table.columns if column.name not in columns)
+    return gaps
+
+
+def missing_indexes(engine: Engine | None = None) -> list[str]:
+    """对照模型与真库，列出「模型声明了、库里没有」的索引。
+
+    和 `missing_columns()` 同一个道理，只是对象换成了索引：`create_all()` 只在**建表**那一刻
+    顺带建索引，往模型里新加一个 `Index(...)` 而忘了写进 `INDEXES`，老库到上线那天还在顺序扫，
+    而且**不会报错**——只能靠启动时点名 + 单测断言把它变成可见的。
+    """
+    target = engine if engine is not None else default_engine
+    inspector = inspect(target)
+    existing = set(inspector.get_table_names())
+    gaps: list[str] = []
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing:
+            gaps.append(f"{table.name}（整张表缺失）")
+            continue
+        names = {index["name"] for index in inspector.get_indexes(table.name)}
+        gaps.extend(f"{table.name}.{index.name}（索引缺失）"
+                    for index in sorted(table.indexes, key=lambda item: item.name)
+                    if index.name not in names)
     return gaps
