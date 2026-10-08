@@ -2,9 +2,9 @@
 # 提交前自检（版本化在 .githooks/ 里，用 `git config core.hooksPath .githooks` 生效，
 # `scripts/init_git.py` 会把这条配置一起设好）。
 #
-# 这个目录不是 GitHub 上的项目，没有 CI 服务可挂，所以把「编码 + 语法 + 后端用例 + 前端用例」
-# 这道闸门放在本地钩子上——正是这四件事先后翻过车（PowerShell 往返把源文件写成 mojibake、
-# 迁移漏列导致 UndefinedColumn、页面上看不出哪个接口慢），不能只靠人记得跑。
+# 默认只跑 `--quick`（编码 + 语法体检，几秒）：这两步拦的正是出过事故的那类问题——
+# PowerShell 文本 cmdlet 往返把源文件写成 mojibake/BOM、语法错误进仓库。
+# 想要连后端 115 个用例与前端 15 个用例一起卡住，用 `PRECOMMIT_FULL=1 git commit ...`。
 set -e
 
 if [ -x ".venv/Scripts/python.exe" ]; then
@@ -15,5 +15,11 @@ else
     PYTHON="python"
 fi
 
-echo "[pre-commit] $PYTHON scripts/check_all.py --quick"
-"$PYTHON" scripts/check_all.py --quick
+if [ "$PRECOMMIT_FULL" = "1" ]; then
+    echo "[pre-commit] $PYTHON scripts/check_all.py（含后端与前端用例）"
+    "$PYTHON" scripts/check_all.py
+else
+    echo "[pre-commit] $PYTHON scripts/check_all.py --quick"
+    echo "[pre-commit] 提示：PRECOMMIT_FULL=1 git commit 会连单元测试一起跑"
+    "$PYTHON" scripts/check_all.py --quick
+fi
