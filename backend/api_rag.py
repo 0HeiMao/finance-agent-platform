@@ -18,6 +18,7 @@ from backend.auth import current_user
 from backend.db import get_db
 from backend.limits import ai_quota
 from backend.models import User
+from backend.scope import departments_of
 from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
 from backend.rag.document_parser import extract_text, split_text
 from backend.rag.embeddings import get_embedding_service
@@ -54,30 +55,40 @@ def _content_hash(text: str) -> str:
 
 # 部门可见性规则（唯一实现在这里，/rag/* 与 /ai/* 共用）：
 # - 片段没写 department：属于全员可见的公共资料；
-# - 写了 department：只有同部门的人能看到；
-# - 用户名下的 department 为空：不受部门限制（财务管理员口径）；
-# - 用户名下是 finance-admin：同样不受限制。
+# - 写了 department：只有该部门的人能看到（多部门账号是「其中之一即可」）；
+# - 用户名下的部门列表为空：不受部门限制（财务管理员口径）；
+# - 用户名下是 finance-admin：同样不受限制（旧客户端兼容）。
 # 之前只有 /rag/answer 做了过滤，而前端 Agent 走的是 /ai/agent/chat/stream，
 # 等于权限形同虚设；现在统一走这个函数，且部门取自服务端用户记录，
 # 不接受请求头自述（X-User-Department 只作为旧客户端的兼容参数保留）。
 DEPARTMENT_ADMIN = "finance-admin"
 
-
-def user_department_of(user: User, legacy_header: str | None = None) -> str | None:
-    """部门只认服务端记录；旧客户端的请求头仅在用户尚未设置部门时用于兼容。"""
-    return user.department or (legacy_header if legacy_header == DEPARTMENT_ADMIN else None)
+# 知识库口径：None = 不受限；非空元组 = 只能看这些部门的片段（外加没标部门的公共资料）。
+ChunkScope = tuple[str, ...] | None
 
 
-def filter_visible(chunks: Iterable, user_department: str | None) -> list:
-    if not user_department or user_department == DEPARTMENT_ADMIN:
+def user_department_of(user: User, legacy_header: str | None = None) -> ChunkScope:
+    """知识库口径只认服务端记录；旧客户端的请求头仅在用户尚未设置部门时用于兼容。
+
+    多部门账号会拿到自己那几个部门的并集：片段只要命中其中任何一个都可见，
+    没标部门的公共资料对所有登录用户可见。
+    """
+    departments = departments_of(user)
+    if departments:
+        return departments
+    return (DEPARTMENT_ADMIN,) if legacy_header == DEPARTMENT_ADMIN else None
+
+
+def filter_visible(chunks: Iterable, user_department: ChunkScope) -> list:
+    if not user_department or DEPARTMENT_ADMIN in user_department:
         return list(chunks)
     return [
         item for item in chunks
-        if not item.metadata_json.get("department") or item.metadata_json.get("department") == user_department
+        if not item.metadata_json.get("department") or item.metadata_json.get("department") in user_department
     ]
 
 
-def retrieve_for_user(db: Session, query: str, user_department: str | None, top_k: int) -> list:
+def retrieve_for_user(db: Session, query: str, user_department: ChunkScope, top_k: int) -> list:
     """宽松阈值多召回候选 -> 部门过滤 -> 重排压缩到 top_k。"""
     settings = get_settings()
     service = get_embedding_service()

@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from backend.auth import current_user
 from backend.ai_service import rag_answer
-from backend.api_rag import retrieve_for_user, user_department_of
+from backend.api_rag import ChunkScope, retrieve_for_user, user_department_of
 from backend.db import SessionLocal
 from backend.rag.financial_evidence import collect as collect_financial_evidence
 from backend.llm import get_llm
@@ -16,7 +16,7 @@ class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
 
 
-def _retrieve(question: str, db, user_department: str | None = None) -> list:
+def _retrieve(question: str, db, user_department: ChunkScope = None) -> list:
     """宽松阈值多召回 -> 部门过滤 -> 重排压缩到 5（规则与 /rag/answer 共用一份实现）。"""
     return retrieve_for_user(db, question, user_department, 5)
 
@@ -48,7 +48,7 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
     financial_scope, violation = resolve_requested_scope(user, department)
     if violation:
         raise HTTPException(403, violation)
-    explicit = department if (department and scope_of(user) is None) else None
+    explicit = financial_scope[0] if (financial_scope and len(financial_scope) == 1 and scope_of(user) is None) else None
 
     def events():
         db = SessionLocal()

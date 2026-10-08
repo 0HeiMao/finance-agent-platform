@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
 import PagePager from '../components/PagePager.vue'
+import { departmentsText, parseDepartments } from '../utils/format'
 
 const PAGE_SIZE = 50
 
@@ -42,7 +43,7 @@ async function load() {
     total.value = payload.total || 0
     departments.value = payload.departments || []
     unrestrictedCount.value = payload.unrestricted_count || 0
-    users.value.forEach((user) => { drafts[user.id] = user.department })
+    users.value.forEach((user) => { drafts[user.id] = departmentsText(user.departments || user.department) })
   } catch (e) {
     error.value = `读取用户列表失败：${e.message}`
     users.value = []
@@ -75,17 +76,19 @@ async function saveDepartment(user) {
   error.value = ''
   notice.value = ''
   try {
+    const wanted = parseDepartments(drafts[user.id])
     const response = await apiFetch(`/admin/users/${user.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ department: drafts[user.id] || '' }),
+      body: JSON.stringify({ departments: wanted }),
     })
     const updated = await response.json()
     user.department = updated.department
+    user.departments = updated.departments
     user.unrestricted = updated.unrestricted
-    drafts[user.id] = updated.department
+    drafts[user.id] = departmentsText(updated.departments)
     notice.value = updated.unrestricted
       ? `已保存：${updated.username} 部门为空，现在是管理员（不受部门限制）。`
-      : `已保存：${updated.username} 只能检索「${updated.department}」与未标注部门的片段。`
+      : `已保存：${updated.username} 只能检索「${departmentsText(updated.departments)}」与未标注部门的片段。`
   } catch (e) {
     error.value = `保存失败：${e.message}`
   } finally {
@@ -126,7 +129,7 @@ onMounted(load)
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>用户管理</h1>
-            <p>部门决定知识库检索范围：留空＝不受限制（管理员），填写后只返回本部门与未标注部门的片段。</p>
+            <p>部门决定知识库检索与财务数据的可见范围：留空＝不受限制（管理员）；可填多个部门（用「、」分隔），看到的是这些部门的并集。</p>
           </div>
         </div>
         <div class="actions">
@@ -178,7 +181,7 @@ onMounted(load)
             <table>
               <thead>
                 <tr>
-                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑）</th><th>创建时间</th><th>操作</th>
+                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>创建时间</th><th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -190,15 +193,15 @@ onMounted(load)
                   </td>
                   <td>
                     <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
-                      {{ user.unrestricted ? '管理员' : '限定部门' }}
+                      {{ user.unrestricted ? '管理员' : (user.departments || []).length > 1 ? `限定 ${user.departments.length} 个部门` : '限定部门' }}
                     </span>
                   </td>
                   <td>
                     <input
                       v-model.trim="drafts[user.id]"
                       class="select"
-                      maxlength="100"
-                      placeholder="留空＝不受限"
+                      maxlength="500"
+                      placeholder="留空＝不受限；多个用「、」分隔"
                       :disabled="user.is_self"
                     >
                   </td>

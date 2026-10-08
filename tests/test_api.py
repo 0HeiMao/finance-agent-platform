@@ -628,6 +628,32 @@ async def test_system_status_never_leaks_secrets(anon_client, auth_headers):
     assert settings.auth_secret_key not in body
     assert {item["name"] for item in payload["directories"]} >= {"财务导入上传目录", "知识库上传目录"}
     assert all("writable" in item for item in payload["directories"])
+    # 系统设置页按这一份渲染「我的部门」输入框与「当前：」一行，所以必须带上完整部门列表
+    assert payload["me"]["departments"] == []
+    assert payload["me"]["unrestricted"] is True
+
+
+async def test_system_status_carries_full_department_list(anon_client, auth_headers):
+    """多部门账号在 /system/status 的 me 里必须拿到**全部**部门。
+
+    真机冒烟当场抓到的缺陷：只回单值列 `department` 时，设置页输入框预填成第一个部门，
+    页面上「当前：限定 部门A」，用户点一次保存就把自己从两个部门缩成了一个部门。
+    """
+    patched = await anon_client.patch("/api/v1/auth/me",
+                                      json={"departments": ["部门A", "部门B"]},
+                                      headers=auth_headers)
+    assert patched.status_code == 200, patched.text
+    try:
+        status = await anon_client.get("/api/v1/system/status", headers=auth_headers)
+        assert status.status_code == 200, status.text
+        me = status.json()["me"]
+        assert me["departments"] == ["部门A", "部门B"]
+        assert me["department"] == "部门A"  # 单值列仍回落到第一个，供老文案使用
+        assert me["unrestricted"] is False
+    finally:
+        restored = await anon_client.patch("/api/v1/auth/me", json={"departments": []},
+                                           headers=auth_headers)
+        assert restored.status_code == 200, restored.text
 
 
 async def test_system_status_requires_token(anon_client):
@@ -719,11 +745,31 @@ async def test_admin_user_department_update_and_self_protection(anon_client, aut
                                       json={"department": "部门B"}, headers=auth_headers)
     assert updated.status_code == 200, updated.text
     assert updated.json() == {"id": target_id, "username": target["username"],
-                              "department": "部门B", "unrestricted": False}
+                              "department": "部门B", "departments": ["部门B"],
+                              "unrestricted": False}
+
+    # 多部门：一次给两个部门，单值列同步成第一个（老前端与审计文案读它）
+    multi = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
+                                    json={"departments": ["部门B", "部门C"]}, headers=auth_headers)
+    assert multi.status_code == 200, multi.text
+    assert multi.json()["departments"] == ["部门B", "部门C"]
+    assert multi.json()["department"] == "部门B"
+    assert multi.json()["unrestricted"] is False
+
+    # 列表里能看到两个部门，且按其中一个部门筛选时这个账号不会被漏掉（JSONB 数组成员判断）
+    listing = await anon_client.get("/api/v1/admin/users", headers=auth_headers)
+    row = {item["username"]: item for item in listing.json()["data"]}[target["username"]]
+    assert row["departments"] == ["部门B", "部门C"]
+    filtered = await anon_client.get("/api/v1/admin/users?department=部门C", headers=auth_headers)
+    assert target["username"] in {item["username"] for item in filtered.json()["data"]}
+    by_first = await anon_client.get("/api/v1/admin/users?department=部门B", headers=auth_headers)
+    assert target["username"] in {item["username"] for item in by_first.json()["data"]}
+    assert "部门C" in by_first.json()["departments"]
 
     cleared = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
-                                      json={"department": "  "}, headers=auth_headers)
+                                      json={"departments": []}, headers=auth_headers)
     assert cleared.json()["department"] == ""
+    assert cleared.json()["departments"] == []
     assert cleared.json()["unrestricted"] is True
 
     # 自改部门会把管理员锁在管理入口之外，必须被拒绝
@@ -1171,6 +1217,46 @@ async def test_scoped_account_cannot_switch_scope(anon_client, api_app, auth_hea
         assert own.status_code == 200 and Decimal(own.json()["revenue_amount"]) == Decimal("300.00")
     finally:
         await scoped.aclose()
+
+
+async def test_multi_department_account_can_narrow_its_own_scope(anon_client, api_app, db_session):
+    """绑定多个部门的账号在「自己那几个部门」之间可以换口径，所以下拉要对它开放。
+
+    早先 `switchable` 只看「账号是否不受限」，多部门账号在看板上看不到口径下拉——
+    而它恰恰是最需要在两个部门之间来回收窄的那个账号。
+    """
+    _seed_scoped_period(db_session, SCOPE_PERIOD)
+    credentials = {"username": f"multi_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
+    token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
+                               base_url="http://testserver", trust_env=False)
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        patched = await client.patch("/api/v1/auth/me", json={"departments": ["部门A", "部门B"]}, headers=headers)
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["departments"] == ["部门A", "部门B"]
+
+        listing = await client.get("/api/v1/analysis/departments", headers=headers)
+        assert listing.status_code == 200, listing.text
+        assert listing.json()["switchable"] is True
+        assert {item["name"] for item in listing.json()["departments"]} == {"部门A", "部门B"}
+
+        # 不带参数＝并集（300 + 700），带上自己的一个＝收窄
+        both = await client.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}", headers=headers)
+        assert Decimal(both.json()["revenue_amount"]) == Decimal("1000.00")
+        narrowed = await client.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}&department=部门B",
+                                    headers=headers)
+        assert narrowed.status_code == 200, narrowed.text
+        assert Decimal(narrowed.json()["revenue_amount"]) == Decimal("700.00")
+
+        # 收窄仍然只能在范围内
+        beyond = await client.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}&department=部门C",
+                                  headers=headers)
+        assert beyond.status_code == 403
+        assert "不能查看" in beyond.json()["detail"]
+    finally:
+        await client.aclose()
 
 
 # ---------------------------------------------------------------- 数据导出

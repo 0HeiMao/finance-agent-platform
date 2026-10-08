@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from backend.auth import current_user
 from backend.db import get_db
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (resolve_requested_scope, scope_alert, scope_label,
+from backend.scope import (Scope, resolve_requested_scope, scope_alert, scope_label,
                            scope_metric, scope_of, scope_payload, scope_transactions)
 
 router = APIRouter(tags=["dashboard"])
@@ -36,18 +36,18 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
     if period not in {"month", "quarter", "year"}:
         raise HTTPException(422, "不支持的期间")
 
-    # 管理员可以按任意部门查看（限制部门账号只能看自己的，越权直接 403）。
+    # 管理员可以按任意部门查看（限制部门账号只能看自己范围内的，越权直接 403）。
     requested, violation = resolve_requested_scope(user, department)
     if violation:
         raise HTTPException(403, violation)
     # 只有「不受限账号主动切了视角」才需要在提示条里说明，受限账号本来就是本部门口径。
-    explicit = requested if (requested and scope_of(user) is None) else None
-    department = requested
+    explicit = requested[0] if (requested and len(requested) == 1 and scope_of(user) is None) else None
+    scope = requested
 
     # 数据期间不一定与自然日期对齐（演示数据是 2026-04~2026-10），取库里最新一期所在的年份，
     # 这样"本月/本季/本年"指向的是有数据的期间，而不是空响应的当前自然月。
     # 用 scope_metric 取，受限账号拿到的是自己部门的期间，不会跟着别人的数据走。
-    latest_metric = db.scalars(scope_metric(select(FinancialMetric), department).order_by(desc(FinancialMetric.period))).first()
+    latest_metric = db.scalars(scope_metric(select(FinancialMetric), scope).order_by(desc(FinancialMetric.period))).first()
     today = datetime.now()
     year = int(latest_metric.period.split("-")[0]) if latest_metric and "-" in latest_metric.period else today.year
     if period == "month":
@@ -66,7 +66,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
     start = datetime(year, 1, 1)
     end = datetime(year, 12, 31, 23, 59, 59)
     rows = db.scalars(
-        scope_transactions(select(FinancialTransaction), department)
+        scope_transactions(select(FinancialTransaction), scope)
         .where(FinancialTransaction.transaction_date >= start, FinancialTransaction.transaction_date <= end)
         .order_by(FinancialTransaction.transaction_date)
     ).all()
@@ -75,8 +75,8 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
     if not rows:
         return {
             "period": period, "period_label": period_label, "months": months, "has_data": False,
-            "scope": scope_payload(department, requested=explicit),
-            "message": f"{scope_label(department)}在 {year} 年 {months[0][5:]}~{months[-1][5:]} 期间没有找到财务数据，请先导入。",
+            "scope": scope_payload(scope, requested=explicit),
+            "message": f"{scope_label(scope)}在 {year} 年 {months[0][5:]}~{months[-1][5:]} 期间没有找到财务数据，请先导入。",
             "kpi": [], "revenue": [], "expenses": [], "cash": {"x": [], "inflow": [], "outflow": []},
             "alerts": [],
         }
@@ -91,7 +91,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
 
     # 环比：与紧邻的上一期比。上一期必须有完整数据，否则不给数字（前端会整行不显示）。
     previous_months = _previous_months(months, period)
-    previous_totals, previous_complete = _totals_by_months(db, previous_months, department)
+    previous_totals, previous_complete = _totals_by_months(db, previous_months, scope)
     compare = {
         "type": "环比", "label": f"{previous_months[0]}~{previous_months[-1]}",
         "available": previous_complete,
@@ -122,7 +122,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
         "updated_at": datetime.now().isoformat(),
         "range": {"year": year, "months": months, "label": f"{months[0]}~{months[-1]}"},
         "compare": compare,
-        "scope": scope_payload(department, requested=explicit),
+        "scope": scope_payload(scope, requested=explicit),
         "source_note": "政府会计总账公开数据（加拿大 Receiver General），口径见 data/processed/README.md",
         "kpi": [
             _kpi("营业收入", revenue, "元", "↗", None, previous_value("revenue"), compare_label),
@@ -158,7 +158,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
              "period": a.period, "department": a.department or "",
              "time": a.created_at.isoformat() if a.created_at else ""}
             for a in db.scalars(
-                scope_alert(select(FinancialAlert), department)
+                scope_alert(select(FinancialAlert), scope)
                 .where(FinancialAlert.period.in_(months)).order_by(desc(FinancialAlert.period))
             ).all()
         ],
@@ -192,11 +192,19 @@ def _previous_months(months: list[str], period: str) -> list[str]:
     return [f"{(total_start + offset) // 12}-{(total_start + offset) % 12 + 1:02d}" for offset in range(span)]
 
 
-def _totals_by_months(db: Session, months: list[str], department: str | None = None) -> tuple[dict[str, Decimal] | None, bool]:
+def _totals_by_months(db: Session, months: list[str], scope: Scope = None) -> tuple[dict[str, Decimal] | None, bool]:
     """上一期的汇总。任一月份缺该口径的 FinancialMetric 就认为数据不完整，返回 (None, False)——
-    宁可说"算不了环比"，也不能拿半个月的数据去比。"""
-    rows = db.scalars(scope_metric(select(FinancialMetric).where(FinancialMetric.period.in_(months)), department)).all()
-    if len({row.period for row in rows}) != len(months):
+    宁可说"算不了环比"，也不能拿半个月的数据去比。
+
+    多部门账号同期有多行（一本部门账一行），所以这里除了「每月都有数据」还要求
+    「每月的行数等于范围内的部门数」：某个部门少一期就说明这一期不可比。
+    """
+    rows = db.scalars(scope_metric(select(FinancialMetric).where(FinancialMetric.period.in_(months)), scope)).all()
+    expected = len(scope) if scope else 1
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.period] = counts.get(row.period, 0) + 1
+    if len(counts) != len(months) or any(counts.get(month, 0) != expected for month in months):
         return None, False
     revenue = sum((row.revenue_amount or Decimal(0) for row in rows), Decimal(0))
     cost = sum((row.cost_amount or Decimal(0) for row in rows), Decimal(0))

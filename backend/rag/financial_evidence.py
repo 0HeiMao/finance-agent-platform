@@ -16,7 +16,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
-from backend.scope import scope_alert, scope_label, scope_metric, scope_transactions
+from backend.scope import (Scope, metric_totals, scope_alert, scope_label, scope_metric,
+                           scope_transactions)
 
 CENT = Decimal("0.01")
 MAX_TABLE_PERIODS = 24
@@ -32,9 +33,9 @@ def ratio(value: Decimal | float | int | None) -> str:
     return str(Decimal(value or 0).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
 
-def available_periods(db: Session, department: str | None = None) -> list[str]:
+def available_periods(db: Session, scope: Scope = None) -> list[str]:
     return list(db.scalars(scope_metric(
-        select(FinancialMetric.period).distinct(), department).order_by(FinancialMetric.period)))
+        select(FinancialMetric.period).distinct(), scope).order_by(FinancialMetric.period)))
 
 
 def pick_period(question: str, periods: list[str]) -> str | None:
@@ -48,7 +49,7 @@ def pick_period(question: str, periods: list[str]) -> str | None:
     return periods[-1]
 
 
-def _aggregate(db: Session, period: str, column, department: str | None = None) -> list[tuple[str, Decimal, int]]:
+def _aggregate(db: Session, period: str, column, scope: Scope = None) -> list[tuple[str, Decimal, int]]:
     key = func.coalesce(column, "未标注")
     statement = (
         select(key, func.sum(FinancialTransaction.revenue_amount), func.sum(FinancialTransaction.expense_amount), func.count())
@@ -58,10 +59,10 @@ def _aggregate(db: Session, period: str, column, department: str | None = None) 
         .limit(MAX_DETAIL_ROWS)
     )
     return [(row[0], Decimal(row[1] or 0), Decimal(row[2] or 0), int(row[3] or 0))
-            for row in db.execute(scope_transactions(statement, department)).all()]
+            for row in db.execute(scope_transactions(statement, scope)).all()]
 
 
-def _summary_lines(metrics: list[FinancialMetric]) -> list[str]:
+def _summary_lines(metrics: list) -> list[str]:
     shown = metrics[-MAX_TABLE_PERIODS:]
     lines = [
         f"期间口径说明：全部金额为「元」，比率保留 4 位小数；共 {len(metrics)} 期已入库，下表为最近 {len(shown)} 期。",
@@ -77,8 +78,8 @@ def _summary_lines(metrics: list[FinancialMetric]) -> list[str]:
     return lines
 
 
-def _period_lines(db: Session, period: str, metric: FinancialMetric,
-                  department: str | None = None) -> tuple[list[str], list[str]]:
+def _period_lines(db: Session, period: str, metric,
+                  scope: Scope = None) -> tuple[list[str], list[str]]:
     lines = [
         f"### 当前期间明细（{period}）",
         f"- 收入金额 {money(metric.revenue_amount)} 元，成本金额 {money(metric.cost_amount)} 元，费用金额 {money(metric.expense_amount)} 元，收支差额 {money(metric.net_profit_amount)} 元。",
@@ -88,13 +89,13 @@ def _period_lines(db: Session, period: str, metric: FinancialMetric,
         "| 部门 | 收入金额 | 费用金额 | 笔数 |",
         "| --- | --- | --- | --- |",
     ]
-    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.department, department):
+    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.department, scope):
         lines.append(f"| {name} | {money(revenue)} | {money(expense)} | {count} |")
     lines += ["", f"按科目汇总（{period}，按费用金额降序，最多 {MAX_DETAIL_ROWS} 行）：", "| 科目名称 | 收入金额 | 费用金额 | 笔数 |", "| --- | --- | --- | --- |"]
-    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.account_name, department):
+    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.account_name, scope):
         lines.append(f"| {name} | {money(revenue)} | {money(expense)} | {count} |")
     alerts = db.scalars(scope_alert(
-        select(FinancialAlert).where(FinancialAlert.period == period), department)
+        select(FinancialAlert).where(FinancialAlert.period == period), scope)
         .order_by(FinancialAlert.id)).all()
     lines += ["", f"本期系统预警（{len(alerts)} 条）："]
     if alerts:
@@ -113,32 +114,32 @@ def _period_lines(db: Session, period: str, metric: FinancialMetric,
     return lines, sources
 
 
-def collect(db: Session, question: str, department: str | None = None) -> dict[str, Any]:
+def collect(db: Session, question: str, scope: Scope = None) -> dict[str, Any]:
     """返回 {'has_data', 'periods', 'context', 'sources'}，context 为空字符串表示没有可用财务数据。
 
-    `department` 是提问者的数据范围：None = 全公司口径，有值 = 只看该部门。
+    `scope` 是提问者的数据范围：None = 全公司口径；非空元组 = 只看这些部门（多部门账号是并集）。
     受限账号的 Agent 绝不能看到别人的数字，所以指标、明细、预警三处都要过 scope。
     """
-    periods = available_periods(db, department)
+    periods = available_periods(db, scope)
     if not periods:
         return {"has_data": False, "periods": [], "context": "", "sources": []}
-    metrics = list(db.scalars(scope_metric(
-        select(FinancialMetric).where(FinancialMetric.period.in_(periods)), department)
+    rows = list(db.scalars(scope_metric(
+        select(FinancialMetric).where(FinancialMetric.period.in_(periods)), scope)
         .order_by(FinancialMetric.period, FinancialMetric.id)))
-    latest_by_period: dict[str, FinancialMetric] = {}
-    for metric in metrics:
-        latest_by_period[metric.period] = metric
-    ordered = [latest_by_period[period] for period in periods]
+    # 一期一行：多部门账号同期有多条部门行，直接取「最后一条」会静默丢掉另一本账，
+    # 所以这里按期间聚合（金额相加、比率按合计重算），证据表里才是一个部门并集的数字。
+    totals = {item.period: item for item in metric_totals(rows, period_order=periods)}
+    ordered = [totals[period] for period in periods if period in totals]
     period = pick_period(question, periods)
-    scope_line = ("" if department is None
-                  else f"数据范围：本证据只包含「{scope_label(department)}」的明细，不是全公司口径。")
+    scope_line = ("" if scope is None
+                  else f"数据范围：本证据只包含「{scope_label(scope)}」的明细，不是全公司口径。")
     lines = ["【已导入财务数据（程序确定性计算，可直接引用）】"]
     if scope_line:
         lines.append(scope_line)
     lines += ["", "#### 各期间汇总", "", *_summary_lines(ordered)]
     sources: list[dict[str, Any]] = [{"name": f"财务汇总表 {periods[0]}~{periods[-1]}", "kind": "financial_metric"}]
     if period:
-        detail_lines, detail_sources = _period_lines(db, period, latest_by_period[period], department)
+        detail_lines, detail_sources = _period_lines(db, period, totals[period], scope)
         lines += ["", *detail_lines]
         sources = detail_sources + sources
     lines += [

@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
+import { departmentsText, parseDepartments } from '../utils/format'
 
 const sidebarOpen = ref(false)
 const departments = ref([])
@@ -26,9 +27,27 @@ const RULES = [
     '知识库只返回该部门与未标注部门的片段；管理接口一律 403。',
     '部门为空的数据行（未标注部门）归全公司口径，不属于任何部门账号。',
   ] },
+  { title: '多部门账号（一个账号绑定多个部门）', tone: 'warn', items: [
+    '看到的是这些部门的并集：金额相加、比率按相加后的金额重算（比率不能相加）。',
+    '部门筛选、部门权限页都会把它算进每一个绑定的部门；同名部门只写一次。',
+    '越界的口径切换被拒绝：只能在自己绑定的部门里收窄，切不到没绑定的部门。',
+  ] },
 ]
 
 const scopeCount = computed(() => departments.value.filter((item) => item.user_count).length)
+
+/**
+ * 多部门账号在 `departments[].users` 里会出现多次（每个绑定的部门一次），
+ * 直接展开渲染会得到重复 `:key` 的表格行（Vue 会告警，且同一账号出现两行）。
+ * 这里按 id 去重、保持「不受限账号在前」的顺序。
+ */
+const editableUsers = computed(() => {
+  const seen = new Map()
+  for (const user of [...unrestrictedUsers.value, ...departments.value.flatMap((item) => item.users)]) {
+    if (!seen.has(user.id)) seen.set(user.id, user)
+  }
+  return [...seen.values()]
+})
 
 function short(value) {
   const raw = Number(String(value ?? 0).replace(/,/g, ''))
@@ -54,7 +73,7 @@ async function load() {
     me.value = payload.me || null
     knownDepartments.value = departments.value.map((item) => item.name)
     ;[...unrestrictedUsers.value, ...departments.value.flatMap((item) => item.users)].forEach((user) => {
-      drafts[user.id] = user.department || ''
+      drafts[user.id] = departmentsText(user.departments || user.department)
     })
   } catch (e) {
     error.value = `读取部门权限失败：${e.message}`
@@ -72,12 +91,12 @@ async function saveUser(user) {
   try {
     const response = await apiFetch(`/admin/users/${user.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ department: drafts[user.id] || '' }),
+      body: JSON.stringify({ departments: parseDepartments(drafts[user.id]) }),
     })
     const updated = await response.json()
     notice.value = updated.unrestricted
       ? `已保存：${updated.username} 现在不受部门限制。`
-      : `已保存：${updated.username} 限定为「部门 ${updated.department}」。`
+      : `已保存：${updated.username} 限定为「${departmentsText(updated.departments)}」。`
     await load()
   } catch (e) {
     error.value = `保存失败：${e.message}`
@@ -161,17 +180,17 @@ onMounted(load)
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>用户名</th><th>当前范围</th><th>部门（可编辑）</th><th>操作</th></tr>
+                <tr><th>用户名</th><th>当前范围</th><th>部门（可编辑，多个用「、」分隔）</th><th>操作</th></tr>
               </thead>
               <tbody>
-                <tr v-for="user in [...unrestrictedUsers, ...departments.flatMap((item) => item.users)]" :key="user.id">
+                <tr v-for="user in editableUsers" :key="user.id">
                   <td>
                     {{ user.username }}
                     <span v-if="user.is_self" class="level medium">当前账号</span>
                   </td>
                   <td>
                     <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
-                      {{ user.unrestricted ? '全公司' : `部门 ${user.department}` }}
+                      {{ user.unrestricted ? '全公司' : `部门 ${departmentsText(user.departments) || user.department}` }}
                     </span>
                   </td>
                   <td>
@@ -179,8 +198,8 @@ onMounted(load)
                       v-model.trim="drafts[user.id]"
                       class="select"
                       list="department-options"
-                      maxlength="100"
-                      placeholder="留空＝不受限"
+                      maxlength="500"
+                      placeholder="留空＝不受限；多个用「、」分隔"
                       :disabled="user.is_self"
                     >
                   </td>

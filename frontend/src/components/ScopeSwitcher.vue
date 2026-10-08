@@ -2,7 +2,7 @@
   <div v-if="switchable" class="scope-switcher">
     <span class="scope-label">查看口径</span>
     <select :value="activeScope" :disabled="loading" @change="onChange">
-      <option value="">全公司（全部部门）</option>
+      <option value="">{{ defaultLabel }}</option>
       <option v-for="item in options" :key="item.name" :value="item.name">
         {{ item.label }}（{{ item.transactions }} 行）
       </option>
@@ -13,11 +13,16 @@
 
 <script setup>
 /**
- * 管理员的口径切换器：不受限账号可以临时切到某个部门看，受限账号看不到这个控件。
+ * 口径切换器：不受限账号可以临时切到任意部门看。
  *
- * 「能不能切换」直接读会话里的 `unrestricted`（与路由守卫、侧边栏同一份 `/auth/me` 缓存），
+ * 「能不能切换」读会话里的 `unrestricted` 与 `departments`（与路由守卫、侧边栏同一份 `/auth/me` 缓存），
  * 而不是让每个页面各自传一个 scope 对象进来——页面少一层耦合，也不会出现某个页面忘了传、
- * 结果管理员在那一页切不了口径的情况。受限账号即便手动改 URL 也会被服务端 403 挡住。
+ * 结果管理员在那一页切不了口径的情况。
+ *
+ * **绑定多个部门的账号也能切**：服务端允许它在自己那几个部门之间收窄（越界仍 403），
+ * 而它恰恰是最需要在两个部门之间来回收窄的那个账号；下拉里只有它自己的部门
+ * （`GET /analysis/departments` 受限时只回自己那几个），不选＝这些部门的并集。
+ * 只绑一个部门的账号没什么可换的，不显示这个控件。
  *
  * 选项来自 `GET /analysis/departments`（数据里真实出现过的部门）。切换只写模块级 `activeScope`，
  * 由各页面自己 watch 重新取数——组件不直接改数据，避免「选择器变了页面还是旧数字」。
@@ -31,7 +36,16 @@ const options = ref([])
 const loading = ref(false)
 const loaded = ref(false)
 
-const switchable = computed(() => currentUser().value?.unrestricted === true)
+const me = computed(() => currentUser().value || {})
+const ownDepartments = computed(() => me.value.departments || [])
+
+const switchable = computed(() => me.value.unrestricted === true || ownDepartments.value.length > 1)
+
+// 「不选任何部门」对不受限账号是全公司，对多部门账号是它自己那几个部门的并集——
+// 文案不能都写「全公司」，否则受限账号会以为自己在看全公司的数。
+const defaultLabel = computed(() => (me.value.unrestricted === true
+  ? '全公司（全部部门）'
+  : `我绑定的 ${ownDepartments.value.length} 个部门（合计）`))
 
 async function load() {
   if (!switchable.value || loaded.value) return

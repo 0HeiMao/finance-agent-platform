@@ -16,7 +16,8 @@ from backend.db import get_db
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.rag.embeddings import get_embedding_service
 from backend.rag.pgvector_store import EMBEDDING_DIMENSION, DocumentChunk
-from backend.scope import scope_alert, scope_metric, scope_of, scope_payload, scope_transactions
+from backend.scope import (departments_of, scope_alert, scope_metric, scope_of, scope_payload,
+                           scope_transactions)
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
@@ -125,7 +126,10 @@ def system_status(db: Session = Depends(get_db), user: User = Depends(current_us
             "id": user.id,
             "username": user.username,
             "department": user.department,
-            "unrestricted": not user.department,
+            # 系统设置页要按这一份渲染「我的部门」输入框，只给单值列会让多部门账号
+            # 一进页面就只看到第一个部门，点保存就把自己缩成了一个部门。
+            "departments": list(departments_of(user)),
+            "unrestricted": not departments_of(user),
         },
         "config_problems": settings.validate(),
     }

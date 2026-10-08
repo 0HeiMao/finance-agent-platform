@@ -11,9 +11,12 @@ import { test } from 'node:test'
 
 import {
   JOB_STATUS_LABELS,
+  MAX_DEPARTMENTS,
+  departmentsText,
   describeResult,
   durationText,
   formatTime,
+  parseDepartments,
   periodsText,
   resultText,
   statusLabel,
@@ -81,4 +84,31 @@ test('periodsText 对不连续期间只列前三个并标总期数', () => {
     '2026-01、2026-04、2026-07 等 4 期')
   // 只有两个且不连续：直接列出，不加"等 N 期"
   assert.equal(periodsText({ periods: ['2026-01', '2026-03'] }), '2026-01、2026-03')
+})
+
+test('parseDepartments 支持顿号/逗号/分号/空格分隔，去空去重保序', () => {
+  assert.deepEqual(parseDepartments('018、097'), ['018', '097'])
+  assert.deepEqual(parseDepartments('018,097'), ['018', '097'])
+  assert.deepEqual(parseDepartments('018，097；122 127'), ['018', '097', '122', '127'])
+  assert.deepEqual(parseDepartments('  018 、  、097  '), ['018', '097'])
+  // 重复项必须去掉：后端拿 len(scope) 当每月期望行数，重复会让它误判数据不完整
+  assert.deepEqual(parseDepartments('018、018、097'), ['018', '097'])
+  assert.deepEqual(parseDepartments(''), [])
+  assert.deepEqual(parseDepartments(null), [])
+  assert.deepEqual(parseDepartments(['018', '', ' 097 ']), ['018', '097'])
+})
+
+test('parseDepartments 截断到后端上限，不会提交后才报 422', () => {
+  const many = Array.from({ length: MAX_DEPARTMENTS + 5 }, (_, index) => `D${index}`)
+  const parsed = parseDepartments(many.join('、'))
+  assert.equal(parsed.length, MAX_DEPARTMENTS)
+  assert.equal(parsed[0], 'D0')
+  assert.equal(parsed[MAX_DEPARTMENTS - 1], `D${MAX_DEPARTMENTS - 1}`)
+})
+
+test('departmentsText 用顿号回填输入框', () => {
+  assert.equal(departmentsText(['018', '097']), '018、097')
+  assert.equal(departmentsText(['018']), '018')
+  assert.equal(departmentsText([]), '')
+  assert.equal(departmentsText('部门A,部门B'), '部门A、部门B')
 })

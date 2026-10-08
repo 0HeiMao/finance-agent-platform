@@ -119,28 +119,44 @@ def _chunk(department):
 
 def test_filter_visible_keeps_public_and_own_department():
     chunks = [_chunk(None), _chunk(""), _chunk("部门A"), _chunk("部门B")]
-    visible = [item.metadata_json["department"] for item in filter_visible(chunks, "部门A")]
+    visible = [item.metadata_json["department"] for item in filter_visible(chunks, ("部门A",))]
     assert visible == [None, "", "部门A"]
 
 
 def test_filter_visible_admin_and_unset_see_everything():
     chunks = [_chunk("部门A"), _chunk("部门B")]
     assert len(filter_visible(chunks, None)) == 2
-    assert len(filter_visible(chunks, DEPARTMENT_ADMIN)) == 2
+    assert len(filter_visible(chunks, (DEPARTMENT_ADMIN,))) == 2
+
+
+def test_filter_visible_multi_department_is_a_union():
+    """多部门账号看到的是并集：两个部门的资料都可见，第三个部门仍然挡住。"""
+    chunks = [_chunk(None), _chunk("部门A"), _chunk("部门B"), _chunk("部门C")]
+    visible = [item.metadata_json["department"] for item in filter_visible(chunks, ("部门A", "部门B"))]
+    assert visible == [None, "部门A", "部门B"]
 
 
 def test_user_department_prefers_server_side_record():
     user = SimpleNamespace(department="部门A")
     # 请求头自报 finance-admin 不能提权：部门以服务端记录为准
-    assert user_department_of(user, DEPARTMENT_ADMIN) == "部门A"
-    assert user_department_of(user, "部门B") == "部门A"
+    assert user_department_of(user, DEPARTMENT_ADMIN) == ("部门A",)
+    assert user_department_of(user, "部门B") == ("部门A",)
+
+
+def test_user_department_reads_multi_department_list():
+    """`departments` 是权威值：有列表就按列表，列表为空才回落到老的单值列。"""
+    user = SimpleNamespace(departments=["部门A", "部门B"], department="部门A")
+    assert user_department_of(user) == ("部门A", "部门B")
+    assert user_department_of(user, DEPARTMENT_ADMIN) == ("部门A", "部门B")
+    legacy = SimpleNamespace(departments=None, department="部门B")
+    assert user_department_of(legacy) == ("部门B",)
 
 
 def test_user_department_ignores_forged_legacy_header():
     user = SimpleNamespace(department=None)
     assert user_department_of(user, "部门B") is None
     # 只有旧用户自己声明 finance-admin 才兼容接受
-    assert user_department_of(user, DEPARTMENT_ADMIN) == DEPARTMENT_ADMIN
+    assert user_department_of(user, DEPARTMENT_ADMIN) == (DEPARTMENT_ADMIN,)
 
 
 # ---------------------------------------------------------------- 看板计算

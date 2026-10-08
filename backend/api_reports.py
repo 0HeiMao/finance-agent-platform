@@ -17,13 +17,14 @@ from backend.auth import current_user
 from backend.db import get_db
 from backend.files import content_disposition
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (resolve_requested_scope, scope_alert, scope_metric, scope_of, scope_payload,
+from backend.scope import (Scope, metric_totals, resolve_requested_scope, scope_alert, scope_label,
+                           scope_metric, scope_of, scope_payload, scope_slug, scope_text,
                            scope_transactions)
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
 
 
-def _report_scope(user: User, requested: str | None) -> tuple[str | None, bool]:
+def _report_scope(user: User, requested: str | None) -> tuple[Scope, str | None]:
     """报告的口径解析：返回 (生效口径, 是否由不受限账号主动指定)。越权直接 403。
 
     报告比页面更容易被外传（下载下来就是一份文件），所以这里和看板用同一套规则，
@@ -32,7 +33,10 @@ def _report_scope(user: User, requested: str | None) -> tuple[str | None, bool]:
     scope, violation = resolve_requested_scope(user, requested)
     if violation:
         raise HTTPException(403, violation)
-    return scope, bool(requested and scope_of(user) is None)
+    # 显式口径只对「本身不受限、这次又指定了部门」的管理员有意义：返回部门名（供提示条文案用），
+    # 其它情况返回 None。以前这里返回的是 bool，提示条于是会写成「正在按部门 True 口径查看」。
+    explicit = scope[0] if (scope and len(scope) == 1 and scope_of(user) is None) else None
+    return scope, explicit
 
 # 逐期数据里的口径限制必须跟着报告一起走，否则「毛利率 1.0000」会被读成经营结论。
 PERIOD_NOTES = (
@@ -59,18 +63,20 @@ DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 DOCX_FONT = "微软雅黑"
 
 
-def _collect(db: Session, period: str, department: str | None = None,
-             requested: bool = False) -> dict:
+def _collect(db: Session, period: str, scope: Scope = None,
+             requested: str | None = None) -> dict:
     """把一期数据整理成报告所需的全部素材（Markdown 与 PPTX 共用）。
 
     `department` 是查看者的数据范围：None = 全公司口径（读 department IS NULL 的汇总行），
     有值 = 该部门口径。报告与看板必须给同一个数，所以取数和看板走同一套 scope 过滤。
     """
-    metric = db.scalar(
-        scope_metric(select(FinancialMetric).where(FinancialMetric.period == period), department)
-        .order_by(FinancialMetric.id.desc()))
+    # 多部门账号同期有多行：金额相加、比率按合计重算（metric_totals 与看板/汇总同一份实现）。
+    rows = db.scalars(scope_metric(
+        select(FinancialMetric).where(FinancialMetric.period == period), scope)).all()
+    totals = metric_totals(rows, period_order=[period])
+    metric = totals[0] if totals else None
     alerts = db.scalars(
-        scope_alert(select(FinancialAlert).where(FinancialAlert.period == period), department)
+        scope_alert(select(FinancialAlert).where(FinancialAlert.period == period), scope)
         .order_by(FinancialAlert.id)).all()
     top_departments: list[tuple[str, Decimal]] = []
     if metric:
@@ -78,7 +84,7 @@ def _collect(db: Session, period: str, department: str | None = None,
         # 报 `operator does not exist: timestamp without time zone >= character varying`。
         statement = scope_transactions(
             select(FinancialTransaction.department, FinancialTransaction.expense_amount)
-            .where(func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period), department)
+            .where(func.to_char(FinancialTransaction.transaction_date, "YYYY-MM") == period), scope)
         rows = db.execute(statement).all()
         grouped: dict[str, Decimal] = {}
         for row_department, expense in rows:
@@ -86,7 +92,7 @@ def _collect(db: Session, period: str, department: str | None = None,
             grouped[key] = grouped.get(key, Decimal("0")) + (expense or Decimal("0"))
         top_departments = sorted(grouped.items(), key=lambda item: item[1], reverse=True)[:5]
     return {"metric": metric, "alerts": alerts, "top_departments": top_departments,
-            "scope": scope_payload(department, requested=requested or None)}
+            "scope": scope_payload(scope, requested=requested)}
 
 
 def _percent(value) -> str:
@@ -109,8 +115,8 @@ def _metric_rows(metric) -> list[tuple[str, str]]:
 @router.get("/monthly", response_class=PlainTextResponse)
 def monthly_report(period: str, department: str | None = Query(None, max_length=100),
                    db: Session = Depends(get_db), user: User = Depends(current_user)):
-    department, requested = _report_scope(user, department)
-    data = _collect(db, period, department, requested)
+    scope, explicit = _report_scope(user, department)
+    data = _collect(db, period, scope, explicit)
     metric = data["metric"]
     if not metric:
         return "# 财务分析报告\n\n数据不足，无法生成报告。\n"
@@ -120,7 +126,7 @@ def monthly_report(period: str, department: str | None = Query(None, max_length=
     risk = "\n".join(f"- [{x.level}] {x.alert_type}：{x.description}" for x in alerts) or "- 该期间未触发预警。"
     metrics = "\n".join(f"- {label}：{value}" for label, value in _metric_rows(metric))
     # 受限账号的报告必须在标题下就写明范围，否则「部门 097 的费用」会被当成公司费用引用出去。
-    scope_line = "" if department is None else f"> 数据范围：仅统计「部门 {department}」的明细，不是全公司口径。\n\n"
+    scope_line = "" if scope is None else f"> 数据范围：仅统计「{scope_label(scope)}」的明细，不是全公司口径。\n\n"
     return (
         f"# {period} 财务分析报告\n\n"
         f"{scope_line}"
@@ -174,8 +180,8 @@ def _outline(data: dict, period: str) -> list[dict]:
 @router.get("/pptx/outline")
 def pptx_outline(period: str, department: str | None = Query(None, max_length=100),
                  db: Session = Depends(get_db), user: User = Depends(current_user)):
-    department, requested = _report_scope(user, department)
-    data = _collect(db, period, department, requested)
+    scope, explicit = _report_scope(user, department)
+    data = _collect(db, period, scope, explicit)
     metric = data["metric"]
     return {
         "period": period,
@@ -343,15 +349,15 @@ def _build_docx(data: dict, period: str) -> bytes:
 @router.get("/docx")
 def docx_report(period: str, department: str | None = Query(None, max_length=100),
                 db: Session = Depends(get_db), user: User = Depends(current_user)):
-    department, requested = _report_scope(user, department)
-    data = _collect(db, period, department, requested)
+    scope, explicit = _report_scope(user, department)
+    data = _collect(db, period, scope, explicit)
     payload = _build_docx(data, period)
-    tag = f" {department}" if department else ""
+    tag = f" {scope_text(scope)}" if scope else ""
     # 后缀交给 content_disposition 拼：名字里一旦带 ".docx"，ASCII 兜底就永远「合格」了
     # （".docx" 自带字母），中文名会被剥成 ` 2097-05.docx` 这种谁也认不出的样子。
     filename = f"财务分析报告 {period}{tag}"
     # ASCII 兜底名里不能带中文部门名（HTTP 头是 latin-1），部门号本身多为数字，过滤后仍可用。
-    safe_department = "".join(ch for ch in (department or "") if ch.isascii() and ch.isalnum())
+    safe_department = "".join(ch for ch in scope_text(scope) if ch.isascii() and ch.isalnum()) if scope else ""
     fallback = f"financial-report-{period}" + (f"-{safe_department}" if safe_department else "")
     return Response(
         content=payload,
@@ -363,11 +369,12 @@ def docx_report(period: str, department: str | None = Query(None, max_length=100
 @router.get("/pptx")
 def pptx_report(period: str, department: str | None = Query(None, max_length=100),
                 db: Session = Depends(get_db), user: User = Depends(current_user)):
-    department, requested = _report_scope(user, department)
-    data = _collect(db, period, department, requested)
+    scope, explicit = _report_scope(user, department)
+    data = _collect(db, period, scope, explicit)
     payload = _build_ppt(data, period)
-    # 指定口径时文件名带上部门，避免「部门 097 报告」被当成公司报告发出去。
-    tag = f"-{department}" if department else ""
+    # 指定口径时文件名带上部门，避免「部门 097 报告」被当成公司报告发出去；
+    # 多部门账号用 scope_slug（018-097），中文/特殊字符不会进文件名。
+    tag = f"-{scope_slug(scope)}" if scope else ""
     filename = f"financial-report-{period}{tag}.pptx"
     return Response(
         content=payload,

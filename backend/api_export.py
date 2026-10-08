@@ -25,8 +25,8 @@ from backend.db import get_db
 from backend.files import content_disposition
 from backend.limits import export_quota
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (resolve_requested_scope, scope_alert, scope_metric, scope_label, scope_of,
-                           scope_payload, scope_transactions)
+from backend.scope import (Scope, resolve_requested_scope, row_label, scope_alert, scope_metric,
+                           scope_of, scope_payload, scope_slug, scope_text, scope_transactions)
 
 router = APIRouter(prefix="/api/v1/export", tags=["export"])
 
@@ -35,12 +35,12 @@ EXPORT_LIMIT = 20000
 PERIOD_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
 
 
-def _resolve(user: User, department: str | None) -> tuple[str | None, str | None]:
+def _resolve(user: User, department: str | None) -> tuple[Scope, str | None]:
     scope, violation = resolve_requested_scope(user, department)
     return scope, violation
 
 
-def _guard(user: User, department: str | None) -> str | None:
+def _guard(user: User, department: str | None) -> Scope:
     scope, violation = _resolve(user, department)
     if violation:
         raise HTTPException(403, violation)
@@ -135,10 +135,10 @@ def _respond(header: list[str], rows: list[list], filename: str, export_format: 
 
 
 def _log_export(db: Session, user: User, request: Request, kind: str, rows: int,
-                scope: str | None, export_format: str, truncated: bool) -> None:
+                scope: Scope, export_format: str, truncated: bool) -> None:
     """导出也留痕：数据外带是审计最关心的事之一，但只记条数与口径，不记导出的内容。"""
     audit.record(db, user, "data.export", target_type="export", target_id=kind,
-                 detail={"kind": kind, "rows": rows, "scope": scope or "全部部门",
+                 detail={"kind": kind, "rows": rows, "scope": scope_text(scope),
                          "format": export_format, "truncated": truncated}, request=request)
     db.commit()
 
@@ -176,7 +176,7 @@ def export_transactions(request: Request, period: str | None = Query(None, patte
     tag = _range_tag(period, None, None)
     truncated = total > len(rows)
     _log_export(db, user, request, "transactions", len(body), scope, export_format, truncated)
-    return _respond(header, body, f"transactions-{tag}-{scope or 'all'}", export_format, truncated)
+    return _respond(header, body, f"transactions-{tag}-{scope_slug(scope)}", export_format, truncated)
 
 
 @router.get("/metrics")
@@ -197,12 +197,12 @@ def export_metrics(request: Request,
         condition = condition.where(FinancialMetric.period <= period_to)
     rows = db.scalars(condition.order_by(FinancialMetric.period)).all()
     header = ["期间", "口径", "收入金额", "成本金额", "费用金额", "毛利金额", "净利润", "毛利率", "净利率"]
-    body = [[x.period, scope_label(x.department), str(x.revenue_amount or 0), str(x.cost_amount or 0),
+    body = [[x.period, row_label(x.department), str(x.revenue_amount or 0), str(x.cost_amount or 0),
              str(x.expense_amount or 0), str(x.gross_profit_amount or 0), str(x.net_profit_amount or 0),
              str(x.gross_profit_ratio or 0), str(x.net_profit_ratio or 0)] for x in rows]
     tag = _range_tag(None, period_from, period_to)
     _log_export(db, user, request, "metrics", len(body), scope, export_format, False)
-    return _respond(header, body, f"metrics-{tag}-{scope or 'all'}", export_format, False)
+    return _respond(header, body, f"metrics-{tag}-{scope_slug(scope)}", export_format, False)
 
 
 @router.get("/alerts")
@@ -234,13 +234,13 @@ def export_alerts(request: Request, period: str | None = Query(None, pattern=PER
     rows = db.scalars(condition.order_by(FinancialAlert.period.desc(), FinancialAlert.id.desc())
                       .limit(EXPORT_LIMIT)).all()
     header = ["期间", "口径", "预警类型", "描述", "级别", "指标", "当前值", "阈值", "需人工复核", "预警 id"]
-    body = [[x.period, scope_label(x.department), x.alert_type, x.description, x.level, x.metric_name,
+    body = [[x.period, row_label(x.department), x.alert_type, x.description, x.level, x.metric_name,
              str(x.current_value or 0), str(x.threshold_value or 0), "是" if x.needs_human_review else "否", x.id]
             for x in rows]
     tag = _range_tag(period, period_from, period_to)
     truncated = total > len(rows)
     _log_export(db, user, request, "alerts", len(body), scope, export_format, truncated)
-    return _respond(header, body, f"alerts-{tag}-{scope or 'all'}", export_format, truncated)
+    return _respond(header, body, f"alerts-{tag}-{scope_slug(scope)}", export_format, truncated)
 
 
 @router.get("/scope")

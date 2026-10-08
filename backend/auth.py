@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from backend.db import get_db
 from backend.models import User
+from backend.scope import departments_of
 from backend.config import get_settings
 from backend.ratelimit import get_login_limiter
 from backend import audit
@@ -93,31 +94,46 @@ def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_
 
 
 class DepartmentInput(BaseModel):
+    # 单值字段保留（老客户端 PATCH 的就是它）；多部门用列表，两个都给时以列表为准。
     department: str | None = Field(default=None, max_length=100)
+    departments: list[str] | None = Field(default=None, max_length=20)
+
+
+def _profile(user: User) -> dict:
+    """账号档案：部门列表是权威值，`department` 只是给老前端的单值回落。"""
+    departments = list(departments_of(user))
+    return {"id": user.id, "username": user.username,
+            "department": departments[0] if departments else None,
+            "departments": departments,
+            "unrestricted": not departments}
 
 
 @router.get("/me")
 def read_me(user: User = Depends(current_user)) -> dict:
-    return {"id": user.id, "username": user.username, "department": user.department,
-            "unrestricted": not user.department}
+    return _profile(user)
 
 
 @router.patch("/me")
 def update_me(payload: DepartmentInput, request: Request, user: User = Depends(current_user),
               db: Session = Depends(get_db)) -> dict:
-    """设置/清空自己的部门。留空表示不限制部门（财务管理员口径）。
+    """设置/清空自己的部门（可以一次给多个）。留空表示不限制部门（财务管理员口径）。
 
     刻意不让前端用请求头自述部门：那样任何登录用户都能伪造 finance-admin 看到全部资料。
     """
-    department = (payload.department or "").strip() or None
-    previous = user.department
-    user.department = department
+    if payload.departments is not None:
+        wanted = [item.strip() for item in payload.departments if (item or "").strip()]
+    else:
+        single = (payload.department or "").strip()
+        wanted = [single] if single else []
+    previous = "、".join(departments_of(user)) or "不受限"
+    user.departments = wanted or None
+    # 单值列同步成第一个部门，只用于展示/审计文案（读权限一律走 scope_of）。
+    user.department = wanted[0] if wanted else None
     db.add(user)
     # 改自己的部门 = 改自己的可见范围，必须留痕（旧值 → 新值）
     audit.record(db, user, "user.department_self", target_type="user", target_id=user.id,
-                 detail={"from": previous or "不受限", "to": department or "不受限", "username": user.username},
+                 detail={"from": previous, "to": "、".join(wanted) or "不受限", "username": user.username},
                  request=request)
     db.commit()
     db.refresh(user)
-    return {"id": user.id, "username": user.username, "department": user.department,
-            "unrestricted": not user.department}
+    return _profile(user)

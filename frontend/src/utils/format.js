@@ -71,3 +71,29 @@ export function periodsText(batch) {
   const head = periods.slice(0, 3).join('、')
   return periods.length > 3 ? `${head} 等 ${periods.length} 期` : periods.join('、')
 }
+
+/**
+ * 一个账号可以属于多个部门（并集）：输入框里用「、」「,」「，」「;」或空格分隔。
+ *
+ * 后端 `DepartmentInput.departments` 限 20 个，这里同步截断，避免提交后才报 422；
+ * 重复项要去掉（保序）——同一个部门写两遍会让 scope 元组出现重复元素，
+ * 后端 `_totals_by_months` 用 `len(scope)` 当每月的期望行数，重复会让它误判数据不完整。
+ */
+export const MAX_DEPARTMENTS = 20
+
+export function parseDepartments(input) {
+  const raw = Array.isArray(input) ? input : String(input ?? '').split(/[、,，;；\s]+/)
+  const seen = []
+  for (const item of raw) {
+    const name = String(item ?? '').trim()
+    if (!name || seen.includes(name)) continue
+    seen.push(name)
+    if (seen.length >= MAX_DEPARTMENTS) break
+  }
+  return seen
+}
+
+/** 展示用：`['018', '097']` → `018、097`；空值 → 空串（由调用方决定占位文案）。 */
+export function departmentsText(value) {
+  return parseDepartments(value).join('、')
+}

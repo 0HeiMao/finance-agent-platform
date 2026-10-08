@@ -33,6 +33,7 @@ from backend.db import get_db
 from backend.models import AlertRule, BackgroundJob, FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.observability import snapshot
 from backend.rag.pgvector_store import DocumentChunk
+from backend.scope import departments_of
 
 logger = logging.getLogger("finance-api")
 
@@ -52,7 +53,7 @@ METRIC_LABELS = {
 
 
 def is_admin(user: User) -> bool:
-    return not (user.department or "").strip()
+    return not departments_of(user)
 
 
 def admin_user(user: User = Depends(current_user)) -> User:
@@ -62,8 +63,10 @@ def admin_user(user: User = Depends(current_user)) -> User:
 
 
 class DepartmentUpdate(BaseModel):
-    # 空字符串等同于"清空部门"（升级为管理员），所以不做 min_length
+    # 空字符串等同于"清空部门"（升级为管理员），所以不做 min_length。
+    # 多部门用 `departments`；只给 `department` 时按「一个部门」处理（老前端兼容）。
     department: str = Field(default="", max_length=100)
+    departments: list[str] | None = Field(default=None, max_length=20)
 
 
 class BatchRevertRequest(BaseModel):
@@ -75,6 +78,16 @@ def _count(db: Session, model, *criteria) -> int:
     if criteria:
         statement = statement.where(*criteria)
     return db.scalar(statement) or 0
+
+
+def _blank_departments():
+    """「不受部门限制」的行条件：多部门列（JSONB 数组）与老单值列都为空。
+
+    `jsonb_array_length` 对 NULL / 非数组返回 NULL，coalesce 成 0 后与 0 比较，
+    所以 `departments IS NULL`、`departments = []`、以及「两者都空」都能覆盖到。
+    """
+    return ((func.coalesce(func.jsonb_array_length(User.departments), 0) == 0)
+            & (User.department.is_(None) | (func.trim(User.department) == "")))
 
 
 def _periods_of(db: Session, column_date) -> list[str]:
@@ -228,27 +241,37 @@ def list_users(
     if query:
         condition = condition.where(User.username.ilike(f"%{query}%"))
     if department is not None:
-        condition = condition.where(User.department == (department or None))
+        # 多部门账号在 `departments`（JSONB 数组）里，单值列只是第一个部门的回落：
+        # 只比单值列会让「看部门 018 的账号」漏掉「018+097」这种账号。
+        if department:
+            condition = condition.where(
+                (User.department == department) | User.departments.contains([department]))
+        else:
+            condition = condition.where(User.department.is_(None))
     if unrestricted is not None:
-        # 「不受部门限制」= department 为空，与 is_admin() 同一口径；
-        # 用或上空白字符串是为了兼容历史上写成空串的行。
-        blank = User.department.is_(None) | (func.trim(User.department) == "")
+        # 「不受部门限制」= 部门列表为空，与 is_admin() 同一口径；
+        # 用或上空白字符串/空数组是为了兼容历史上写成空串或空列表的行。
+        blank = _blank_departments()
         condition = condition.where(blank if unrestricted else ~blank)
     total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
     users = db.scalars(
         condition.order_by(User.id).limit(limit).offset(row_offset)).all()
-    # 筛选下拉的选项由后端给：前端自己拿一页数据去凑选项，翻页后就自相矛盾了
-    blank = User.department.is_(None) | (func.trim(User.department) == "")
-    departments = [row[0] for row in db.execute(
-        select(func.distinct(User.department))
-        .where(~blank)
-        .order_by(User.department)).all() if row[0]]
+    # 筛选下拉的选项由后端给：前端自己拿一页数据去凑选项，翻页后就自相矛盾了。
+    # 选项从账号记录里扫（而不是 distinct 单值列），这样「018+097」这种多部门账号的
+    # 两个部门都会出现在下拉里；账号数量是「几个到几百个」，扫一遍比 lateral join 好懂。
+    known: list[str] = []
+    for row in db.scalars(select(User).order_by(User.id)).all():
+        for name in departments_of(row):
+            if name not in known:
+                known.append(name)
+    blank = _blank_departments()
     return {
         "data": [
             {
                 "id": user.id,
                 "username": user.username,
                 "department": user.department or "",
+                "departments": list(departments_of(user)),
                 "unrestricted": is_admin(user),
                 "created_at": user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else None,
                 "is_self": user.id == me.id,
@@ -258,7 +281,7 @@ def list_users(
         "total": total,
         "offset": row_offset,
         "limit": limit,
-        "departments": departments,
+        "departments": known,
         "unrestricted_count": db.scalar(
             select(func.count()).select_from(User).where(blank)) or 0,
         "me": {"id": me.id, "username": me.username},
@@ -283,17 +306,25 @@ def update_user(
     me: User = Depends(admin_user),
 ):
     target = _target_user(db, user_id, me)
-    previous = target.department
-    target.department = payload.department.strip() or None
+    previous = "、".join(departments_of(target)) or "不受限"
+    if payload.departments is not None:
+        wanted = [item.strip() for item in payload.departments if (item or "").strip()]
+    else:
+        single = payload.department.strip()
+        wanted = [single] if single else []
+    target.departments = wanted or None
+    # 单值列同步成第一个部门：老前端的「部门」列与审计文案读的都是它（权限只看 departments）。
+    target.department = wanted[0] if wanted else None
     audit.record(db, me, "user.department_change", target_type="user", target_id=target.id,
-                 detail={"username": target.username, "from": previous or "不受限",
-                         "to": target.department or "不受限"}, request=request)
+                 detail={"username": target.username, "from": previous,
+                         "to": "、".join(wanted) or "不受限"}, request=request)
     db.commit()
     db.refresh(target)
     return {
         "id": target.id,
         "username": target.username,
         "department": target.department or "",
+        "departments": list(departments_of(target)),
         "unrestricted": is_admin(target),
     }
 
@@ -302,7 +333,7 @@ def update_user(
 def delete_user(user_id: int, request: Request, db: Session = Depends(get_db), me: User = Depends(admin_user)):
     target = _target_user(db, user_id, me)
     username = target.username
-    department = target.department
+    department = "、".join(departments_of(target))
     # 先记录再删：删掉以后 target.id 还在这个 Python 对象里，但写进 detail 的必须是快照
     audit.record(db, me, "user.delete", target_type="user", target_id=target.id,
                  detail={"username": username, "department": department or "不受限"}, request=request)
@@ -373,12 +404,15 @@ def list_departments(db: Session = Depends(get_db), me: User = Depends(admin_use
     for user in users:
         payload = {
             "id": user.id, "username": user.username, "department": user.department or "",
+            "departments": list(departments_of(user)),
             "unrestricted": is_admin(user), "is_self": user.id == me.id,
         }
         if payload["unrestricted"]:
             unrestricted.append(payload)
         else:
-            slot(user.department)["users"].append(payload)
+            # 多部门账号会出现在它每一个部门下（每行都带着完整的部门列表，前端只展示一行归属）。
+            for name in payload["departments"]:
+                slot(name)["users"].append(payload)
 
     rows = []
     for item in departments.values():
@@ -402,7 +436,8 @@ def list_departments(db: Session = Depends(get_db), me: User = Depends(admin_use
             "unrestricted_users": len(unrestricted),
             "total_users": len(users),
         },
-        "me": {"id": me.id, "username": me.username, "department": me.department or ""},
+        "me": {"id": me.id, "username": me.username, "department": me.department or "",
+               "departments": list(departments_of(me))},
     }
 
 

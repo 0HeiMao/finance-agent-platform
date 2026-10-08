@@ -38,6 +38,9 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("financial_alerts", "reviewed_at", "TIMESTAMP WITH TIME ZONE"),
     # 预警规则可配置
     ("alert_rules", "require_metric", "VARCHAR(100)"),
+    # 多部门账号：权威值是一个 JSON 数组，老的单值列 department 作为回落与展示保留。
+    # 已有账号不需要数据迁移：departments 为 NULL 时 scope_of() 会自动回落到 department。
+    ("users", "departments", "JSONB"),
 ]
 
 

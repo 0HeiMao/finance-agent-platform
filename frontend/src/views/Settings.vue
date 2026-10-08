@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
+import { departmentsText, parseDepartments } from '../utils/format'
 
 const sidebarOpen = ref(false)
 const status = ref(null)
@@ -17,7 +18,7 @@ async function load() {
   try {
     const r = await apiFetch('/system/status')
     status.value = await r.json()
-    department.value = status.value.me?.department || ''
+    department.value = departmentsText(status.value.me?.departments || status.value.me?.department)
   } catch (e) {
     error.value = `读取系统状态失败：${e.message}`
     status.value = null
@@ -33,13 +34,13 @@ async function saveDepartment() {
   try {
     const r = await apiFetch('/auth/me', {
       method: 'PATCH',
-      body: JSON.stringify({ department: department.value }),
+      body: JSON.stringify({ departments: parseDepartments(department.value) }),
     })
     const me = await r.json()
     status.value.me = me
-    saved.value = me.department
-      ? `已保存：只检索「${me.department}」与公共片段。`
-      : '已清空部门：当前账号不受部门限制（等同于财务管理员）。'
+    saved.value = me.unrestricted
+      ? '已清空部门：当前账号不受部门限制（等同于财务管理员）。'
+      : `已保存：只检索「${departmentsText(me.departments)}」与公共片段。`
   } catch (e) {
     error.value = `保存失败：${e.message}`
   } finally {
@@ -104,15 +105,16 @@ onMounted(load)
             留空表示不受限制（财务管理员）；填写后<strong>财务数据与知识库都只按本部门收窄</strong>：
             看板/分析/报告/Agent 只统计本部门明细（读该部门的指标与预警口径行），知识库检索只返回
             「本部门 + 未标注部门」的片段，管理接口一律 403。
+            一个账号可以填多个部门（用「、」分隔），看到的是这些部门的<strong>并集</strong>（金额相加、比率按合计重算）。
             部门由服务端记录，不接受请求头自述，避免伪造提权。
           </p>
           <div class="upload-box">
-            <input v-model.trim="department" class="select" maxlength="100" placeholder="例如：财务部（留空=不受限）">
+            <input v-model.trim="department" class="select" maxlength="500" placeholder="例如：018、097（多个用「、」分隔；留空=不受限）">
             <button class="btn primary" :disabled="saving" @click="saveDepartment">{{ saving ? '保存中…' : '保存' }}</button>
           </div>
           <p class="muted">
             当前：<strong>{{ status.me.username }}</strong>（id {{ status.me.id }}）·
-            {{ status.me.unrestricted ? '不受部门限制' : `限定 ${status.me.department}` }}
+            {{ status.me.unrestricted ? '不受部门限制' : `限定 ${departmentsText(status.me.departments)}` }}
           </p>
         </section>
 

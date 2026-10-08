@@ -25,8 +25,8 @@ Authorization: Bearer <access_token>
 | --- | --- | --- |
 | POST | `/auth/register` | 请求 `{"username","password"}`；用户名重复返回 409 |
 | POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type"}` |
-| GET | `/auth/me` | 返回 `{id,username,department,unrestricted}`；`department` 留空表示不受限（财务管理员） |
-| PATCH | `/auth/me` | 请求 `{"department": "…"}`（≤100 字，空串等于清空）；部门只由服务端记录 **`User.department`** 决定 |
+| GET | `/auth/me` | 返回 `{id,username,department,departments,unrestricted}`；**权威值是数组 `departments`**，`department` 只是它的第一个元素（回落用），`departments` 为空表示不受限（财务管理员） |
+| PATCH | `/auth/me` | 请求 `{"departments": ["018","097"]}`（字符串形式 `{"department":"018"}` 仍兼容，≤100 字；`[]` 与空串等于清空）；部门只由服务端记录 **`User.departments`** 决定，最多 20 个 |
 
 登录有**滑动窗口限流**（默认 10 次 / 300 秒，按「用户名 + 来源 IP」分桶，配置项 `LOGIN_MAX_ATTEMPTS` /
 `LOGIN_WINDOW_SECONDS`）：超过后即使密码正确也返回
@@ -79,27 +79,36 @@ Retry-After: 42
 
 | 函数 | 行为 |
 | --- | --- |
-| `scope_of(user)` | `(user.department or "").strip() or None`；None = 不受限（全公司） |
-| `scope_metric(stmt, d)` / `scope_alert(stmt, d)` | `d` 为 None 时加 `department IS NULL`，否则 `department = d` |
-| `scope_transactions(stmt, d)` | None 时不过滤；有值时 `FinancialTransaction.department = d`（部门为空的行不属于任何部门） |
-| `scope_payload(d)` | `{department,label,unrestricted,note}`，随看板/分析/报告/Agent/系统状态响应一起返回 |
-| `resolve_requested_scope(user, requested)` | 解析请求里的 `department`：不受限账号可指定任意部门；受限账号只允许自己的部门，其他值返回违规说明（端点转成 403） |
+| `departments_of(user)` | 读 `User.departments`（JSONB 数组），为空时回落到单值列 `user.department`；返回去重保序的元组 |
+| `scope_of(user)` | `tuple[str, ...] | None`；**空元组与 None 都表示不受限**（全公司），一个有值的元组 = 只看这几个部门 |
+| `scope_metric(stmt, scope)` / `scope_alert(stmt, scope)` | `scope` 为 None 时加 `department IS NULL`，单元素退化 `department = d`，多元素 `department IN (…)` |
+| `scope_transactions(stmt, scope)` | None 时不过滤；有值时 `FinancialTransaction.department IN (…)`（部门为空的行不属于任何部门） |
+| `in_scope(scope, department)` | 逐行判断（预警这类已经取出来的对象用），None 恒真 |
+| `metric_totals(rows, period_order=…)` | 按期间聚合：**单行期间沿用库里存的比率**，多行期间金额相加、比率按相加后的金额重算（比率不能相加） |
+| `scope_payload(scope, requested=…)` | `{department,departments,label,unrestricted,note}`，随看板/分析/报告/Agent/系统状态响应一起返回 |
+| `scope_label(scope)` / `scope_slug(scope)` / `scope_text(scope)` / `row_label(department)` | 文案与文件名的四种写法：「部门 018、097 等 N 个部门」/ 文件名的 `018-097` / 审计用的 `018、097` / 数据行级的「部门 097」。**`scope_label` 收的是元组，传字符串会按字符长度渲染成「部门 097 等 3 个部门」** |
+| `resolve_requested_scope(user, requested)` | 解析请求里的 `department`：不受限账号可指定任意部门；受限账号只允许在自己绑定的部门里**收窄**，其他值返回违规说明（端点转成 403） |
+
+> 多部门是「并集口径」而不是「取第一个部门」：多部门账号的看板/汇总/报告/Agent 证据/预测走的是同一份
+> `metric_totals`，所以四个页面同一个数。跨期间的完整性判断用「每月行数 == 范围内部门数」
+> （`_totals_by_months`），用 distinct 期间数会把缺一期数据当成完整、环比直接算错。
 
 ### 查看某个部门的口径（管理员切换视角）
 
 `GET /dashboard`、`/analysis/summary`、`/analysis/alerts`、`/analysis/alerts/all`、`/reports/monthly`、
 `/reports/docx`、`/reports/pptx*`、`/ai/agent/chat/stream`、`/export/*` 都接受可选的 `?department=<名称>`：
 
-- **不受限账号**（`User.department` 为空）：可以指定任意部门，响应里的 `scope` 会多一个 `"requested": true`
+- **不受限账号**（`departments` 为空）：可以指定任意部门，响应里的 `scope` 会多一个 `"requested": true`
   并把 `note` 换成「正在按「部门 X」口径查看…不是全公司口径。」——用于区分「本来就不受限」与「主动切到了某部门」。
-- **受限账号**：只能不带或填自己的部门；填别人的部门一律 **403** `{"detail":"当前账号的数据范围是「部门 A」，不能查看「部门 B」"}`，
+- **受限账号**：只能不带参数（＝自己绑定的全部部门，并集）或填**自己范围内的一个**部门收窄；
+  填别人的部门一律 **403** `{"detail":"当前账号的数据范围是「部门 A、B」，不能查看「部门 C」"}`，
   而不是静默回落到自己的范围（静默回落会让人以为自己在看别人的数据）。
 - 注意 `scope.unrestricted` 描述的是**这次响应覆盖的范围**是否为全公司，不是账号属性；
   「账号本身不受限吗」看 `/auth/me` 的 `unrestricted`（前端口径下拉也用它决定是否显示）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/analysis/departments` | 口径下拉的选项：`{"scope":…,"departments":[{"name":"097","label":"部门 097","transactions":1523}],"switchable":true}`；受限账号只会拿到自己那一个且 `switchable:false` |
+| GET | `/analysis/departments` | 口径下拉的选项：`{"scope":…,"departments":[{"name":"097","label":"部门 097","transactions":1523}],"switchable":true}`；受限账号只会拿到自己绑定的那几个，`switchable` 只在**绑定数 > 1**（可收窄）或不受限时为 `true` |
 
 受限账号拿别人的预警 id 调 `/analysis/alerts/{id}/transactions` 会得到 HTTP 200 + `{"data":[],"message":"该预警不在当前账号的数据范围内"}`（不泄漏"这条预警存在"以外的信息）。
 

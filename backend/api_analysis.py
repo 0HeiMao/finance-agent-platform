@@ -9,17 +9,18 @@ from backend.auth import current_user
 from backend.alert_rules import ensure_rules, evaluate, metric_values
 from backend.db import get_db
 from backend.models import AlertRule, FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (resolve_requested_scope, scope_alert, scope_metric, scope_of,
-                           scope_payload, scope_transactions)
+from backend.scope import (Scope, in_scope, metric_totals, resolve_requested_scope, scope_alert,
+                           scope_label, scope_metric, scope_of, scope_payload, scope_transactions)
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
 
-def _scoped(user: User, requested: str | None) -> tuple[str | None, dict, str | None]:
+def _scoped(user: User, requested: str | None) -> tuple[Scope, dict, str | None]:
     """解析部门参数，返回 (生效口径, 提示条载荷, 越权说明)。"""
-    department, violation = resolve_requested_scope(user, requested)
-    explicit = department if (department and scope_of(user) is None) else None
-    return department, scope_payload(department, requested=explicit), violation
+    scope, violation = resolve_requested_scope(user, requested)
+    # 只有「本身不受限的管理员主动切到某个部门」才需要在页面上说明这是切过来的视角。
+    explicit = scope[0] if (scope and len(scope) == 1 and scope_of(user) is None) else None
+    return scope, scope_payload(scope, requested=explicit), violation
 
 
 # 处理闭环的状态机：pending（待处理）/ confirmed（已确认，确实异常）/ false_positive（误报）/
@@ -51,13 +52,13 @@ def _alert_json(row: FinancialAlert) -> dict:
 
 
 def _find_alert(db: Session, alert_id: int, user: User) -> FinancialAlert:
-    """取预警并做口径校验：受限账号只能动本部门的预警（越权返回 404 语义之外的 403）。"""
+    """取预警并做口径校验：受限账号只能动自己范围内的预警（越权返回 404 语义之外的 403）。"""
     row = db.get(FinancialAlert, alert_id)
     if row is None:
         raise HTTPException(404, "预警不存在")
     own = scope_of(user)
-    if own and (row.department or "") != own:
-        raise HTTPException(403, f"当前账号的数据范围是「部门 {own}」，不能处理「{row.department or '全公司'}」的预警")
+    if own and not in_scope(own, row.department or None):
+        raise HTTPException(403, f"当前账号的数据范围是「{scope_label(own)}」，不能处理「{row.department or '全公司'}」的预警")
     return row
 
 
@@ -273,39 +274,50 @@ def _department_items(db: Session, names: set[str]) -> list[dict]:
 def departments(db: Session = Depends(get_db), user: User = Depends(current_user)):
     """可切换的数据口径列表（看板/分析页的「查看口径」下拉）。
 
-    不受限账号拿到全部部门，受限账号只拿到自己那一个——避免受限账号从下拉里
+    不受限账号拿到全部部门，受限账号只拿到自己那几个——避免受限账号从下拉里
     看到别的部门名字，也避免它误以为能切过去（后端另有 403 兜底）。
+
+    `switchable` 表示「这个账号能不能自己换口径」：不受限账号当然可以；**绑定多个部门的账号
+    也可以**——它能在自己那几个部门之间收窄（`resolve_requested_scope` 允许，越界仍然 403）。
+    绑定单个部门的账号没什么可换的，前端就不显示下拉，只显示当前口径。
     """
     own = scope_of(user)
     if own:
-        names = {own}
+        names = set(own)
     else:
         found = {(row or "").strip() for row in db.scalars(select(FinancialTransaction.department).distinct()).all()}
         found |= {(row or "").strip() for row in db.scalars(select(FinancialMetric.department).distinct()).all()}
         found |= {(row or "").strip() for row in db.scalars(select(FinancialAlert.department).distinct()).all()}
         names = {name for name in found if name}
-    return {"scope": scope_payload(own), "departments": _department_items(db, names), "switchable": own is None}
+    return {"scope": scope_payload(own), "departments": _department_items(db, names),
+            "switchable": own is None or len(own) > 1}
 
 
 @router.get("/alerts/{alert_id}/transactions")
 def alert_transactions(alert_id: int, limit: int = Query(200, ge=1, le=2000), row_offset: int = Query(0, ge=0, alias="offset"),
                        db: Session = Depends(get_db), user: User = Depends(current_user)):
-    department = scope_of(user)
+    scope = scope_of(user)
     alert = db.get(FinancialAlert, alert_id)
     if not alert: return {"data": [], "message": "预警不存在"}
-    # 预警本身也带口径：受限账号拿到全公司预警的 id 时要挡住，否则等于绕开范围看明细。
-    if (alert.department or None) != (department or None):
-        return {"data": [], "message": "该预警不在当前账号的数据范围内", "scope": scope_payload(department)}
+    # 预警本身也带口径：受限账号拿到全公司（或别的部门）预警的 id 时要挡住，否则等于绕开范围看明细。
+    if not in_scope(scope, alert.department or None):
+        return {"data": [], "message": "该预警不在当前账号的数据范围内", "scope": scope_payload(scope)}
+    # 明细按「这条预警自己的部门」过滤，而不是按账号范围：多部门账号点开部门 A 的预警时，
+    # 不该把部门 B 的同期明细混进来。
+    when = alert.department or None
     year, month = map(int, alert.period.split("-"))
-    condition = scope_transactions(select(FinancialTransaction).where(extract("year", FinancialTransaction.transaction_date) == year, extract("month", FinancialTransaction.transaction_date) == month), department)
+    condition = scope_transactions(select(FinancialTransaction).where(extract("year", FinancialTransaction.transaction_date) == year, extract("month", FinancialTransaction.transaction_date) == month), (when,) if when else None)
     total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
     rows = db.scalars(condition.order_by(FinancialTransaction.transaction_date.desc(), FinancialTransaction.id.desc()).limit(limit).offset(row_offset)).all()
-    return {"alert": _alert_json(alert), "scope": scope_payload(department), "total": total, "offset": row_offset, "limit": limit, "data": [{"id": x.id, "date": x.transaction_date.strftime("%Y-%m-%d"), "account": x.account_name, "department": x.department, "revenue": float(x.revenue_amount or 0), "cost": float(x.cost_amount or 0), "expense": float(x.expense_amount or 0), "description": x.description} for x in rows]}
+    return {"alert": _alert_json(alert), "scope": scope_payload(scope), "total": total, "offset": row_offset, "limit": limit, "data": [{"id": x.id, "date": x.transaction_date.strftime("%Y-%m-%d"), "account": x.account_name, "department": x.department, "revenue": float(x.revenue_amount or 0), "cost": float(x.cost_amount or 0), "expense": float(x.expense_amount or 0), "description": x.description} for x in rows]}
 
 @router.get("/summary")
 def summary(period: str, department: str | None = Query(None, max_length=100), db: Session = Depends(get_db), user: User = Depends(current_user)):
     scope, payload, violation = _scoped(user, department)
     if violation: raise HTTPException(403, violation)
-    metric = db.scalar(scope_metric(select(FinancialMetric).where(FinancialMetric.period == period), scope).order_by(FinancialMetric.id.desc()))
-    if not metric: return {"has_data": False, "revenue_amount": 0, "cost_amount": 0, "net_profit_amount": 0, "net_profit_ratio": 0, "scope": payload}
-    return {"has_data": True, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "net_profit_amount": float(metric.net_profit_amount), "net_profit_ratio": float(metric.net_profit_ratio), "department": metric.department or "", "scope": payload}
+    rows = db.scalars(scope_metric(select(FinancialMetric).where(FinancialMetric.period == period), scope)).all()
+    # 多部门账号同期有多行：金额相加、比率按相加后的金额重算（不能把比率加起来）。
+    totals = metric_totals(rows, period_order=[period])
+    if not totals: return {"has_data": False, "revenue_amount": 0, "cost_amount": 0, "net_profit_amount": 0, "net_profit_ratio": 0, "scope": payload}
+    metric = totals[0]
+    return {"has_data": True, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "net_profit_amount": float(metric.net_profit_amount), "net_profit_ratio": float(metric.net_profit_ratio), "department": metric.department or "", "departments": list(metric.departments), "scope": payload}

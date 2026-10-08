@@ -5,6 +5,7 @@ import AgentChat from '../components/AgentChat.vue'
 import DataScopeNotice from '../components/DataScopeNotice.vue'
 import ScopeSwitcher from '../components/ScopeSwitcher.vue'
 import { currentUser, loadCurrentUser } from '../api/session'
+import { departmentsText } from '../utils/format'
 
 const sidebarOpen = ref(false)
 const user = currentUser()
@@ -15,11 +16,15 @@ onMounted(loadCurrentUser)
 const scope = computed(() => {
   const me = user.value
   if (!me || me.unrestricted) return null
+  const names = departmentsText(me.departments) || me.department || ''
+  const multi = names.includes('、')
   return {
-    department: me.department,
-    label: `部门 ${me.department}`,
+    department: names,
+    label: multi ? `部门 ${names}（${names.split('、').length} 个部门的并集）` : `部门 ${names}`,
     unrestricted: false,
-    note: '当前账号只统计本部门明细，回答里的金额不是全公司口径。',
+    note: multi
+      ? '当前账号统计的是这几个部门的并集（金额相加、比率按合计重算），回答里的金额不是全公司口径。'
+      : '当前账号只统计本部门明细，回答里的金额不是全公司口径。',
   }
 })
 

@@ -10,8 +10,14 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    # 部门可见性：留空 = 不受部门限制（财务管理员）；填了值 = 只看本部门 + 公共资料。
-    # 由用户自己通过 PATCH /api/v1/auth/me 维护，不采信请求头里的自述部门。
+    # 部门可见性（多部门）：`departments` 是权威值，留空 = 不受部门限制（财务管理员）；
+    # 填了部门列表 = 只看这些部门的明细与据此重算的指标、预警（几本部门账相加），
+    # 知识库则是「这些部门 + 没标部门的公共资料」。由管理员在 /admin/users 维护，
+    # 不采信请求头里的自述部门。
+    departments: Mapped[list | None] = mapped_column(JSONB)
+    # 单值列保留给老客户端与导出/审计里的展示（口径文案只有一行），语义 = 第一个部门。
+    # 读权限**不要**用它，一律走 backend/scope.py 的 scope_of()（它会优先读 departments，
+    # 列表为空时回落到这一列，所以多部门上线前建的账号行为不变）。
     department: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

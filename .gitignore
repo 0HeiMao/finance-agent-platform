@@ -17,6 +17,8 @@ torchinductor_*/
 # 前端依赖与构建产物
 node_modules/
 frontend/dist/
+# 本机跑 `npm run build` 时把 TEMP/TMP 指到工作区里，绕开受限环境对系统临时目录的写入拦截
+frontend/.build-tmp/
 
 # 编辑器/IDE 的本地工程文件
 .idea/
