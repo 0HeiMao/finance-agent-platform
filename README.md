@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十七个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十八个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下十八个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十九个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -113,6 +113,8 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_metrics_logs.py` | Prometheus 指标与结构化日志 31 项：`/metrics` 匿名 200 且是 Prometheus 文本（桶单调不减、`le="+Inf"` 恒等于 `_count`、指标名全带 `finance_` 前缀）、**与活库对账**（`finance_background_jobs` 总数 == `/admin/jobs` 的 `total`、`finance_alerts` == `/admin/overview` 的 `counts.alert_rows`、`finance_db_up` = 1）、计数真跟流量走（连点三次 `/health` 正好 +3；两个不同 id 只长一条 `{row_id}` 序列且 body 里没有 `/123` 这种字面量；404 归 `unmatched`）、**`/metrics` 不在 `/openapi.json` 的 paths 里**（`include_in_schema=False`，否则加一个指标契约就飘）、gzip 网线字节 11360 → 1228 且**摘掉 `/metrics` 自己那条自增序列**之后与 `identity` 逐字节相等、`X-Request-ID` 回显且后端文本日志里那一次请求同时带 path/method/status/duration_ms；另起两个短命 uvicorn 验配置面：`LOG_FORMAT=json` + `METRICS_TOKEN` + `SLOW_PATH_MS=1`（无 token 401、带 token 200、每条日志都是合法单行 JSON、慢接口告警也是 JSON 且字段真在 JSON 里）与 `METRICS_ENABLED=false`（`/metrics` 404 而 `/api/v1/health` 仍 200）。两个只在这台机器上才有的坑写进了脚本注释：日志编码要**按 BOM 判**（`\| Tee-Object` 写 UTF-16、脚本自己 `Popen` 写 UTF-8，而任意偶数长度的 UTF-8 用 `utf-16` 解码不报错只出乱码），而 `\| Tee-Object` 会按控制台 120 列把长行**硬折**（`duration_ms=` 可能正好被折点切开），所以比对前要把空白整体去掉 |
 
 | `verify_alerts_outbound.py` | 预警外发通道 41 项：真库建 Webhook 通道（201 且响应与列表都只有 `has_secret`、重名 409、`ftp://` 与带用户名口令的 URL 422、非法 `min_level`/`kind` 422、邮件收件人里的多余空格被规范化）、`POST …/test` 成功与失败**都回 200** 且**不写投递台账**、真导入一个探针期间后 4 条投递全部 `sent`（`attempts=1`、`response_status=200`）且本地 sink 收到的正文与 `sha256=<timestamp>.<body>` 签名 **4/4 对得上**、把 sink 切成一直失败后同一批按 2/4/8 秒退避真的重发（sink 三轮共收到 12 次）而 `attempts` 停在 `ALERT_MAX_ATTEMPTS`=3、同一期间再点补发 `created=0`（内容寻址去重的目的正在于此：重算不会把同一件事再通知一遍）、人工重发一次即 `sent`/`attempts=1`/`status=200`、通道计数 `{pending,sent,failed}` 与 `last_result`/`last_error` 如实、六个动作的审计逐条留痕，跑完撤销探针批次、删临时通道并断言该期 0 条 pending |
+
+| `verify_agent_sessions.py` | Agent 会话与用量 39 项（**每次跑两次真模型调用**：一次完整回答、一次生成中就停止）：显式建会话 201 且显示「未命名会话」、空会话详情带 `status_labels`、没有正在生成的回答时停止 409、匿名 401、`start`→`delta`→`done` 事件齐全且 `start` 带 `session_id`/`message_id`/`question_message_id`/`title`、**落库正文与流式正文一字不差**（实测 1883 字、19 秒）、`usage_source=api` 且 prompt+completion=total 与 done 一致、**第一块 delta 时占位行就已经在库里且 `status=streaming`**、停止请求在流结束前被受理（`stopped=true`）且下一块就收尾成 `done.status=stopped`、被停回答只留已生成的部分并按字数估算记账（`estimated`）、停止之后再停止 409、`days=1` 的 `series` 就是今天这一天（**这条曾抓到「跑着的后端还是旧进程」**）、`api/estimated/free` 三个计数相加等于回答数、`days=0`/`days=400`/`limit=0` 422、`/admin/agent-usage` 的 `by_user`（未受限账号显示「不受限」）/`by_status`、别人的会话读写都 404、部门受限账号看不到管理员会话但能看自己的用量（管理端点 403）、删会话回报 `deleted_messages` 并留 `agent_session.delete` 审计，跑完删临时会话与临时账号 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -170,7 +172,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 241 项、前端 44 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 256 项、前端 48 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -333,6 +335,16 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 加完 `data-visual-mask` 后 8 张**全部 0 像素差异**。⑭ 新增的第 9 张（`/admin/alert-channels`）连同刷新后的
 其余 8 张（侧边栏多了一行，所以宽屏那几张都变了）重刷完之后，整套 9 张复跑同样是 0 像素差异。
 
+**重刷是「补拍」不是「清空」**：`--update-baseline` 把这次拍的几张**并进**旧 manifest（只替换「页面 + 视口」
+相同的那几条），其余的条目原样留着，所以 `--update-baseline --pages /agent --sizes 1440x900` 只动 `/agent` 那一张。
+这条是真踩过的坑：改之前它整份重写 manifest，补拍一页之后 manifest 只剩那一页，下一次比对就把另外 8 张
+报成「基线目录里有 manifest 没登记的图」——`merge_manifest()` 现在把这套合并口径单独锁在单测里。
+
+**会随时间变的内容别放进首屏**：`/agent` 工作台的「近 7 天用量」按天明细带日期（今天 10-08，明天就是 10-09），
+展开渲染会让这条基线**每天**都红一次——所以它默认收在 `<details>` 里，截图拿到的是收起状态（概览数字仍在，
+逐日明细在管理概览的用量卡里另有一份）。页面上一律自己变的数字用 `data-visual-mask`，日期这种「本来就会翻页」
+的内容则从首屏基线里挪走。
+
 **它不进 CI**：像素依赖本机字体与抗锯齿，换台机器、换个 Edge 版本就会整片差一点，这类基线只在
 「同一台机器上前后的两次运行」之间有比较意义（理由与其它本地门禁一起写在「有意不进 CI 的门禁」一节）。
 在这台机器上它是 `check_all.py --with-pages` 的第二步（第一步是页面溢出扫描）：临时改一处样式（`body` 换个底色）
@@ -344,7 +356,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **241** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**）、
+`tests/` 下三个文件共 **256** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -399,7 +411,15 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 `POST …/{channel_id}/test` 成功与失败**都回 200** 且**不写投递台账**、台账按状态/级别/期间/通道筛选、
 **按内容寻址去重**（同一期间再点补发 `created=0` 且不重复排队）、失败退避时人工重发把 `attempts` 归零
 之后立刻重排、`/analysis/calculate` 与 CSV 导入都会顺手排好投递单（响应里带 `deliveries`）、
-四个端点都要求管理员（匿名 401 / 部门账号 403）。
+四个端点都要求管理员（匿名 401 / 部门账号 403）→
+**Agent 会话落库**：显式建会话 201（直接返回会话体）且标题压掉空白、列表与详情里的显示名（`untitled` / 「未命名会话」）
+与 `status_labels`、删除回报 `deleted_messages` 并留 `agent_session.delete` 审计（`target_id` 是会话 id）、
+别人的会话读与删都 404→**真实流式的整链路用例走真库 + 真会话**：`start` 事件给出会话与两条消息 id、
+正文与落库内容一字不差、`done.tokens` 三项自洽且 `usage_source="api"`、追问带 `?session_id=` 累积到同一条会话
+（`answers` 从 1 到 2、tokens 相加）且不覆盖已有标题、未知 `session_id` 404、
+生成期间占位行确实是 `streaming` 时停止请求被受理并在收尾时变成 `stopped`（正文只留已生成部分）、
+没有正在生成的回答时再停止是 409、四个会话/用量端点匿名 401 而部门受限账号看管理端点 403、看自己的用量照常
+（`days=0` → 422）。
 异步用例用 **anyio** 插件（`pytestmark = pytest.mark.anyio`，用例 id 显示 `[asyncio]`），
 不依赖未安装的 pytest-asyncio；数据库不可用时自动 `pytest.skip` 而不是失败。
 测试自身在外层事务里跑，结束整体回滚，不会污染库里数据。
@@ -562,8 +582,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 241 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 44 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 256 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 48 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -910,6 +930,45 @@ loading）、空数据（`.empty-state` + 去导入引导）、失败（`.error-
   `Vector` 列 + `cosine_distance`），并且按 `metadata_json["embedding_model"]` 过滤，防止旧模型索引
   混进同一向量空间。仓库里没有任何 Chroma / `vector_store.py` 的代码或依赖，`init_pgvector_db.py`
   负责装扩展与建索引——换向量库时要从这里改起。
+
+### Agent 会话落库、停止生成与 token 统计
+
+问答不再是「看完就没了」：每一次提问与回答都落在 `agent_sessions` / `agent_messages` 两张表里，
+可以回看、可以停止、可以算用量。状态机集中在 `backend/agent_sessions.py`，
+`backend/api_agent.py` 只做读写与权限判断。
+
+- **会话归属只有一条规则：会话属于提问的人。** 别人的会话 id 一律按「不存在」处理（**404，不区分
+  「没有」与「不是你的」**），免得会话 id 变成探测他人提问的探针；跨用户的用量只在管理员端点看汇总。
+- **先写占位行，再调用模型**：回答一开始就是库里的一行 `status="streaming"`，所以生成中刷新页面能看到
+  「生成中」，而不是等写完才出现。进程被杀留下的孤儿行不靠定时任务清理——**读的时候按
+  `STREAMING_STALE_SECONDS = 120` 判成「已中断」**（`effective_status()`），库里那份不动。
+- **停止生成是显式请求**（`POST /api/v1/ai/agent/sessions/{id}/stop`）：生成器每吐一块查一次标志位，
+  看到就收尾、把已经生成的正文按 `status="stopped"` 落库、`done` 事件里回 `stopped: true`。
+  前端「停止」必须**先打这个接口再 abort 本地流**：只 abort 的话服务端要到下一块才发现连接没了，
+  那期间模型仍在按 token 计费。没有正在生成的回答时返回 **409**（不是 500，也不是默默成功）。
+  进程内的停止标志位是 `threading.Event`，早到的停止请求会先记在 `_EARLY_STOPS` 里等生成器来取。
+- **token 统计分两路，估算不当账单**：网关在最后一帧报了用量 → `usage_source="api"`（账单口径）；
+  被停止 / 出错时拿不到用量，就按字数折算（`CHARS_PER_TOKEN = 1.5`）→ `usage_source="estimated"`。
+  `GET /api/v1/ai/agent/usage?days=` 把两者分开计数（`api_answers` / `estimated_answers` /
+  `free_answers`），前端在被停的回答下面写「（按字数估算）」。
+- **用量是向网关「要」来的，所以有一个开关**：`LLM_INCLUDE_USAGE`（默认 `true`，见 `.env.example`）让最后一个
+  流式 chunk 带上 `usage`。不认这个参数的兼容网关会直接报错——后端只在**一个字都还没吐出去**时**去掉该参数
+  重试一次**（已经吐过字的流不能重来，重来就是重复计费），把开关关掉最坏也只是全体退化成按字数估算。
+- **窗口是「含今天的 N 个自然日」，起点对齐到那一天的 00:00（UTC）**，`daily_series` 把没问的日子补 0。
+  这里踩过两个坑：起点若按「此刻」算，① 图上的今天会消失（`by_day` 与 `series` 从不同的天开始铺）；
+  ② `agent_messages.created_at` 用的是数据库的 `now()`（事务开始时刻，可能早于 Python 这边的「此刻」），
+  同一个事务里刚写下的行会被 `created_at >= start` 自己筛掉。
+- **显式建会话**（`POST /api/v1/ai/agent/sessions`，201）让前端先拿到 id 再开始流式——这样第一条回答
+  一开始就能被停止；不显式建（看板卡片、直接问）时后端在 `start` 事件里建会话并把 id 交回去，
+  前端后续追问自动带上 `?session_id=`。
+- **工作台 `/agent` 左侧是会话列表**（标题 + `N 问 · M tokens`、删除、近 7 天用量），回答下面挂
+  `本回答 N tokens`；管理概览页多了一张 **Agent 用量卡**（`GET /api/v1/admin/agent-usage?days=7`，
+  按用户列 token、逐日列出），它有自己的错误状态——**用量统计挂了不该把整页概览变成错误页**。
+- 真机验证是 `scripts/verify_agent_sessions.py`（39 项，见上表）；单测在 `tests/test_units.py`
+  （用量口径、估算与账单三种记账、状态归一、停止注册表）与 `tests/test_api.py`（真库整链路：
+  `tests/test_api.py` 里两个流式用例走**真库 + 真会话**，因为流式落库在 Starlette 的线程池里另开会话，
+  外层事务的 savepoint 里未提交的占位行它看不见）。踩过的坑：agent 端点的完整前缀是
+  `/api/v1/ai/agent/...`（`api_agent.py` 的 `prefix="/api/v1/ai"` 再加 `"/agent/…"`），少写 `/ai` 全都 404。
 
 ### Word 报告（.docx）
 
@@ -1338,6 +1397,9 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
   不分口径地数会看着像涨了几十倍。
   同一张卡片里还有**慢接口告警**（`observability.snapshot()["slow_paths"]`）：单次请求超过阈值的那几条路径，
   带「超阈值 N 次 / 阈值 / 最慢 / 最近」——它是下面那条「P95 只是观测、阈值才是告警」的落地位置。
+  另外还有一张 **Agent 用量卡**（`GET /admin/agent-usage?days=7`）：近 7 天的回答数 / tokens、
+  按用户（未受限账号的部门列写「不受限」）与逐日明细，账单价与估算价分开报。
+  它单独发一个请求、单独一套错误状态：**用量统计失败只让这张卡报错，整页概览照常显示**。
 - **用户管理**：改部门立即改变该账号**财务数据与知识库**的可见范围；部门栏可以填**多个**部门
   （用「、」分隔，后端收 `departments` 数组），留空等于清空（升级为管理员）。多部门账号那一行的
   角色列写「限定 N 个部门」。每行还有「会话」列（`未作废过` / `已作废 N 次`，读 `token_version`）

@@ -16,7 +16,7 @@ python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第�
 用法：
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + lint + 接口快照 + 后端 + 前端（两边都含覆盖率门槛）
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只做编码/语法体检 + 后端 ruff + 接口契约快照（不碰数据库、不需要 npm）
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描 + 首屏截图基线比对
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 18 页 × 3 档扫描 + 首屏截图基线比对
       （--with-pages 需要后端 127.0.0.1:8000 与前端 127.0.0.1:5173 已启动）
 
 后端/前端两步分别委托给 `scripts/check_coverage.py` 与 `scripts/check_frontend_coverage.py`：
@@ -249,7 +249,8 @@ def check_frontend_format() -> Step:
 
 
 def run_pages() -> Step:
-    step = Step("真机页面扫描（17 页 × 3 档）")
+    # 页数从 check_pages.py 现取：写死过一个「17 页」，加了「预警外发通道」页面之后就一直是错的
+    step = Step(f"真机页面扫描（{len(_page_list())} 页 × 3 档）")
     code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_pages.py")], PROJECT_ROOT)
     if code != 0:
         step.detail = "有页面横向溢出或服务未启动\n" + _tail(output, 25)
@@ -257,6 +258,19 @@ def run_pages() -> Step:
     groups = sum(1 for line in output.splitlines() if "无横向溢出" in line)
     step.pass_(f"退出码 0（{groups} 组无横向溢出，截图在 output/charts/）")
     return step
+
+
+def _page_list() -> tuple[str, ...]:
+    """页面清单来自 `check_pages.py`；取不到就退回空元组（标题少个数字，不影响门禁本身）。"""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    try:
+        import check_pages  # noqa: PLC0415 —— 只有 --with-pages 这条路径需要它
+
+        return tuple(check_pages.DEFAULT_PAGES)
+    except Exception:  # pragma: no cover —— 导入失败只影响标题里的页数
+        return ()
+    finally:
+        sys.path.pop(0)
 
 
 def run_visual_baseline() -> Step:

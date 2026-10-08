@@ -206,6 +206,10 @@ if BaseSettings is not None:
         deepseek_api_key: str = ""
         deepseek_base_url: str = "https://api.deepseek.com"
         deepseek_model: str = "deepseek-chat"
+        # 让网关在流式回答的最后一个 chunk 里带上本次 token 用量（⑮ 的用量统计靠它）。
+        # 默认开：不认这个参数的兼容网关会直接报错，backend/llm.py 会在"一个字都没吐出去"
+        # 时自动不带该参数重试一次；想彻底不冒这个险就把它设成 false（用量退回按字数估算）。
+        llm_include_usage: bool = True
 
         model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
@@ -301,6 +305,7 @@ else:
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        llm_include_usage = os.getenv("LLM_INCLUDE_USAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
         @property
         def cors_origin_list(self) -> list[str]:

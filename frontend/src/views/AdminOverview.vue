@@ -81,7 +81,31 @@ async function rebuildRollups() {
   }
 }
 
-onMounted(load)
+// Agent 用量（⑮）：跨用户看「谁在烧 token」。单独一个请求、单独一套错误状态——
+// 用量统计失败不该把整页概览变成错误页（它与财务数据是两条链路）。
+const AGENT_USAGE_DAYS = 7
+const agentUsage = ref(null)
+const agentUsageError = ref('')
+const byUser = computed(() => agentUsage.value?.data?.by_user || [])
+
+async function loadAgentUsage() {
+  agentUsageError.value = ''
+  try {
+    const response = await apiFetch(`/admin/agent-usage?days=${AGENT_USAGE_DAYS}`)
+    agentUsage.value = await response.json()
+  } catch (e) {
+    agentUsage.value = null
+    agentUsageError.value = `读取 Agent 用量失败：${e.message}`
+  }
+}
+
+// 「重新读取」要连着用量一起刷：用量卡有自己的错误状态，只刷一半会留下过期数字。
+function reload() {
+  load()
+  loadAgentUsage()
+}
+
+onMounted(reload)
 </script>
 
 <template>
@@ -98,7 +122,7 @@ onMounted(load)
           </div>
         </div>
         <div class="actions">
-          <button class="btn" :disabled="loading" @click="load">
+          <button class="btn" :disabled="loading" @click="reload">
             {{ loading ? '读取中…' : '↻ 重新读取' }}
           </button>
         </div>
@@ -109,7 +133,7 @@ onMounted(load)
       <section v-else-if="error && !data" class="state-box error-state">
         <strong>读取失败</strong>
         <p>{{ error }}</p>
-        <button class="btn" @click="load">重试</button>
+        <button class="btn" @click="reload">重试</button>
       </section>
 
       <template v-else-if="data">
@@ -272,6 +296,58 @@ onMounted(load)
           <p class="quality-hint">
             每路径只保留最近 {{ data.observability.samples_per_path }} 次采样；进程重启即清零。
           </p>
+        </section>
+
+        <section class="page-card">
+          <div class="card-head">
+            <h2>Agent 用量</h2>
+            <span>近 {{ AGENT_USAGE_DAYS }} 天，按回答统计</span>
+          </div>
+          <p v-if="agentUsageError" class="muted">{{ agentUsageError }}</p>
+          <template v-else-if="agentUsage">
+            <div class="settings-grid">
+              <div>
+                <span>回答</span>
+                <strong>{{ agentUsage.data.answers }} 条</strong>
+                <small
+                  >提问 {{ agentUsage.data.questions }} 次 · 会话 {{ agentUsage.data.sessions }} 个</small
+                >
+              </div>
+              <div>
+                <span>总 tokens</span>
+                <strong>{{ agentUsage.data.total_tokens }}</strong>
+                <small
+                  >账单价 {{ agentUsage.data.api_answers }} 条 · 估算
+                  {{ agentUsage.data.estimated_answers }} 条</small
+                >
+              </div>
+            </div>
+            <h3 class="sub-head">按用户（按 tokens 排序）</h3>
+            <p v-if="!byUser.length" class="muted">这段时间还没有人用过智能助手。</p>
+            <ul v-else class="dir-list">
+              <li v-for="row in byUser" :key="row.username">
+                <div class="dir-head">
+                  <strong>{{ row.username }}</strong>
+                  <span class="level low">{{ row.total_tokens }} tokens</span>
+                </div>
+                <small class="quality-hint">{{ row.department }} · {{ row.answers }} 条回答</small>
+              </li>
+            </ul>
+            <h3 class="sub-head">逐日</h3>
+            <ul class="dir-list">
+              <li v-for="row in agentUsage.series" :key="row.date">
+                <div class="dir-head">
+                  <strong class="path-text">{{ row.date }}</strong>
+                  <span class="level low">{{ row.answers }} 条</span>
+                </div>
+                <small class="quality-hint">{{ row.total_tokens }} tokens</small>
+              </li>
+            </ul>
+            <p class="quality-hint">
+              估算的 token 不是账单（模型没报用量时按字数折算），窗口是含今天的
+              {{ agentUsage.data.days }} 个自然日（UTC），没问的日子也会占一行。
+            </p>
+          </template>
         </section>
 
         <section class="page-card">

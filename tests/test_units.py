@@ -898,6 +898,42 @@ def test_visual_manifest_reports_missing_file(tmp_path):
     assert problems and "基线图缺失" in problems[0]
 
 
+def test_visual_manifest_merge_only_replaces_the_pages_being_recaptured():
+    """`--update-baseline --pages /x` 是「补拍一页」，不能把 manifest 清成只剩它一张。
+
+    这条是真踩过的坑：重拍 `/agent` 之后 manifest 只剩它一张，下一次
+    `manifest_problems()` 把另外 8 张基线报成「没登记」，整条截图门禁红。
+    """
+    old = {
+        "note": "旧说明",
+        "full_page": False,
+        "tolerance": 8,
+        "threshold": 0.002,
+        "images": [
+            {"page": "/dashboard", "size": "1440x900", "file": "dashboard_1440x900.png", "sha256": "a"},
+            {"page": "/agent", "size": "1440x900", "file": "agent_1440x900.png", "sha256": "旧"},
+            {"page": "/settings", "size": "375x812", "file": "settings_375x812.png", "sha256": "b"},
+        ],
+    }
+    fresh = {"page": "/agent", "size": "1440x900", "file": "agent_1440x900.png", "sha256": "新"}
+    merged = check_visual_baseline.merge_manifest(old, [fresh], full_page=False, tolerance=8,
+                                                  threshold=0.002)
+    assert [item["file"] for item in merged["images"]] == [
+        "agent_1440x900.png", "dashboard_1440x900.png", "settings_375x812.png"]
+    assert merged["images"][0]["sha256"] == "新"
+    assert merged["tolerance"] == 8 and merged["threshold"] == 0.002
+
+    # 没有旧 manifest（第一次生成）与补拍一个全新页面，都只是加条目
+    only_new = check_visual_baseline.merge_manifest(None, [fresh], full_page=True, tolerance=8,
+                                                   threshold=0.002)
+    assert len(only_new["images"]) == 1 and only_new["full_page"] is True
+    added = check_visual_baseline.merge_manifest(
+        merged, [{"page": "/admin", "size": "1440x900", "file": "admin_1440x900.png", "sha256": "c"}],
+        full_page=False, tolerance=8, threshold=0.002)
+    assert [item["file"] for item in added["images"]] == [
+        "admin_1440x900.png", "agent_1440x900.png", "dashboard_1440x900.png", "settings_375x812.png"]
+
+
 # ---------------------------------------------------------------- 后台任务幂等（⑩）
 
 def test_retry_delay_grows_exponentially_and_caps():
@@ -1774,6 +1810,319 @@ def test_channel_and_delivery_json_never_leak_the_secret():
     assert json.loads(serialized)["status_label"] == "待发送"
     assert json.loads(serialized)["level_label"] == "高"
     assert "topsecret" not in serialized
+
+
+# ---------------------------------------------------------------- ⑮ Agent 会话与用量
+
+
+def _agent_user(db, *, departments=None):
+    """造一个只属于本用例的用户（跟着 savepoint 一起回滚）。"""
+    import uuid as _uuid
+
+    from backend.models import User
+
+    user = User(username=f"pytest-agent-{_uuid.uuid4().hex[:10]}", password_hash="x",
+                departments=list(departments or []))
+    db.add(user)
+    db.flush()
+    return user
+
+
+def _llm_chunk(text=None, usage=None):
+    """模仿 OpenAI 流式块：收尾那个块只有 usage、没有 choices。
+
+    名字不能叫 `_chunk`：模块顶部另有一个同名的 RAG 辅助件，后定义的会把它盖掉。
+    """
+    choices = [SimpleNamespace(delta=SimpleNamespace(content=text))] if text is not None else []
+    return SimpleNamespace(choices=choices, usage=usage)
+
+
+def _client_with(fake_create, *, include_usage=True):
+    """拿一个不碰网络的 DeepSeekClient：只把 `chat.completions.create` 换掉。"""
+    from backend.llm import DeepSeekClient
+
+    client = object.__new__(DeepSeekClient)
+    client.model = "stub-model"
+    client.include_usage = include_usage
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    return client
+
+
+def test_usage_of_reads_sdk_objects_and_ignores_zeroed_usage():
+    """用量可能来自 SDK 对象或网关 dict；全 0 是网关占位，不是账单。"""
+    from backend.llm import usage_of
+
+    class _Usage:
+        prompt_tokens = 120
+        completion_tokens = 30
+        total_tokens = 150
+
+    assert usage_of(_Usage()) == {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+    # 网关只报了 prompt/completion：total 自己加出来，别把 0 当真实用量
+    assert usage_of({"prompt_tokens": 8, "completion_tokens": 2}) == {
+        "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+    assert usage_of({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}) == {}
+    assert usage_of({"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}) == {}
+    assert usage_of(SimpleNamespace(prompt_tokens="", completion_tokens=None, total_tokens=None)) == {}
+    assert usage_of(None) == {}
+
+
+def test_stream_reports_usage_and_falls_back_once_only_before_any_text():
+    """`stream_options` 不被网关认时回退一次，但**吐过字就不再重试**（否则用户看到重复正文）。"""
+    calls = []
+
+    def create(**params):
+        calls.append(params)
+        if "stream_options" in params:
+            raise ValueError("unknown parameter: stream_options")
+        return iter(
+            [_llm_chunk("答"), _llm_chunk("案"),
+             _llm_chunk(usage={"prompt_tokens": 7, "completion_tokens": 3})])
+
+    client = _client_with(create)
+    usage = {}
+    assert list(client.stream("问题", "证据", usage)) == ["答", "案"]
+    assert [("stream_options" in item) for item in calls] == [True, False]
+    assert usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+
+    # 已经吐出过正文：报错就直接冒泡，**不**重试（重试会让用户看到重复正文）
+    def create_after_text(**params):
+        calls.append(params)
+
+        def iterator():
+            yield _llm_chunk("半句")
+            raise ValueError("连接断了")
+
+        return iterator()
+
+    calls.clear()
+    client = _client_with(create_after_text)
+    with pytest.raises(ValueError, match="连接断了"):
+        list(client.stream("问题", "证据", {}))
+    assert len(calls) == 1
+
+    # 还没吐字就失败：允许回退，且回退后仍能把用量写进同一个字典
+    def create_without_usage_support(**params):
+        calls.append(params)
+        return iter([_llm_chunk("好")])
+
+    calls.clear()
+    client = _client_with(create_without_usage_support, include_usage=False)
+    assert list(client.stream("问题", "证据", {})) == ["好"]
+    assert len(calls) == 1 and "stream_options" not in calls[0]
+
+
+def test_estimate_tokens_and_derive_title():
+    from backend import agent_sessions
+
+    assert agent_sessions.estimate_tokens("") == 0
+    assert agent_sessions.estimate_tokens(None) == 0
+    assert agent_sessions.estimate_tokens("a" * 15) == 10          # 1.5 字 ≈ 1 token
+    assert agent_sessions.estimate_tokens("abc", "defg", "") == 5   # 7 字 / 1.5 向上取整不适用，四舍五入
+
+    assert agent_sessions.derive_title("  本月  收支\n差额是多少？ ") == "本月 收支 差额是多少？"
+    assert agent_sessions.derive_title("") == ""
+    long_title = agent_sessions.derive_title("问" * 200)
+    assert len(long_title) == agent_sessions.TITLE_MAX and long_title.endswith("…")
+
+
+def test_effective_status_normalises_stale_streaming_only():
+    """进程崩了没人写回终态：挂太久的 streaming 读取时算「已中断」，终态原样返回。"""
+    from backend import agent_sessions
+
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    fresh = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=5))
+    stale = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=121))
+    naive = SimpleNamespace(status="streaming", created_at=datetime(2026, 5, 1, 11, 0))
+    done = SimpleNamespace(status="stopped", created_at=now - timedelta(days=3))
+    unknown = SimpleNamespace(status="streaming", created_at=None)
+
+    assert agent_sessions.effective_status(fresh, now) == "streaming"
+    assert agent_sessions.effective_status(stale, now) == "interrupted"
+    assert agent_sessions.effective_status(naive, now) == "interrupted"   # 无时区的库值按 UTC 读
+    assert agent_sessions.effective_status(done, now) == "stopped"
+    assert agent_sessions.effective_status(unknown, now) == "streaming"
+
+
+def test_stop_registry_keeps_early_stops_and_releases_events():
+    """停止请求可能比流先到：登记时要把早到的标志补上，生成结束必须能释放干净。"""
+    from backend import agent_sessions
+
+    agent_sessions.reset()
+    try:
+        assert agent_sessions.request_stop(77) is False      # 还没登记：记下来，等登记时补
+        event = agent_sessions.register(77)
+        assert event.is_set() is True
+        assert agent_sessions.is_stopped(77) is True
+        assert agent_sessions.register(77) is event          # 幂等：同一条回答同一个事件
+        assert agent_sessions.active_count() == 1
+
+        other = agent_sessions.register(78)
+        assert agent_sessions.request_stop(78) is True
+        assert other.is_set() is True
+
+        agent_sessions.release(77)
+        assert agent_sessions.active_count() == 1
+        assert agent_sessions.is_stopped(77) is False
+        agent_sessions.release(78)
+        assert agent_sessions.active_count() == 0
+    finally:
+        agent_sessions.reset()
+
+
+def test_scope_text_joins_departments_and_caps_length():
+    from backend import agent_sessions
+
+    assert agent_sessions.scope_text(None) is None
+    assert agent_sessions.scope_text([]) is None
+    assert agent_sessions.scope_text("部门A") == "部门A"
+    assert agent_sessions.scope_text(["部门A", "部门B"]) == "部门A, 部门B"
+    assert len(agent_sessions.scope_text(["部" * 200])) == 100
+
+
+def test_start_exchange_derives_title_and_writes_the_placeholder(db_session):
+    """回答在流开始前就落库：前端因此拿得到 message_id，「停止」才有东西可停。"""
+    from backend import agent_sessions
+    from backend.models import AgentMessage
+
+    user = _agent_user(db_session)
+    session, question_row, assistant = agent_sessions.start_exchange(
+        db_session, user, "  差旅费  标准是多少？ ", scope=["部门A"])
+
+    assert session.id is not None and session.user_id == user.id
+    assert session.title == "差旅费 标准是多少？"
+    assert session.scope == "部门A"
+    assert question_row.id is not None and assistant.id is not None   # flush 过，SSE 能报 id
+    assert question_row.role == "user" and question_row.status == "ok"
+    assert assistant.role == "assistant" and assistant.status == "streaming"
+    assert assistant.content == "" and assistant.prompt_tokens == 0
+    assert agent_sessions.messages_of(db_session, session.id) == [question_row, assistant]
+
+    # 复用同一个会话：标题不被后来的提问覆盖，等于说「标题取第一条提问」
+    again, second_question, second_assistant = agent_sessions.start_exchange(
+        db_session, user, "那住宿标准呢？", session_id=session.id)
+    assert again.id == session.id and again.title == "差旅费 标准是多少？"
+    assert second_question.id != question_row.id and second_assistant.id != assistant.id
+    assert agent_sessions.streaming_message(db_session, session.id).id == second_assistant.id
+
+    # 别人的会话 id 当不存在（不区分「没有」与「不是你的」）
+    stranger = _agent_user(db_session)
+    with pytest.raises(agent_sessions.SessionNotFound):
+        agent_sessions.start_exchange(db_session, stranger, "偷看", session_id=session.id)
+
+    assert db_session.query(AgentMessage).filter_by(session_id=session.id).count() == 4
+
+
+def test_finish_exchange_records_api_usage_or_estimates(db_session):
+    """用量三种口径：模型报了→api；没报但真调过→estimated；压根没调→0。"""
+    from backend import agent_sessions
+
+    user = _agent_user(db_session)
+    _, _, assistant = agent_sessions.start_exchange(db_session, user, "成本率异常在哪？")
+
+    agent_sessions.finish_exchange(
+        db_session, assistant, content="结论：成本率偏高。", sources=[{"name": "年报", "kind": "knowledge_base"}],
+        period="2026-07", knowledge_chunks=2, duration_ms=1234,
+        usage={"prompt_tokens": 900, "completion_tokens": 100, "total_tokens": 1000})
+    assert (assistant.usage_source, assistant.prompt_tokens, assistant.completion_tokens,
+            assistant.total_tokens) == ("api", 900, 100, 1000)
+    assert assistant.status == "ok" and assistant.period == "2026-07"
+    assert assistant.knowledge_chunks == 2 and assistant.duration_ms == 1234
+    payload = agent_sessions.message_payload(assistant)
+    assert payload["status_label"] == "已完成" and payload["error"] == ""
+    assert payload["sources"] == [{"name": "年报", "kind": "knowledge_base"}]
+
+    # 模型没报用量（网关不支持 stream_options）→ 按字数估，并且明确标成 estimated
+    _, _, second = agent_sessions.start_exchange(db_session, user, "本月收支差额？", session_id=assistant.session_id)
+    agent_sessions.finish_exchange(db_session, second, content="差" * 30, status="stopped",
+                                   prompt_text="问" * 15, count_estimate=True)
+    assert second.usage_source == "estimated"
+    assert second.prompt_tokens == 10 and second.completion_tokens == 20
+    assert second.total_tokens == 30
+
+    # 没调模型：错误、或平台自己的「没有证据」文案，token 记 0 而不是估一个出来
+    _, _, third = agent_sessions.start_exchange(db_session, user, "没有证据的问题", session_id=assistant.session_id)
+    agent_sessions.finish_exchange(db_session, third, content="当前知识库里没有相关材料。", status="ok",
+                                   count_estimate=False)
+    assert (third.usage_source, third.total_tokens) == (None, 0)
+
+    _, _, fourth = agent_sessions.start_exchange(db_session, user, "模型挂了", session_id=assistant.session_id)
+    agent_sessions.finish_exchange(db_session, fourth, content="", status="error", error="模型不可用" * 500)
+    assert (fourth.usage_source, fourth.total_tokens) == (None, 0)
+    assert len(fourth.error) == 2000 and fourth.status == "error"
+
+
+def test_session_counts_and_delete_session_remove_messages(db_session):
+    from backend import agent_sessions
+
+    user = _agent_user(db_session)
+    session, question_row, assistant = agent_sessions.start_exchange(db_session, user, "第一个问题")
+    agent_sessions.finish_exchange(db_session, assistant, content="回答", usage={"total_tokens": 42},
+                                   prompt_text="第一个问题")
+    _, _, second = agent_sessions.start_exchange(db_session, user, "第二个问题", session_id=session.id)
+    agent_sessions.finish_exchange(db_session, second, content="回答二", usage={"prompt_tokens": 5,
+                                                                               "completion_tokens": 5})
+    other_session, _, _ = agent_sessions.start_exchange(db_session, user, "另一个会话")
+
+    counts = agent_sessions.session_counts(db_session, [session.id, other_session.id])
+    assert counts[session.id] == {"answers": 2, "total_tokens": 52}   # 只数 assistant，问题不计
+    # 刚开始、还没写回的那条也占一行：它的 token 是 0，但它确实是一条"回答"
+    assert counts[other_session.id] == {"answers": 1, "total_tokens": 0}
+
+    payload = agent_sessions.session_payload(session, counts[session.id])
+    assert payload["answers"] == 2 and payload["total_tokens"] == 52
+    assert payload["display_title"] == "第一个问题" and payload["title"] == "第一个问题"
+    untitled = agent_sessions.session_payload(agent_sessions.AgentSession(user_id=user.id, title=""))
+    assert untitled["display_title"] == agent_sessions.UNTITLED
+
+    rows, total = agent_sessions.list_sessions(db_session, user_id=user.id)
+    assert total == 2 and {row.id for row in rows} == {session.id, other_session.id}
+
+    removed = agent_sessions.delete_session(db_session, session)
+    assert removed == 4                     # 两轮问答 = 两个提问 + 两个回答，全都要跟着走
+    assert agent_sessions.messages_of(db_session, session.id) == []
+    assert db_session.get(type(other_session), other_session.id) is not None
+    assert question_row.id is not None
+
+
+def test_usage_stats_and_daily_series_fill_the_whole_window(db_session):
+    """用量统计按本人/按天聚合，缺的那几天要补 0，前端曲线才不会断。"""
+    from backend import agent_sessions
+
+    user = _agent_user(db_session)
+    _, _, assistant = agent_sessions.start_exchange(db_session, user, "算一下成本率")
+    agent_sessions.finish_exchange(db_session, assistant, content="成本率 0.9123",
+                                   usage={"prompt_tokens": 30, "completion_tokens": 10}, status="ok")
+    _, _, stopped = agent_sessions.start_exchange(db_session, user, "再算一次", session_id=assistant.session_id)
+    agent_sessions.finish_exchange(db_session, stopped, content="算到一半", status="stopped",
+                                   prompt_text="再算一次", count_estimate=True)
+
+    stats = agent_sessions.usage_stats(db_session, user_id=user.id, days=7)
+    assert stats["days"] == 7
+    assert stats["answers"] == 2 and stats["questions"] == 2 and stats["sessions"] == 1
+    assert stats["prompt_tokens"] == 30 + stopped.prompt_tokens
+    assert stats["completion_tokens"] == 10 + stopped.completion_tokens
+    assert stats["total_tokens"] == 40 + stopped.total_tokens
+    assert stats["api_answers"] == 1 and stats["estimated_answers"] == 1 and stats["free_answers"] == 0
+    assert stats["stopped"] == 1 and stats["failed"] == 0
+    by_status = {item["status"]: item["count"] for item in stats["by_status"]}
+    assert by_status == {"ok": 1, "stopped": 1}     # 只列出现过的状态，按状态名排序
+
+    # 本人视角没有 by_user（那是管理员端点才有的拆分）
+    assert "by_user" not in stats
+    series = agent_sessions.daily_series(stats)
+    assert len(series) == 7
+    assert [item["date"] for item in series] == sorted(item["date"] for item in series)
+    assert sum(item["answers"] for item in series) == 2
+    assert series[-1]["answers"] == 2                     # 刚写的就是今天
+    assert all(item["total_tokens"] == 0 for item in series[:-1])
+
+    admin_stats = agent_sessions.usage_stats(db_session, user_id=None, days=1)
+    mine = [item for item in admin_stats["by_user"] if item["username"] == user.username]
+    assert len(mine) == 1 and mine[0]["answers"] == 2 and mine[0]["total_tokens"] == stats["total_tokens"]
+    assert mine[0]["department"] == "不受限"
+
 
 
 

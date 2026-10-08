@@ -314,3 +314,66 @@ class AlertDelivery(Base):
         # 「同一条预警 + 同一个通道」只发一次：并发重算/补发时靠数据库拦，而不是靠先查后插。
         Index("uq_alert_deliveries_key_channel", "alert_key", "channel_id", unique=True),
     )
+
+
+class AgentSession(Base):
+    """Agent 会话（⑮）：一次「和财务助手聊下去」的容器。
+
+    为什么要落库而不是只放在浏览器里：会话是**证据链**的一部分——一条结论是从哪些检索片段、
+    哪个期间的财务数据推出来的，出了问题要能回看；token 用量也得有个按人/按天的落点，
+    否则「这个月问答花了多少」只能靠日志。前端只拿会话 id，正文都在库里。
+
+    `title` 由第一条提问派生（见 backend/agent_sessions.py 的 derive_title），
+    空标题的会话在列表里显示成「未命名会话」。
+    """
+    __tablename__ = "agent_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # 用户被删时连同会话一起删（ondelete=CASCADE）：这是个人问答记录，不是审计证据
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(120), default="")
+    # 本会话问答时生效的数据范围（受限账号的部门口径，逗号分隔）；用于列表里解释"为什么只看到这些"
+    scope: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
+
+
+class AgentMessage(Base):
+    """Agent 会话里的一条消息（⑮）：提问、回答、以及回答的用量与出处。
+
+    三次刻意的选择：
+
+    1. **先落"占位行"再流式。** 流式回答要能中途停止、还可能要跨进程重连，
+       没有落库的行就只能靠内存里的字符串；所以回答一开始就写一行 `status="streaming"`，
+       结束时才把正文、来源、token 写回去。
+    2. **`status` 覆盖失败与中断。** 生成到一半被用户停掉是 `stopped`（有正文，是有效结果），
+       进程崩了是 `interrupted`（读取时把超时的 streaming 归一成它），模型不可用是 `error`——
+       这三种在界面上是完全不同的提示，不能都塞进"空回答"。
+    3. **token 记来源。** `usage_source="api"` 是模型报的真数，`"estimated"` 是按字数估的；
+       把两者混在一起报账，等于把估算当账单。
+    """
+    __tablename__ = "agent_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
+    # 冗余一份用户：按人统计用量时不必回连会话表
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # user / assistant（取值见 backend/agent_sessions.py 的 ROLES）
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text, default="")
+    # streaming / ok / stopped / error / interrupted（取值见 agent_sessions.STATUSES）
+    status: Mapped[str] = mapped_column(String(20), default="ok", index=True)
+    # 出错时的原话：状态只说明"失败了"，回看时得知道是模型不可用还是证据阶段就炸了
+    error: Mapped[str | None] = mapped_column(Text)
+    # 检索片段（[{type, name, ...}]），与 done 事件里的 sources 同源
+    sources: Mapped[list] = mapped_column(JSONB, default=list)
+    period: Mapped[str | None] = mapped_column(String(20))
+    knowledge_chunks: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    scope: Mapped[str | None] = mapped_column(String(100))
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # api / estimated（哪个都拿不到时是 None）
+    usage_source: Mapped[str | None] = mapped_column(String(20))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

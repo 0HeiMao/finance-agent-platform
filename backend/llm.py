@@ -4,6 +4,36 @@ from backend.config import get_settings
 
 SYSTEM_PROMPT = """你是严谨的智能财务分析助手。只能基于提供的财务数据和检索证据回答。证据不足时必须明确说数据不足，不得编造数字、原因或政策结论。金额保留两位小数，比率保留四位小数。回答包含：结论、数据依据、风险提示。"""
 
+
+def _int_or_zero(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_of(raw) -> dict:
+    """把模型返回的 usage 压成三个数字，没有用量时返回空字典。
+
+    兼容两种形状：openai SDK 的 `CompletionUsage` 对象，以及 OpenAI 兼容网关
+    在 JSON 里直接给的那个 dict。全 0 也当没有——那通常是网关占位，不是真账单。
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        def get(key):
+            return raw.get(key)
+    else:
+        def get(key):
+            return getattr(raw, key, None)
+    prompt = _int_or_zero(get("prompt_tokens"))
+    completion = _int_or_zero(get("completion_tokens"))
+    total = _int_or_zero(get("total_tokens"))
+    if not (prompt or completion or total):
+        return {}
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": total or prompt + completion}
+
 class DeepSeekClient:
     def __init__(self):
         try:
@@ -15,26 +45,62 @@ class DeepSeekClient:
             raise RuntimeError("未配置 DEEPSEEK_API_KEY")
         self.client = OpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
         self.model = settings.deepseek_model
+        # 让网关在最后一个 chunk 里带上本次用量（⑮ 的 token 统计靠它）
+        self.include_usage = bool(getattr(settings, "llm_include_usage", True))
 
-    def answer(self, question: str, context: str) -> str:
+    def _messages(self, question: str, context: str) -> list[dict]:
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"问题：{question}\n\n检索证据：\n{context or '无有效证据'}"},
+        ]
+
+    def answer(self, question: str, context: str, usage: dict | None = None) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             temperature=0.1,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"问题：{question}\n\n检索证据：\n{context or '无有效证据'}"},
-            ],
+            messages=self._messages(question, context),
         )
+        reported = usage_of(getattr(response, "usage", None))
+        if usage is not None and reported:
+            usage.update(reported)
         return response.choices[0].message.content or "数据不足，无法生成可靠回答。"
 
-    def stream(self, question: str, context: str):
-        response = self.client.chat.completions.create(model=self.model, temperature=0.1, stream=True, messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"问题：{question}\n\n检索证据：\n{context or '无有效证据'}"},
-        ])
+    def _chunks(self, messages: list[dict], *, include_usage: bool):
+        """逐块产出 `(文本, 用量)`：文本可能为 None（只有用量那个收尾块），用量通常是 {}。"""
+        params = {"model": self.model, "temperature": 0.1, "stream": True, "messages": messages}
+        if include_usage:
+            params["stream_options"] = {"include_usage": True}
+        response = self.client.chat.completions.create(**params)
         for chunk in response:
-            text = chunk.choices[0].delta.content if chunk.choices else None
-            if text: yield text
+            reported = usage_of(getattr(chunk, "usage", None))
+            text = chunk.choices[0].delta.content if getattr(chunk, "choices", None) else None
+            yield text, reported
+
+    def stream(self, question: str, context: str, usage: dict | None = None):
+        """逐块吐字，`usage` 传字典就把这次调用的用量写进去。
+
+        `stream_options={"include_usage": True}` 并非所有 OpenAI 兼容网关都认：有的直接报错。
+        所以只有「一个字都还没吐出去」的时候才允许不带该参数重试一次——已经吐过再重试，
+        用户会看到重复正文。真拿不到用量时上层会退回按字数估算（usage_source="estimated"）。
+        """
+        messages = self._messages(question, context)
+        produced = False
+        try:
+            for text, reported in self._chunks(messages, include_usage=self.include_usage):
+                if reported and usage is not None:
+                    usage.update(reported)
+                if text:
+                    produced = True
+                    yield text
+            return
+        except Exception:
+            if produced or not self.include_usage:
+                raise
+        for text, reported in self._chunks(messages, include_usage=False):
+            if reported and usage is not None:
+                usage.update(reported)
+            if text:
+                yield text
 
 @lru_cache(maxsize=1)
 def get_llm() -> DeepSeekClient:

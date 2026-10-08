@@ -878,6 +878,19 @@
         "title": "SearchInput",
         "type": "object"
       },
+      "SessionCreate": {
+        "description": "显式建会话：前端先拿到 id 再开始流式，这样回答一开始就能被\"停止\"。",
+        "properties": {
+          "title": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "title": "SessionCreate",
+        "type": "object"
+      },
       "TransactionCorrection": {
         "additionalProperties": false,
         "description": "更正请求：只允许出现这些字段（批次号是文件哈希，改了就追溯不上）。",
@@ -1242,6 +1255,55 @@
           }
         },
         "summary": "Health"
+      }
+    },
+    "/api/v1/admin/agent-usage": {
+      "get": {
+        "description": "跨用户的 Agent 问答用量（⑮）。\n\n与 `/api/v1/ai/agent/usage` 分开是因为口径不同：那个只报本人，这个按用户拆开，给管理员看\n「谁在烧 token」。`estimated` 与 `api` 也分开计数 —— 估算出来的数字只能当参考，不是账单。",
+        "operationId": "agent_usage_summary_api_v1_admin_agent_usage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Agent Usage Summary",
+        "tags": [
+          "admin"
+        ]
       }
     },
     "/api/v1/admin/alert-channels": {
@@ -3232,7 +3294,7 @@
     },
     "/api/v1/ai/agent/chat/stream": {
       "post": {
-        "description": "财务 Agent 流式问答：证据 = 已导入财务数据 + 知识库检索，模型只能依据证据作答。",
+        "description": "财务 Agent 流式问答：证据 = 已导入财务数据 + 知识库检索，模型只能依据证据作答。\n\n这一轮问答在流开始之前就先落库（⑮）：用户提问 + 一条 `status=\"streaming\"` 的助手占位行。\n两件事因此成为可能——前端在流当中就知道 `message_id` 并能请求停止；\n进程半路没了也能在会话里看到一条\"没写完的回答\"，而不是什么都没有。",
         "operationId": "agent_stream_api_v1_ai_agent_chat_stream_post",
         "parameters": [
           {
@@ -3250,6 +3312,23 @@
                 }
               ],
               "title": "Department"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
             }
           },
           {
@@ -3307,6 +3386,290 @@
         "summary": "Agent Stream",
         "tags": [
           "ai"
+        ]
+      }
+    },
+    "/api/v1/ai/agent/sessions": {
+      "get": {
+        "operationId": "list_agent_sessions_api_v1_ai_agent_sessions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "List Agent Sessions",
+        "tags": [
+          "agent"
+        ]
+      },
+      "post": {
+        "operationId": "create_agent_session_api_v1_ai_agent_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Create Agent Session",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/api/v1/ai/agent/sessions/{session_id}": {
+      "delete": {
+        "operationId": "delete_agent_session_api_v1_ai_agent_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Delete Agent Session",
+        "tags": [
+          "agent"
+        ]
+      },
+      "get": {
+        "operationId": "get_agent_session_api_v1_ai_agent_sessions__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Get Agent Session",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/api/v1/ai/agent/sessions/{session_id}/stop": {
+      "post": {
+        "description": "停止正在生成的回答。\n\n只置一个服务端标志位，**不等它写完**：生成器每吐一块查一次，看到就收尾并把已经生成的\n正文按 `status=\"stopped\"` 落库（前端的 abort 只断开连接，服务端要到下一块才发现，\n那期间模型还在烧 token，所以停止必须是显式请求）。",
+        "operationId": "stop_agent_session_api_v1_ai_agent_sessions__session_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Stop Agent Session",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/api/v1/ai/agent/usage": {
+      "get": {
+        "description": "本人近 N 天的问答用量。`estimated` 与 `api` 分开报，估算不当账单。",
+        "operationId": "agent_usage_api_v1_ai_agent_usage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Agent Usage",
+        "tags": [
+          "agent"
         ]
       }
     },

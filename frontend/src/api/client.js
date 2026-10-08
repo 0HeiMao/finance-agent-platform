@@ -39,7 +39,7 @@ export async function apiFetch(path, options = {}) {
   return response
 }
 
-export async function readSSE(path, body, { onDelta, onDone, onError, signal }) {
+export async function readSSE(path, body, { onStart, onDelta, onDone, onError, signal }) {
   const response = await apiFetch(path, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -61,7 +61,8 @@ export async function readSSE(path, body, { onDelta, onDone, onError, signal }) 
         const data = raw.match(/^data:\s*(.+)$/m)?.[1]
         if (!data) continue
         const payload = JSON.parse(data)
-        if (event === 'delta') onDelta?.(payload.text || '')
+        if (event === 'start') onStart?.(payload)
+        else if (event === 'delta') onDelta?.(payload.text || '')
         else if (event === 'done') onDone?.(payload)
         else if (event === 'error') onError?.(payload)
       }

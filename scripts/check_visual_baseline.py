@@ -172,6 +172,29 @@ def manifest_problems(manifest: dict, baseline_dir: Path = BASELINE_DIR) -> list
     return problems
 
 
+def merge_manifest(existing: dict | None, captured: list[dict], *,
+                   full_page: bool, tolerance: int, threshold: float) -> dict:
+    """把这次重拍的基线并进旧 manifest：只替换 (page, size) 相同的那几条，其余原样留着。纯函数，可单测。
+
+    `--update-baseline --pages /x` 是「补拍这一页」的手势，不能读成「把 manifest 清成只剩这一页」——
+    真删页面得自己动手改 manifest。这条曾经吃掉过 8 张基线：重拍 `/agent` 之后 manifest 只剩它一张，
+    下一次 `manifest_problems()` 就报「基线目录里有 manifest 没登记的图」×8。
+    """
+    entries: dict[tuple[str, str], dict] = {}
+    for entry in (existing or {}).get("images") or []:
+        entries[(entry["page"], entry["size"])] = entry
+    for entry in captured:
+        entries[(entry["page"], entry["size"])] = entry
+    return {
+        "note": "由 scripts/check_visual_baseline.py --update-baseline 生成：这是首屏视觉基线，"
+                "有意的界面改动要连图和代码一起提交",
+        "full_page": bool(full_page),
+        "tolerance": tolerance,
+        "threshold": threshold,
+        "images": sorted(entries.values(), key=lambda item: (item["page"], item["size"])),
+    }
+
+
 def _console() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -381,17 +404,15 @@ async def _drive(ws_url: str, plan: list[tuple[str, str]], args, base_url: str) 
                 line += f" → 差异图 {diff_path.relative_to(PROJECT_ROOT)}"
             print(line)
         if args.update_baseline and captured:
-            manifest = {
-                "note": "由 scripts/check_visual_baseline.py --update-baseline 生成：这是首屏视觉基线，"
-                        "有意的界面改动要连图和代码一起提交",
-                "full_page": bool(args.full_page),
-                "tolerance": args.tolerance,
-                "threshold": args.threshold,
-                "images": sorted(captured, key=lambda item: (item["page"], item["size"])),
-            }
+            existing = None
+            if MANIFEST_PATH.exists():
+                existing = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+            manifest = merge_manifest(existing, captured, full_page=bool(args.full_page),
+                                      tolerance=args.tolerance, threshold=args.threshold)
             MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
                                      encoding="utf-8", newline="\n")
-            print(f"已更新 {MANIFEST_PATH.relative_to(PROJECT_ROOT)}：{len(captured)} 张基线")
+            print(f"已更新 {MANIFEST_PATH.relative_to(PROJECT_ROOT)}："
+                  f"本次重拍 {len(captured)} 张 / manifest 共 {len(manifest['images'])} 张基线")
         await cdp.send("Target.closeTarget", {"targetId": target["targetId"]})
     return 1 if failures else 0
 

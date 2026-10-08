@@ -61,6 +61,7 @@ ACTIONS: dict[str, str] = {
     "alert_channel.test": "测试预警外发通道",
     "alert_delivery.retry": "重试预警投递",
     "alert.notify": "补发预警通知",
+    "agent_session.delete": "删除 Agent 会话",
     "audit.export": "导出审计日志",
     "audit.purge": "清理过期审计",
 }

@@ -1,6 +1,6 @@
 <script setup>
 import { nextTick, ref } from 'vue'
-import { readSSE } from '../api/client'
+import { apiFetch, readSSE } from '../api/client'
 import { withScope } from '../api/scope'
 import { renderMarkdown } from '../utils/markdown'
 
@@ -9,19 +9,27 @@ import { renderMarkdown } from '../utils/markdown'
  * - 默认（卡片形态）：嵌在看板底部，只给输入框和消息流。
  * - `full`（工作台形态）：独立页面用，消息区更高、带示例问题和清空会话。
  * 两种形态共用同一套流式逻辑，避免「看板里的助手」和「专属页面的助手」行为漂移。
+ *
+ * ⑮ 起对话有了身份：`sessionId` 由上层传入（工作台的会话历史），流式过程中服务端会
+ * 在 `event: start` 里回一个新的 id，这里再抛回上层——所以「停止」与「会话列表」都有
+ * 对象可用，而不是只在浏览器内存里存在一段聊天记录。
  */
 const props = defineProps({
   full: { type: Boolean, default: false },
-  examples: { type: Array, default: () => [] }
+  examples: { type: Array, default: () => [] },
+  sessionId: { type: [Number, String], default: null },
+  history: { type: Array, default: () => [] }
 })
 
+const emit = defineEmits(['update:sessionId', 'saved'])
+
 const input = ref('')
-const messages = ref([])
 const loading = ref(false)
 const error = ref('')
 const listRef = ref(null)
 // 「重试」要重发的是上一条问题：发完之后输入框已经被清空，读 input.value 只会拿到空串
 const lastQuestion = ref('')
+const session = ref(props.sessionId)
 let controller = null
 
 const KIND_LABEL = {
@@ -30,6 +38,20 @@ const KIND_LABEL = {
   financial_transaction: '明细账',
   knowledge_base: '知识库'
 }
+
+/** 落库的会话记录 → 界面上的消息（名字对齐后端，界面不直接吃接口形状）。 */
+function fromHistory(item) {
+  return {
+    role: item.role,
+    text: item.content || '',
+    sources: item.sources || [],
+    tokens: item.total_tokens ? { total_tokens: item.total_tokens, usage_source: item.usage_source } : null,
+    stopped: item.status === 'stopped',
+    error: item.status === 'error' ? item.error || '' : ''
+  }
+}
+
+const messages = ref((props.history || []).map(fromHistory))
 
 function sourceLabel(source) {
   const item = typeof source === 'string' ? { name: source } : source
@@ -59,25 +81,36 @@ async function ask(text) {
   error.value = ''
   messages.value.push({ role: 'user', text: question })
   input.value = ''
-  const answer = { role: 'assistant', text: '', sources: [], loading: true }
+  const answer = { role: 'assistant', text: '', sources: [], loading: true, tokens: null }
   messages.value.push(answer)
   loading.value = true
   controller = new AbortController()
   await scrollToBottom()
+  // 已有会话就接上去，否则让服务端在流式开始时建一个（date: start 事件带回它的 id）
+  const path = session.value ? `/ai/agent/chat/stream?session_id=${session.value}` : '/ai/agent/chat/stream'
   try {
     // 财务范围只认服务端记录 + 当前选择的口径（请求头自述一律不算，见后端注释）
     await readSSE(
-      withScope('/ai/agent/chat/stream'),
+      withScope(path),
       { question },
       {
         signal: controller.signal,
+        onStart: (payload) => {
+          if (payload?.session_id && payload.session_id !== session.value) {
+            session.value = payload.session_id
+            emit('update:sessionId', payload.session_id)
+          }
+        },
         onDelta: (chunk) => {
           answer.text += chunk
           scrollToBottom()
         },
         onDone: (payload) => {
           answer.sources = payload?.sources || []
+          answer.tokens = payload?.tokens || null
+          answer.stopped = payload?.status === 'stopped'
           answer.loading = false
+          emit('saved')
         },
         onError: (e) => {
           answer.loading = false
@@ -103,7 +136,19 @@ function retry() {
   ask(lastQuestion.value || input.value)
 }
 
-function stop() {
+/**
+ * 停止生成：先让服务端把标志位置上，再断开本地连接。
+ *
+ * 只 abort 是不够的：服务端要到下一块才发现连接没了，那期间模型还在按 token 计费。
+ * 置标志位之后生成器下一块就收尾，并把已经生成的部分按「已停止」落库。
+ */
+async function stop() {
+  const id = session.value
+  try {
+    if (id) await apiFetch(`/ai/agent/sessions/${id}/stop`, { method: 'POST' })
+  } catch (e) {
+    error.value = e.message || '停止失败'
+  }
   controller?.abort()
   loading.value = false
 }
@@ -155,8 +200,17 @@ function clearSession() {
           <template v-else-if="message.text">{{ message.text }}</template>
           <span v-else-if="message.loading" class="muted">正在检索财务数据与知识库…</span>
           <span v-if="message.loading">▋</span>
+          <span v-if="message.stopped" class="muted stopped-note"
+            >（这条回答被停止，只保留已生成的部分）</span
+          >
+          <p v-if="message.error" class="muted">{{ message.error }}</p>
           <div v-if="message.sources && message.sources.length" class="sources">
             依据：{{ sourceText(message.sources) }}
+          </div>
+          <div v-if="message.tokens" class="muted usage-note">
+            本回答 {{ message.tokens.total_tokens }} tokens{{
+              message.tokens.usage_source === 'estimated' ? '（按字数估算）' : ''
+            }}
           </div>
         </div>
       </div>

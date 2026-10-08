@@ -28,8 +28,8 @@
       "file": "agent_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 104508,
-      "sha256": "436bceaa9328ec42bf781471b762eb2f3dd7c6706b4ab07019a91dc6646412be"
+      "bytes": 128542,
+      "sha256": "03ac25dab4abe0083a98996172ab159be6e0513faaf40b7be3d644b6ab5d804c"
     },
     {
       "page": "/analysis/alerts",

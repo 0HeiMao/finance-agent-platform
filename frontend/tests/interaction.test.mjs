@@ -711,6 +711,358 @@ test('预警外发（⑭）：台账筛选带 status 查询参数，点「重发
   view.app.unmount()
 })
 
+// ------------------------------------------------------------------ Agent 会话（⑮）
+
+/** 一条不会自动结束的 SSE 流：用来把界面停在「正在生成」，好检查「停止」按钮。 */
+function openSseResponse(events) {
+  const encoder = new TextEncoder()
+  let opened = null
+  const stream = new ReadableStream({
+    start(controller) {
+      opened = controller
+      for (const event of events) controller.enqueue(encoder.encode(event))
+    }
+  })
+  return {
+    response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    close: () => {
+      try {
+        opened?.close()
+      } catch {
+        // 已经被 abort：关不关都无所谓
+      }
+    }
+  }
+}
+
+test('Agent 会话（⑮）：开始事件把会话 id 抛回上层，追问带上 session_id，token 用量挂在回答下', async () => {
+  setActiveScope('')
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/chat/stream',
+      response: () =>
+        sseResponse([
+          'event: start\ndata: {"session_id":9,"message_id":31,"question_message_id":30,"title":"本月收支差额是多少"}\n\n',
+          'event: delta\ndata: {"text":"本月收支差额为 -5。"}\n\n',
+          'event: done\ndata: {"session_id":9,"message_id":31,"status":"ok","sources":' +
+            '[{"name":"财务汇总表 2026-07","kind":"financial_metric"}],"tokens":' +
+            '{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"usage_source":"api"}}\n\n'
+        ])
+    }
+  ])
+  const sessionIds = []
+  const saved = []
+  const view = mount(AgentChat, {
+    props: {
+      full: true,
+      examples: ['本月收支差额是多少？'],
+      'onUpdate:sessionId': (id) => sessionIds.push(id),
+      onSaved: () => saved.push(1)
+    },
+    global: { components: { 'router-link': { render: () => null } } }
+  })
+
+  await view.click('本月收支差额是多少？')
+  assert.ok(await waitFor(() => view.text().includes('本回答 17 tokens')), `实际渲染：${view.text()}`)
+  // 没有会话时不能让前端编一个 id：id 必须来自服务端的 start 事件
+  assert.equal(fetchImpl.calls.at(-1).path, '/api/v1/ai/agent/chat/stream')
+  assert.deepEqual(sessionIds, [9])
+  assert.equal(saved.length, 1)
+  assert.match(view.text(), /依据：财务汇总表 2026-07/)
+  assert.doesNotMatch(view.text(), /按字数估算/)
+
+  // 第二问接着同一个会话：路径要带上落库后的 id，否则每次提问都另起一个会话
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/chat/stream',
+      response: () =>
+        sseResponse([
+          'event: start\ndata: {"session_id":9,"message_id":33,"title":"本月收支差额是多少"}\n\n',
+          'event: delta\ndata: {"text":"被停在这里"}\n\n',
+          'event: done\ndata: {"session_id":9,"message_id":33,"status":"stopped","sources":[],' +
+            '"tokens":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40,"usage_source":"estimated"}}\n\n'
+        ])
+    }
+  ])
+  await view.input(
+    view.find((node) => node.type === 'input'),
+    '那 7 月呢？'
+  )
+  await view.click('发送')
+  assert.ok(await waitFor(() => view.text().includes('按字数估算')), `实际渲染：${view.text()}`)
+  assert.equal(fetchImpl.calls.at(-1).path, '/api/v1/ai/agent/chat/stream?session_id=9')
+  assert.deepEqual(JSON.parse(fetchImpl.calls.at(-1).body), { question: '那 7 月呢？' })
+  assert.match(view.text(), /本回答 40 tokens（按字数估算）/)
+  // 被停止的回答要说明「只保留已生成的部分」，否则看着像答案不完整
+  assert.match(view.text(), /（这条回答被停止，只保留已生成的部分）/)
+  assert.equal(saved.length, 2)
+  setActiveScope('')
+  view.app.unmount()
+})
+
+test('Agent 会话（⑮）：点「停止」先请服务端置标志位，再断开本地流', async () => {
+  const stream = openSseResponse([
+    'event: start\ndata: {"session_id":12,"message_id":34,"title":"成本率排查"}\n\n',
+    'event: delta\ndata: {"text":"正在汇总"}\n\n'
+  ])
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/sessions/12/stop',
+      response: () => jsonResponse({ session_id: 12, message_id: 34, stopped: true })
+    },
+    { method: 'POST', path: '/api/v1/ai/agent/chat/stream', response: () => stream.response }
+  ])
+  const view = mount(AgentChat, {
+    props: { full: true, sessionId: 12 },
+    global: { components: { 'router-link': { render: () => null } } }
+  })
+  await view.input(
+    view.find((node) => node.type === 'input'),
+    '成本率为什么异常？'
+  )
+  await view.click('发送')
+  // 流还没结束：同一个按钮这时是「停止」
+  assert.ok(await waitFor(() => view.button('停止') !== null), `实际渲染：${view.text()}`)
+  await view.click('停止')
+  assert.ok(
+    await waitFor(() =>
+      fetchImpl.calls.some(
+        (call) => call.method === 'POST' && call.path === '/api/v1/ai/agent/sessions/12/stop'
+      )
+    ),
+    JSON.stringify(fetchImpl.calls)
+  )
+  // 本地 abort 之后请求真的结束了，按钮回到「发送」
+  assert.ok(await waitFor(() => view.button('发送') !== null), `实际渲染：${view.text()}`)
+  stream.close()
+  view.app.unmount()
+})
+
+const AGENT_SESSION_ROW = {
+  id: 7,
+  title: '成本率排查',
+  display_title: '成本率排查',
+  status: 'ok',
+  answers: 2,
+  total_tokens: 42,
+  created_at: '2026-07-31T09:00:00+00:00',
+  updated_at: '2026-07-31T09:10:00+00:00'
+}
+const AGENT_STATUS_LABELS = { ok: '已完成', streaming: '生成中', stopped: '已停止', error: '失败' }
+
+test('Agent 工作台（⑮）：会话列表点开把落库消息灌回对话框，删除后回到新会话，用量卡列逐日', async () => {
+  await seedUser({ unrestricted: true, departments: [] })
+  // 删除之后列表就该空了：用一个开关让「重读列表」拿到和服务端一致的结果
+  let deleted = false
+  useRoutes([
+    { path: '/api/v1/analysis/departments', response: () => jsonResponse(DEPARTMENTS) },
+    {
+      method: 'DELETE',
+      path: '/api/v1/ai/agent/sessions/7',
+      response: () => {
+        deleted = true
+        return jsonResponse({ id: 7, title: '成本率排查', deleted_messages: 3, deleted: true })
+      }
+    },
+    {
+      path: '/api/v1/ai/agent/sessions/7',
+      response: () =>
+        jsonResponse({
+          data: AGENT_SESSION_ROW,
+          messages: [
+            { role: 'user', content: '成本率为什么异常？', status: 'ok', sources: [] },
+            {
+              role: 'assistant',
+              content: '成本率 0.91，高于阈值 0.8。',
+              status: 'stopped',
+              sources: [{ name: '成本表.xlsx', kind: 'knowledge_base' }],
+              total_tokens: 42,
+              usage_source: 'estimated'
+            }
+          ],
+          status_labels: AGENT_STATUS_LABELS
+        })
+    },
+    {
+      path: '/api/v1/ai/agent/sessions',
+      response: () =>
+        jsonResponse({
+          data: deleted ? [] : [AGENT_SESSION_ROW],
+          total: deleted ? 0 : 1,
+          limit: 50,
+          offset: 0,
+          untitled: '未命名会话'
+        })
+    },
+    {
+      path: '/api/v1/ai/agent/usage',
+      response: () =>
+        jsonResponse({
+          data: {
+            days: 7,
+            answers: 3,
+            questions: 3,
+            sessions: 2,
+            prompt_tokens: 90,
+            completion_tokens: 30,
+            total_tokens: 120,
+            api_answers: 1,
+            estimated_answers: 2,
+            free_answers: 0,
+            by_status: [{ status: 'ok', label: '已完成', count: 3 }],
+            by_day: [{ date: '2026-07-31', answers: 2, total_tokens: 80 }],
+            stopped: 0,
+            failed: 0
+          },
+          series: [
+            { date: '2026-07-31', answers: 2, total_tokens: 80 },
+            { date: '2026-08-01', answers: 1, total_tokens: 40 }
+          ],
+          status_labels: AGENT_STATUS_LABELS
+        })
+    }
+  ])
+  const router = makeRouter()
+  router.push('/agent')
+  await router.isReady()
+  const AgentWorkbench = (await import('../src/views/AgentWorkbench.vue')).default
+  const view = mount(AgentWorkbench, { global: { plugins: [router] } })
+
+  assert.ok(await waitFor(() => view.text().includes('成本率排查')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /2 问 · 42 tokens/)
+  // 用量卡：总量 + 估算说明；逐日明细收在 <details> 里（它带日期，展开渲染会让截图基线天天变）
+  assert.match(view.text(), /3 次回答 · 120 tokens/)
+  assert.match(view.text(), /其中 1 次由接口上报真实用量，2 次按字数估算/)
+  assert.match(view.text(), /按天明细（近 7 天）/)
+  const usageDays = view.find((node) => String(node.props.class || '').includes('usage-days-details'))
+  assert.ok(usageDays, `找不到按天明细的 details：${view.text()}`)
+  assert.match(textOf(usageDays), /07-31/)
+  assert.match(textOf(usageDays), /08-01/)
+
+  // 会话行按钮里除了标题还有「2 问 · 42 tokens」，按 class 找，不按整段文本
+  const sessionRow = view.find(
+    (node) => String(node.props.class || '').includes('session-open') && textOf(node).includes('成本率排查')
+  )
+  assert.ok(sessionRow, `找不到会话行：${view.text()}`)
+  await view.click(sessionRow)
+  assert.ok(
+    await waitFor(() => view.text().includes('成本率 0.91，高于阈值 0.8。')),
+    `实际渲染：${view.text()}\n请求：${JSON.stringify(fetchImpl.calls)}`
+  )
+  assert.match(view.text(), /成本率为什么异常？/)
+  assert.match(view.text(), /（这条回答被停止，只保留已生成的部分）/)
+  assert.match(view.text(), /本回答 42 tokens（按字数估算）/)
+  assert.match(fetchImpl.calls.map((call) => call.path).join('\n'), /\/api\/v1\/ai\/agent\/sessions\/7\b/)
+
+  await view.click('删除')
+  assert.ok(
+    await waitFor(() =>
+      fetchImpl.calls.some((call) => call.method === 'DELETE' && call.path === '/api/v1/ai/agent/sessions/7')
+    ),
+    JSON.stringify(fetchImpl.calls)
+  )
+  // 删掉的正好是当前会话：对话框回到空态（旧问答不能留在屏幕上），列表也要重读到空
+  assert.ok(await waitFor(() => view.text().includes('还没有会话')), `实际渲染：${view.text()}`)
+  assert.doesNotMatch(view.text(), /成本率 0.91，高于阈值 0.8。/)
+  assert.doesNotMatch(view.text(), /本回答 42 tokens/)
+  assert.match(view.text(), /试试这些问题/)
+  view.app.unmount()
+})
+
+const ADMIN_OVERVIEW = {
+  counts: {
+    users: 5,
+    admins: 1,
+    transactions: 8909,
+    metrics: 196,
+    alerts: 68,
+    knowledge_chunks: 5,
+    knowledge_sources: 3,
+    batches: 4
+  },
+  periods: { latest: '2026-07', all: ['2026-06', '2026-07'] },
+  me: { id: 1, username: 'admin' },
+  quality: [{ name: '有明细但缺指标的期间', value: 0, level: 'ok', hint: '没有对不上的期间' }],
+  rollups: {
+    rows: 6,
+    company_rows: 4,
+    department_rows: 2,
+    quarters: ['2026-Q3'],
+    years: ['2026'],
+    incomplete: []
+  },
+  recent_batches: [],
+  observability: {
+    total: 12,
+    p95_duration_ms: 30,
+    requests: {},
+    samples_per_path: 200,
+    slow_paths: [],
+    slow_default_ms: 1000,
+    slow_overrides: {}
+  }
+}
+
+test('管理概览（⑮）：Agent 用量卡按用户列 token，它自己挂掉时整页概览仍然在', async () => {
+  await seedUser({ unrestricted: true, departments: [] })
+  let usageFails = false
+  useRoutes([
+    { path: '/api/v1/admin/overview', response: () => jsonResponse(ADMIN_OVERVIEW) },
+    {
+      path: '/api/v1/admin/agent-usage',
+      response: () =>
+        usageFails
+          ? jsonResponse({ detail: '统计服务不可用' }, { status: 500 })
+          : jsonResponse({
+              data: {
+                days: 7,
+                answers: 2,
+                questions: 2,
+                sessions: 1,
+                prompt_tokens: 2223,
+                completion_tokens: 1100,
+                total_tokens: 3323,
+                api_answers: 1,
+                estimated_answers: 1,
+                free_answers: 0,
+                by_status: [{ status: 'stopped', label: '已停止', count: 1 }],
+                by_day: [{ date: '2026-10-08', answers: 2, total_tokens: 3323 }],
+                by_user: [{ username: 'demo_analyst', department: '不受限', answers: 2, total_tokens: 3323 }],
+                stopped: 1,
+                failed: 0
+              },
+              series: [{ date: '2026-10-08', answers: 2, total_tokens: 3323 }],
+              status_labels: AGENT_STATUS_LABELS
+            })
+    }
+  ])
+  const router = makeRouter()
+  router.push('/admin')
+  await router.isReady()
+  const AdminOverview = (await import('../src/views/AdminOverview.vue')).default
+  const view = mount(AdminOverview, { global: { plugins: [router] } })
+
+  assert.ok(await waitFor(() => view.text().includes('Agent 用量')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /近 7 天，按回答统计/)
+  assert.match(view.text(), /3323 tokens/)
+  assert.match(view.text(), /demo_analyst/)
+  assert.match(view.text(), /不受限 · 2 条回答/)
+  assert.match(view.text(), /账单价 1 条 · 估算\s*1 条/)
+  assert.match(view.text(), /2026-10-08/)
+  assert.match(fetchImpl.calls.map((call) => call.path).join('\n'), /\/api\/v1\/admin\/agent-usage\?days=7/)
+
+  // 用量统计失败不该把整页变成错误页：概览数字与用量卡各自的错误提示同时在
+  usageFails = true
+  await view.click('↻ 重新读取')
+  assert.ok(await waitFor(() => view.text().includes('读取 Agent 用量失败')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /8909 行/)
+  assert.doesNotMatch(view.text(), /读取管理概览失败/)
+  view.app.unmount()
+})
+
 test.after(() => {
   resetShims()
   clearCurrentUser()

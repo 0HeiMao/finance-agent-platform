@@ -15,6 +15,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from backend import metrics, observability
 from backend.api_admin import router as admin_router
+from backend.api_agent import router as agent_router
 from backend.api_ai import router as ai_router
 from backend.api_analysis import router as analysis_router
 from backend.api_dashboard import router as dashboard_router
@@ -140,6 +141,8 @@ app.include_router(auth_router)
 app.include_router(financial_router)
 app.include_router(analysis_router)
 app.include_router(ai_router)
+# Agent 会话与用量（⑮）：与 ai_router 同前缀，但状态机在 backend/agent_sessions.py
+app.include_router(agent_router)
 app.include_router(forecast_router)
 app.include_router(reports_router)
 app.include_router(system_router)

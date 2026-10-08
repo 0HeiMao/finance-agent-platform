@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import alerts_outbound, audit, batch_ops, jobs, lockout, rollups
+from backend import agent_sessions, alerts_outbound, audit, batch_ops, jobs, lockout, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
@@ -676,6 +676,22 @@ def get_job(job_id: int, db: Session = Depends(get_db), _: User = Depends(admin_
     if job is None:
         raise HTTPException(404, "没有这条后台任务")
     return jobs.serialize(job)
+
+
+@router.get("/agent-usage")
+def agent_usage_summary(
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+):
+    """跨用户的 Agent 问答用量（⑮）。
+
+    与 `/api/v1/ai/agent/usage` 分开是因为口径不同：那个只报本人，这个按用户拆开，给管理员看
+    「谁在烧 token」。`estimated` 与 `api` 也分开计数 —— 估算出来的数字只能当参考，不是账单。
+    """
+    stats = agent_sessions.usage_stats(db, user_id=None, days=days)
+    return {"data": stats, "series": agent_sessions.daily_series(stats),
+            "status_labels": agent_sessions.STATUS_LABELS}
 
 
 @router.get("/knowledge")

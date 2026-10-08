@@ -478,15 +478,22 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 
 | 方法 | 路径 | 请求体 | 说明 |
 | --- | --- | --- | --- |
-| POST | `/ai/rag/chat` | `{"question":"..."}` | 知识库问答，返回 `{answer_status,answer,sources,embedding_model}` |
+| POST | `/ai/rag/chat` | `{"question":"..."}` | 知识库问答，返回 `{answer_status,answer,sources,embedding_model}`；**不落库、不记账** |
 | POST | `/ai/agent/ask` | `{"question":"..."}` | 同上 |
-| POST | `/ai/agent/chat/stream` | `{"question":"..."}` | SSE 流式 |
+| POST | `/ai/agent/chat/stream` | `{"question":"..."}` | SSE 流式；可用查询参数 `?session_id=<会话 id>` **接着已有会话问**（不带就按会话里的立场新起一条会话） |
+| GET | `/ai/agent/sessions?limit=&offset=` | — | 我的会话列表（倒序）：`{data,total,limit,offset,untitled}`，每行 `{id,title,display_title,scope,answers,total_tokens,created_at,updated_at}` |
+| POST | `/ai/agent/sessions` | `{"title"?: "..."}` | 显式建会话，成功 **201 且直接返回会话体（不裹 `data`）**；标题会压掉首尾空白，超过 120 字 → 422 |
+| GET | `/ai/agent/sessions/{session_id}` | — | 会话详情：`{data,messages,status_labels}`；**别人的会话与不存在的会话都 404** |
+| DELETE | `/ai/agent/sessions/{session_id}` | — | 删会话（连同它的消息）：`{"id","title","deleted_messages","deleted":true}`；别人的会话 404 |
+| POST | `/ai/agent/sessions/{session_id}/stop` | — | 停止正在生成的回答：`{"session_id","stopped":true,...}`；该会话当前**没有**正在生成的回答 → **409 `这个会话当前没有正在生成的回答`** |
+| GET | `/ai/agent/usage?days=30` | — | 我的用量：`{data,series,status_labels}`；`days` 取 1..365（越界 422） |
 
 流式响应为 `text/event-stream`：
 
 ```text
+event: start\ndata: {"session_id":12,"message_id":34,"question_message_id":33,"title":"本月收入"}\n\n
 event: delta\ndata: {"text":"本月"}\n\n
-event: done\ndata: {"sources":[{"name":"财务汇总表 2026-07","kind":"financial_metric"}],"has_financial_data":true,"matched_period":"2026-07"}\n\n
+event: done\ndata: {"session_id":12,"message_id":34,"status":"ok","stopped":false,"sources":[{"name":"财务汇总表 2026-07","kind":"financial_metric"}],"has_financial_data":true,"matched_period":"2026-07","knowledge_chunks":3,"scope":{"departments":[]},"tokens":{"prompt_tokens":2223,"completion_tokens":1100,"total_tokens":3323,"usage_source":"api"},"duration_ms":19063}\n\n
 event: error\ndata: {"message":"模型暂时不可用"}\n\n
 ```
 
@@ -500,6 +507,27 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 的 `name` 是文件名，所以展示时按「名字是否已以类型开头」决定要不要补前缀，并对同名片段去重
 （`frontend/src/utils/markdown.js` 只负责把回答渲染成标题 / 列表 / 表格，转义在解析之前完成）。
 
+### 会话落库、停止生成与用量口径
+
+`/ai/rag/chat` 与 `/ai/agent/ask` 是一次性的，`/ai/agent/chat/stream` 则会把提问与回答都写进
+`agent_sessions` / `agent_messages`（`backend/agent_sessions.py`），所以它有下面这些额外语义：
+
+- **`start` 事件先于第一块 `delta`**：会话 id 与两条消息 id 在这时就交给前端了。前端若没显式建会话，
+  就用这个 id 记住会话（后续追问带 `?session_id=`）；显式建过的会话沿用原来的 id。
+- **回答先落一行 `status="streaming"` 再调用模型**，所以生成中刷新页面能看到「生成中」。
+  进程被杀会留下孤儿行，读的时候按 `STREAMING_STALE_SECONDS = 120` 判成「已中断」（`effective_status()`），
+  库里那份不动。状态只有五个：`streaming` / `ok` / `stopped` / `error` / `interrupted`。
+- **停止生成是显式请求**，不是断开连接：`POST …/stop` 置标志位，生成器每块查一次，收尾时把已生成的正文
+  按 `status="stopped"` 落库并在 `done` 里回 `stopped: true`。没有正在生成的回答 → 409。
+- **token 两路记账，别把估算当账单**：最后一帧报了用量就是 `usage_source="api"`；被停止 / 出错拿不到用量，
+  按 `CHARS_PER_TOKEN = 1.5` 折算为 `estimated`；一次模型都没调用则是 `free`。`data` 里三者分开计数
+  （`api_answers` / `estimated_answers` / `free_answers`），`series` 是**含今天的 N 个自然日**（起点对齐
+  那一天的 00:00 UTC），没问的日子补 0。
+- **归属只有一条规则**：会话属于提问的人，别人的会话 id 一律 404（不区分「没有」与「不是你的」）。
+  跨用户的用量只在管理员端点 `GET /admin/agent-usage` 看汇总。
+- 令牌与 `X-User-Department` 的口径与其它接口一致：会话的 `scope` 记的是提问时的口径快照。
+- 完整前缀是 `/api/v1/ai/agent/...`（`backend/api_agent.py` 的 `prefix="/api/v1/ai"`），漏掉 `/ai` 会 404。
+
 ## 管理员
 
 所有 `/admin/*` 接口都经过 `admin_user` 依赖：**`User.department` 为空 = 不受部门限制 = 管理员**
@@ -509,6 +537,7 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测（含**慢接口告警** `observability.slow_paths`） |
+| GET | `/admin/agent-usage?days=7` | **全员** Agent 用量（`days` 取 1..365，越界 422）：`{data,series,status_labels}`，比 `GET /ai/agent/usage` 多一份按用户的 `data.by_user`（每行 `{user_id,username,department,answers,total_tokens}`，未受限账号的 `department` 是「不受限」）。管理概览页的「Agent 用量」卡就走它，**它挂掉不该影响整页概览** |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
 | GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、登录态三个字段 `failed_attempts`/`locked_until`/`locked`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |

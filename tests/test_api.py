@@ -414,7 +414,7 @@ async def test_rag_search_rejects_mismatched_embedding_model(anon_client, auth_h
 
 
 async def test_agent_stream_requires_token_and_streams_sse(anon_client, auth_headers, stub_retrieval, monkeypatch):
-    def fake_stream(question, context):
+    def fake_stream(question, context, usage=None):
         yield "依据"
         yield "证据"
 
@@ -423,6 +423,7 @@ async def test_agent_stream_requires_token_and_streams_sse(anon_client, auth_hea
                                   json={"question": "差旅费标准是多少？"}) as response:
         assert response.status_code == 200
         body = "".join([chunk async for chunk in response.aiter_text()])
+    assert "event: start" in body
     assert "event: delta" in body
     assert "event: done" in body
     assert "knowledge_chunks" in body
@@ -4255,6 +4256,299 @@ async def test_alert_channel_endpoints_require_admin(anon_client, api_app):
         assert denied.status_code == 403 and "需要管理员权限" in denied.json()["detail"]
         assert (await client.post("/api/v1/admin/alerts/notify", json={},
                                   headers=headers)).status_code == 403
+    finally:
+        await client.aclose()
+
+
+# ---------------------------------------------------------------- Agent 会话落库与停止生成（⑮）
+
+
+def _agent_events(body: str) -> list[tuple[str, dict]]:
+    """把 SSE 文本拆成 (事件名, 数据)；只服务测试，不追求协议完备。"""
+    events: list[tuple[str, dict]] = []
+    for block in body.split("\n\n"):
+        if not block.strip():
+            continue
+        name, payload = "delta", {}
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                payload = json.loads(line.split(":", 1)[1].strip())
+        events.append((name, payload))
+    return events
+
+
+def _agent_text(events: list[tuple[str, dict]]) -> str:
+    return "".join(item.get("text", "") for name, item in events if name == "delta")
+
+
+def _agent_llm(chunks=("依据", "证据"), tokens=(12, 5), before_second=None) -> SimpleNamespace:
+    """假的模型：块内容与用量可指定；`before_second` 用来在第二块之前挂住（测停止）。"""
+    def stream(question, context, usage=None):
+        if usage is not None and tokens:
+            usage.update({"prompt_tokens": tokens[0], "completion_tokens": tokens[1]})
+        for index, chunk in enumerate(chunks):
+            if before_second is not None and index == 1:
+                before_second()
+            yield chunk
+
+    return SimpleNamespace(stream=stream)
+
+
+class _RealAgentDatabase:
+    """把整条请求链路切到真库（绕过 conftest 的 savepoint）。
+
+    ⑮ 的流式落库会在 Starlette 的线程池里另开一个会话写回答，savepoint 里尚未提交的占位行
+    它看不见——所以流式用例必须让接口与生成器看到同一份真库数据，结束时按用户名精确清理。
+    """
+
+    def __init__(self, api_app):
+        self.api_app = api_app
+        self.username = f"pytest-agent-{uuid.uuid4().hex[:10]}"
+        self.password = "pytest-agent-2026"
+        self.headers: dict = {}
+
+    async def __aenter__(self):
+        from backend.db import SessionLocal, get_db
+
+        def real_get_db():
+            db = SessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        self.SessionLocal = SessionLocal
+        self.api_app.dependency_overrides[get_db] = real_get_db
+        return self
+
+    async def login(self, client) -> dict:
+        registered = await client.post("/api/v1/auth/register",
+                                       json={"username": self.username, "password": self.password})
+        assert registered.status_code == 200, registered.text
+        response = await client.post("/api/v1/auth/login",
+                                     json={"username": self.username, "password": self.password})
+        assert response.status_code == 200, response.text
+        self.headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+        return self.headers
+
+    async def __aexit__(self, *exc) -> None:
+        from sqlalchemy import delete
+
+        from backend.models import AgentMessage, AgentSession, AuditLog, User
+
+        with self.SessionLocal() as db:
+            user = db.execute(select(User).where(User.username == self.username)).scalars().first()
+            if user is None:
+                return
+            db.execute(delete(AgentMessage).where(AgentMessage.user_id == user.id))
+            db.execute(delete(AgentSession).where(AgentSession.user_id == user.id))
+            db.execute(delete(AuditLog).where(AuditLog.actor == self.username))
+            db.delete(user)
+            db.commit()
+
+
+async def test_agent_sessions_crud_ownership_and_audit(anon_client, api_app, auth_headers):
+    """会话是本人的私产：能建/列/看/删，别人的既看不见也删不掉，删除要留审计。"""
+    created = await anon_client.post("/api/v1/ai/agent/sessions", headers=auth_headers,
+                                     json={"title": "  成本率排查  "})
+    assert created.status_code == 201, created.text
+    session = created.json()                                # 建会话直接返回会话本身
+    assert session["title"] == "成本率排查"                 # 首尾空白被压掉
+    assert session["answers"] == 0 and session["total_tokens"] == 0
+    session_id = session["id"]
+
+    listed = (await anon_client.get("/api/v1/ai/agent/sessions", headers=auth_headers)).json()
+    assert any(item["id"] == session_id for item in listed["data"])
+    assert listed["untitled"] == "未命名会话"
+
+    detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                    headers=auth_headers)).json()
+    assert detail["data"]["id"] == session_id and detail["messages"] == []
+    assert detail["status_labels"]["stopped"] == "已停止"
+
+    untitled = await anon_client.post("/api/v1/ai/agent/sessions", headers=auth_headers, json={})
+    assert untitled.status_code == 201
+    assert untitled.json()["title"] == ""
+    assert untitled.json()["display_title"] == "未命名会话"
+
+    headers, stranger = await _scoped_headers(anon_client, api_app, "部门A")
+    try:
+        assert (await stranger.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                   headers=headers)).status_code == 404
+        assert (await stranger.delete(f"/api/v1/ai/agent/sessions/{session_id}",
+                                      headers=headers)).status_code == 404
+    finally:
+        await stranger.aclose()
+
+    removed = await anon_client.delete(f"/api/v1/ai/agent/sessions/{session_id}", headers=auth_headers)
+    assert removed.status_code == 200
+    assert removed.json() == {"id": session_id, "title": "成本率排查",
+                              "deleted_messages": 0, "deleted": True}
+    assert (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                  headers=auth_headers)).status_code == 404
+
+    logged = (await _audit(anon_client, auth_headers, action="agent_session.delete"))["data"]
+    assert any(row["target_id"] == str(session_id) and row["detail"]["messages"] == 0
+               for row in logged)
+
+
+async def test_agent_stream_persists_session_tokens_and_usage(anon_client, api_app,
+                                                              stub_retrieval, monkeypatch):
+    """一次真流式问答：会话/提问/回答/token 全部落库，done 事件里的数字与库里一致。"""
+    monkeypatch.setattr("backend.api_ai.get_llm", lambda: _agent_llm())
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        async with anon_client.stream("POST", "/api/v1/ai/agent/chat/stream", headers=headers,
+                                      json={"question": "差旅费标准是多少？"}) as response:
+            assert response.status_code == 200
+            body = "".join([chunk async for chunk in response.aiter_text()])
+
+        events = _agent_events(body)
+        assert events[0][0] == "start" and events[-1][0] == "done"
+        start, done = events[0][1], events[-1][1]
+        assert start["title"].startswith("差旅费标准")
+        assert done["session_id"] == start["session_id"] and done["status"] == "ok"
+        assert done["stopped"] is False
+        assert done["tokens"] == {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17,
+                                  "usage_source": "api"}
+        assert _agent_text(events) == "依据证据"
+        session_id = start["session_id"]
+
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                        headers=headers)).json()
+        assert [item["role"] for item in detail["messages"]] == ["user", "assistant"]
+        answer = detail["messages"][1]
+        assert answer["content"] == "依据证据" and answer["status"] == "ok"
+        assert answer["usage_source"] == "api" and answer["total_tokens"] == 17
+        assert answer["duration_ms"] is not None
+        assert detail["data"]["answers"] == 1 and detail["data"]["total_tokens"] == 17
+
+        usage = (await anon_client.get("/api/v1/ai/agent/usage?days=1", headers=headers)).json()
+        assert usage["data"]["api_answers"] == 1 and usage["data"]["total_tokens"] == 17
+        assert [item["total_tokens"] for item in usage["series"]] == [17]
+        assert "by_user" not in usage["data"]                 # 按用户拆开只给管理员端点
+
+        # 追加到同一个会话：第二轮问答进同一个 session，回答数累加
+        async with anon_client.stream("POST", f"/api/v1/ai/agent/chat/stream?session_id={session_id}",
+                                      headers=headers, json={"question": "住宿标准呢？"}) as response:
+            again = _agent_events("".join([chunk async for chunk in response.aiter_text()]))
+        assert again[0][1]["session_id"] == session_id
+        assert again[0][1]["title"] == start["title"]          # 已有标题不覆盖
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                        headers=headers)).json()
+        assert len(detail["messages"]) == 4 and detail["data"]["answers"] == 2
+        assert detail["data"]["total_tokens"] == 34
+
+        missing = await anon_client.post("/api/v1/ai/agent/chat/stream?session_id=999999999",
+                                         headers=headers, json={"question": "还在吗？"})
+        assert missing.status_code == 404
+
+
+async def _wait_for_streaming_row(real, session_id: int, timeout: float = 10.0):
+    """轮询真库，等那条 `streaming` 的占位回答出现（httpx 的 ASGITransport 会把响应体攒完
+    再交给调用方，所以不能靠"读到第一个 delta"来判断流已经开始了）。"""
+    import asyncio
+    import time
+
+    from backend.models import AgentMessage
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with real.SessionLocal() as db:
+            row = db.execute(select(AgentMessage).where(
+                AgentMessage.session_id == session_id, AgentMessage.role == "assistant",
+                AgentMessage.status == "streaming")).scalars().first()
+            if row is not None:
+                return row.id
+        await asyncio.sleep(0.05)
+    return None
+
+
+async def test_agent_stop_marks_the_answer_stopped(anon_client, api_app, stub_retrieval, monkeypatch):
+    """停止生成：服务端标志位一置，生成器下一块就收尾，已生成的部分按「已停止」落库。"""
+    import asyncio
+    import threading
+
+    gate = threading.Event()
+
+    def wait_for_the_test():
+        assert gate.wait(timeout=15), "测试没有放开闸门"
+
+    monkeypatch.setattr("backend.api_ai.get_llm", lambda: _agent_llm(
+        chunks=("已经写了一半", "这半句不该出现"), tokens=None, before_second=wait_for_the_test))
+
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        created = await anon_client.post("/api/v1/ai/agent/sessions", headers=headers, json={})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+
+        async def drive():
+            async with anon_client.stream("POST", f"/api/v1/ai/agent/chat/stream?session_id={session_id}",
+                                          headers=headers, json={"question": "成本率怎么了？"}) as response:
+                assert response.status_code == 200
+                return "".join([chunk async for chunk in response.aiter_text()])
+
+        task = asyncio.create_task(drive())
+        try:
+            message_id = await _wait_for_streaming_row(real, session_id)
+            assert message_id is not None, "占位回答没落库"
+            stopped = await anon_client.post(f"/api/v1/ai/agent/sessions/{session_id}/stop",
+                                            headers=headers)
+            assert stopped.status_code == 200, stopped.text
+            assert stopped.json() == {"session_id": session_id, "message_id": message_id,
+                                      "stopped": True}
+        finally:
+            gate.set()                                        # 用例早早失败时别把线程池挂死
+        body = await asyncio.wait_for(task, timeout=20)
+
+        events = _agent_events(body)
+        done = events[-1][1]
+        assert done["status"] == "stopped" and done["stopped"] is True
+        assert _agent_text(events) == "已经写了一半"           # 停住之后不再产出
+
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                        headers=headers)).json()
+        answer = detail["messages"][-1]
+        assert answer["status"] == "stopped" and answer["status_label"] == "已停止"
+        assert answer["content"] == "已经写了一半"
+        assert answer["usage_source"] == "estimated" and answer["total_tokens"] > 0
+
+        again = await anon_client.post(f"/api/v1/ai/agent/sessions/{session_id}/stop", headers=headers)
+        assert again.status_code == 409                       # 已经没有在生成的了
+
+
+async def test_agent_endpoints_require_token_and_usage_scope(anon_client, api_app, auth_headers):
+    """会话与用量都要求登录；跨用户用量只给管理员，部门账号只看得到自己的。"""
+    for method, path in (("get", "/api/v1/ai/agent/sessions"),
+                         ("post", "/api/v1/ai/agent/sessions"),
+                         ("get", "/api/v1/ai/agent/usage"),
+                         ("get", "/api/v1/admin/agent-usage")):
+        call = getattr(anon_client, method)
+        response = await (call(path, json={}) if method == "post" else call(path))
+        assert response.status_code == 401, (method, path, response.status_code)
+
+    mine = await anon_client.get("/api/v1/ai/agent/usage?days=7", headers=auth_headers)
+    assert mine.status_code == 200
+    assert mine.json()["data"]["days"] == 7 and "by_user" not in mine.json()["data"]
+    assert len(mine.json()["series"]) == 7
+
+    overview = await anon_client.get("/api/v1/admin/agent-usage", headers=auth_headers)
+    assert overview.status_code == 200
+    assert "by_user" in overview.json()["data"]               # 无部门账号 = 不受限 = 管理员
+    assert overview.json()["status_labels"]["interrupted"] == "已中断"
+
+    # 后台任务式的越界参数要被挡下
+    assert (await anon_client.get("/api/v1/admin/agent-usage?days=0",
+                                  headers=auth_headers)).status_code == 422
+
+    headers, client = await _scoped_headers(anon_client, api_app, "部门A")
+    try:
+        denied = await client.get("/api/v1/admin/agent-usage", headers=headers)
+        assert denied.status_code == 403 and "需要管理员权限" in denied.json()["detail"]
+        assert (await client.get("/api/v1/ai/agent/usage", headers=headers)).status_code == 200
     finally:
         await client.aclose()
 
