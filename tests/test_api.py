@@ -2989,3 +2989,164 @@ async def test_transaction_correction_permissions_and_validation(anon_client, ap
     assert same.status_code == 422 and "一致" in same.json()["detail"]
     assert (await anon_client.patch("/api/v1/financial/transactions/99999999", headers=auth_headers,
                                     json={"revenue_amount": "1.00"})).status_code == 404
+
+
+# ------------------------------------------- 并发重算互斥（期间锁，②）
+
+LOCK_SQL = "pg_advisory_xact_lock"
+
+
+def _capture_locks():
+    """抓「发出去的 SQL + 绑定参数」，返回 (seen, stop)。调用方必须在 finally 里 stop()。"""
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    seen: list[tuple[str, dict]] = []
+
+    def record(_conn, _cursor, statement, parameters, _context, _many):
+        seen.append((" ".join(statement.split()), dict(parameters) if parameters else {}))
+
+    event.listen(Engine, "before_cursor_execute", record)
+    return seen, lambda: event.remove(Engine, "before_cursor_execute", record)
+
+
+def _lock_state(seen, candidates) -> tuple[list[str], list[int]]:
+    """把抓到的加锁语句还原成 (按加锁顺序的期间名, 不在候选全集里的 key)。
+
+    锁语句里只有算好的 key，所以要把候选期间（含各自的季/年）算成 key 才能反查回来。
+    第二个返回值是「本次锁了候选之外的期间」——出现它说明锁集合与预期不符，用例应当报出来。
+    """
+    from backend.locks import lock_key, period_lock_set
+
+    names = {lock_key(name): name for name in period_lock_set(candidates)}
+    order: list[str] = []
+    unknown: list[int] = []
+    for statement, params in seen:
+        if LOCK_SQL not in statement:
+            continue
+        key = params.get("key")
+        if key in names:
+            order.append(names[key])
+        else:
+            unknown.append(key)
+    return order, unknown
+
+
+async def test_calculate_takes_period_lock_including_quarter_and_year(anon_client, auth_headers, db_session):
+    """重算某个月必须在**改数据之前**持有「这个月 + 它所在的季与年」的事务锁。
+
+    断言的是接口真发出去的 `SELECT pg_advisory_xact_lock(:key)`（不是源码里有没有这个词）：
+    重算是「读明细 → 删旧指标/预警 → 重写」的读改写，两个并发请求会各写一份少算对方数据的
+    结果而且不报错。季与年也要锁，因为这次重算会连带刷新它们的落库行。
+    """
+    _seed_row(db_session, day=5)
+    seen, stop = _capture_locks()
+    try:
+        response = await anon_client.post(f"/api/v1/analysis/calculate?period={TX_PERIOD}",
+                                          headers=auth_headers)
+    finally:
+        stop()
+
+    assert response.status_code == 200, response.text
+    locks_taken, unknown = _lock_state(seen, [TX_PERIOD])
+    assert unknown == [], f"锁了预期之外的期间：{unknown}"
+    assert set(locks_taken) == {TX_PERIOD, "2097-Q4", "2097"}, locks_taken
+    # 加锁必须在「删指标」之前：改完才锁，另一个重算这一期的请求已经读到旧数据了
+    first_lock = next(index for index, (sql, _p) in enumerate(seen) if LOCK_SQL in sql)
+    first_delete = next(index for index, (sql, _p) in enumerate(seen)
+                        if sql.startswith("DELETE FROM financial_metrics"))
+    assert first_lock < first_delete, seen
+
+
+async def test_correction_locks_both_periods_before_touching_the_row(anon_client, auth_headers, db_session):
+    """更正把一行搬到别的月份时，新旧两期要**一起**锁上，且都在改行之前。
+
+    只锁旧期（或改完再补锁新期）等于没锁：并发重算旧期的请求仍可能读到改到一半的行集合；
+    分两次取锁还会与「反向搬运」的另一个请求互相等成 Postgres deadlock detected。
+    """
+    row = _seed_row(db_session, day=6)
+    seen, stop = _capture_locks()
+    try:
+        response = await anon_client.patch(
+            f"/api/v1/financial/transactions/{row.id}", headers=auth_headers,
+            json={"transaction_date": "2097-11-02"})
+    finally:
+        stop()
+
+    assert response.status_code == 200, response.text
+    locks_taken, unknown = _lock_state(seen, [TX_PERIOD, "2097-11"])
+    assert unknown == [], f"锁了预期之外的期间：{unknown}"
+    assert {"2097-11", "2097-12"} <= set(locks_taken), locks_taken
+    first_lock = next(index for index, (sql, _p) in enumerate(seen) if LOCK_SQL in sql)
+    first_update = next(index for index, (sql, _p) in enumerate(seen)
+                        if sql.startswith("UPDATE financial_transactions"))
+    assert first_lock < first_update, seen
+
+
+async def test_import_takes_all_period_locks_before_inserting(anon_client, auth_headers, tmp_path, monkeypatch):
+    """一份文件涉及多期时，要**一次性**把全集锁全，再开始插行。
+
+    一圈循环里逐期加锁是并发版的经典坑：两个多期请求各持一半、又都在等对方剩下的那半，
+    Postgres 会掐掉一个并报 deadlock detected。这里卡住顺序：先锁，后 INSERT。
+    """
+    monkeypatch.setattr("backend.api_financial.get_settings",
+                        lambda: SimpleNamespace(upload_dir=str(tmp_path)))
+    payload = _csv_bytes("2097-01-03,6001,一月,部门-097,跨期导入,100,0,0,0,0\n"
+                         "2097-02-04,6001,二月,部门-097,跨期导入,200,0,0,0,0")
+    seen, stop = _capture_locks()
+    try:
+        response = await anon_client.post("/api/v1/financial/import", headers=auth_headers,
+                                          files={"file": ("lock.csv", io.BytesIO(payload), "text/csv")})
+    finally:
+        stop()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is True
+    # 导入会多出一把锁：文件内容哈希（`:79` 的查重锁），两把锁各管一件事，都不是多余的
+    locks_taken, unknown = _lock_state(seen, ["2097-01", "2097-02"])
+    assert unknown == [int(body["batch"][:15], 16)], f"除了去重锁，不该锁别的：{unknown}"
+
+    # 关键点：这次请求**最早**取的那批期间锁必须是「两期 + 各自的季/年」的全集、且按名字排序。
+    # 首个 INSERT 已经在第一期重算里面了（calculate 里 flush 才落行），所以这里看的是
+    # 「插行之前的加锁序列以全集开头」，而不是「插行前只有这些锁」——每期重算会再重复锁子集。
+    expected = ["2097", "2097-01", "2097-02", "2097-Q1"]
+    first_insert = next(index for index, (sql, _p) in enumerate(seen)
+                        if sql.startswith("INSERT INTO financial_transactions"))
+    before_insert, _unknown = _lock_state(seen[:first_insert], ["2097-01", "2097-02"])
+    assert before_insert[:len(expected)] == expected, (
+        f"插行前第一批锁必须是全集且按排序取锁：{before_insert}")
+
+    # 之后每个期间的重算只会重复锁已持有的子集，不会冒出新的期间（冒出新的就是「逐期取锁」了）
+    assert set(locks_taken) == set(expected), (
+        f"出现了全集之外的期间锁，说明锁不是一次取全的：{sorted(set(locks_taken) - set(expected))}")
+    # 锁都要在插行之前取到（`seen[:first_insert]` 里已经能取到上面那把全集锁）
+    first_lock = next(index for index, (sql, _p) in enumerate(seen) if LOCK_SQL in sql)
+    assert first_lock < first_insert, seen
+
+
+async def test_rollup_rebuild_locks_the_quarter_it_rewrites(anon_client, auth_headers, db_session):
+    """管理端重算落库同样是「按期先删后建」，所以它也要锁住那些季/年。
+
+    不锁的话，并发的一次月重算会把刚写好的季度合计覆盖成少算一个月的版本（数字变小、无报错）。
+    """
+    _drop_rollups(db_session)
+    for month in ROLLUP_MONTHS:
+        _seed_metric(db_session, month, revenue="1000.00", expense="200.00")
+
+    seen, stop = _capture_locks()
+    try:
+        response = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                          json={"periods": [ROLLUP_QUARTER]})
+    finally:
+        stop()
+
+    assert response.status_code == 200, response.text
+    locks_taken, unknown = _lock_state(seen, ["2098-04", "2098-05", "2098-06"])
+    assert unknown == [], f"锁了预期之外的期间：{unknown}"
+    assert locks_taken == [ROLLUP_QUARTER], locks_taken
+    first_lock = next(index for index, (sql, _p) in enumerate(seen) if LOCK_SQL in sql)
+    first_delete = next(index for index, (sql, _p) in enumerate(seen)
+                        if sql.startswith("DELETE FROM financial_rollups"))
+    assert first_lock < first_delete, seen
+

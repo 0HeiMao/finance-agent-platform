@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import extract, func, select, delete
 from sqlalchemy.orm import Session
-from backend import audit, rollups
+from backend import audit, locks, rollups
 from backend.auth import current_user
 from backend.alert_rules import ensure_rules, evaluate, metric_values, resolve_rules
 from backend.db import get_db
@@ -118,6 +118,11 @@ def calculate(db: Session, period: str, commit: bool = True):
     """
     year, month = map(int, period.split("-"))
     datetime(year, month, 1)
+    # 期间锁：这一段是「读明细 → 删旧指标/预警 → 重写」的读改写。两个请求同时重算同一期时，
+    # 彼此读不到对方还没提交的明细，于是各写一份少算了对方数据的结果，而且没有任何报错——
+    # 数字就一直错下去，因为不会有谁再来重算这一期。锁在事务结束时自动释放。
+    # 取锁范围含这个月所在的季与年：季/年落库行是同一次重算的一部分，不能被另一个月份的并发重算覆盖。
+    locks.lock_periods(db, locks.period_lock_set([period]))
     db.flush()
     rules = ensure_rules(db)
     previous = _review_state(db, period)

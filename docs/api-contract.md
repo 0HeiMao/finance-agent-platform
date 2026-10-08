@@ -195,6 +195,17 @@ Retry-After: 42
 审计：`transaction.update`（`detail` 带 `before`/`after`/`periods`）与 `transaction.reverse`
 （`detail` 带 `period`/`reversal_id`/`reason`/`revenue_amount`）。这一页没有删除接口——要整批收回请撤销导入批次。
 
+### 写路径的期间锁（并发重算互斥）
+
+`POST /analysis/calculate`、`POST /financial/import`、`PATCH /financial/transactions/{id}`、
+`POST /financial/transactions/{id}/reverse`、`DELETE /admin/batches/{id}`、`POST /admin/rollups/rebuild`
+这些会改动某一期的接口，进入临界区前都要先拿「这一期（含它的季与年）」的事务级 advisory lock。
+锁是数据库级的，跨进程有效，随事务结束自动释放（提交、回滚、连接断掉都释放）。
+
+对调用方只有一条可观察的影响：**同期并发时请求会排队而不是算错**，所以「同一期的写请求突然变慢」是
+正常现象（不是超时、不是 5xx）。**不会**因此多出状态码：仍然 200，只是耗时里多了一段等锁时间。
+不同期间不互相排队（只有同一年下的不同月份会共享年锁——月重算要刷新年度落库行，属于刻意取舍）。
+
 ## 指标与预警
 
 | 方法 | 路径 | 说明 |

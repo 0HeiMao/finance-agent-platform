@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from hashlib import sha256
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
-from backend import audit, transactions
+from backend import audit, locks, transactions
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
@@ -101,8 +101,12 @@ async def import_excel(request: Request, file: UploadFile = File(...),
             db.rollback()
             return {"success": False, "imported": 0, "errors": errors, "calculated": [], "batch": batch}
         if not rows: raise ValueError('文件没有有效数据行')
-        db.add_all(rows)
         periods = sorted({row.transaction_date.strftime('%Y-%m') for row in rows})
+        # 期间锁：这份文件会改这些期间的行集合，而下面每个期间都要重算指标。
+        # 先一次性把**所有**涉及期间（含各自的季与年）锁全，再插行 —— 分两步或逐个期间循环加锁，
+        # 都可能与另一个多期请求各持一半、互相等对方，Postgres 会掐掉一个并报 deadlock detected。
+        locks.lock_periods(db, locks.period_lock_set(periods))
+        db.add_all(rows)
         calculated = []
         for period in periods:
             metric, period_alerts = calculate(db, period, commit=False)

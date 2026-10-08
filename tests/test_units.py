@@ -482,3 +482,78 @@ def test_combine_sums_amounts_and_recomputes_ratios():
     assert department_single([totals("2026-07", "1", "1", "018")]) is True
     assert department_single([totals("2026-07", "1", "1", "018"), totals("2026-08", "1", "1", "018")]) is True
     assert department_single([totals("2026-07", "1", "1", "018"), totals("2026-08", "1", "1", "097")]) is False
+
+
+# ---------------------------------------------------------------- 期间锁（并发重算）
+def test_period_lock_key_is_stable_namespaced_and_signed_64_bit():
+    """锁 key 必须跨进程/跨重启稳定、不同期间不撞号，并且能塞进 Postgres 的 bigint。
+
+    `pg_advisory_xact_lock` 的 key 是**整个数据库共享**的一个数字空间，所以要用命名空间前缀
+    哈希，别拿一个自增序号（两个库/两类用途会撞上同一个数字，表现为毫不相干的请求互相阻塞）。
+    """
+    from backend import locks
+
+    assert locks.lock_key("2026-07") == locks.lock_key("2026-07")
+    assert locks.lock_key("2026-07") != locks.lock_key("2026-08")
+    assert locks.lock_key("2026-07") != locks.lock_key("2026")
+    assert locks.NAMESPACE, "没有命名空间就等于裸哈希，容易被别处撞上"
+    keys = {locks.lock_key(name) for name in ("2026", "2026-Q2", "2026-04", "2026-05", "2026-06")}
+    assert len(keys) == 5, "不同期间不能算出同一个 key"
+    for key in keys:
+        assert -(2 ** 63) <= key < 2 ** 63, "超出 bigint 会直接报错，等于锁不上"
+
+
+def test_period_lock_set_includes_quarter_and_year():
+    """锁的期间全集 = 这些月 + 它们所在的季与年。
+
+    月重算会连带刷新季/年落库行（`rollups.refresh_for_months`），所以季/年也是同一个临界区；
+    只锁月份时，两个不同月份的并发重算会各自把季度合计覆盖成少算一个月的版本。
+    """
+    from backend import locks
+
+    assert locks.period_lock_set(["2026-05"]) == ["2026", "2026-05", "2026-Q2"]
+    assert locks.period_lock_set(["2026-12"]) == ["2026", "2026-12", "2026-Q4"]
+    # 多个期间合并成一个集合（一次取全，不是逐期分开取）
+    assert locks.period_lock_set(["2026-06", "2026-05"]) == ["2026", "2026-05", "2026-06", "2026-Q2"]
+    # 重复、空值、季/年与乱写的期间：去重、忽略空串，认不出的只锁它自己
+    assert locks.period_lock_set(["2026-05", "2026-05", "", None]) == ["2026", "2026-05", "2026-Q2"]
+    assert locks.period_lock_set(["2026-Q2"]) == ["2026-Q2"]
+
+
+def test_lock_periods_takes_sorted_unique_locks_in_one_batch():
+    """`lock_periods()` 按排序去重的顺序逐个加锁，且顺序必须每次都一样。
+
+    顺序本身不重要，**一致**才重要：两个请求以相反顺序去抢同一组锁就是 deadlock。
+    这里用一个假 Session 记录发出去的参数，连「重复的期间只锁一次」也一起卡住。
+    """
+    from backend import locks
+
+    class FakeSession:
+        def __init__(self):
+            self.keys: list[int] = []
+
+        def execute(self, statement, parameters=None):
+            assert "pg_advisory_xact_lock" in str(statement)
+            self.keys.append(parameters["key"])
+
+    fake = FakeSession()
+    taken = locks.lock_periods(fake, ["2026-Q2", "2026-05", "2026-05", "2026"])
+    assert taken == ["2026", "2026-05", "2026-Q2"]
+    assert fake.keys == [locks.lock_key(name) for name in taken]
+    # 乱序传入也要收敛成同一串 key，否则两个调用方会以相反顺序互抢
+    other = FakeSession()
+    locks.lock_periods(other, ["2026", "2026-Q2", "2026-05"])
+    assert other.keys == fake.keys
+
+    # 补全发生在 lock_periods 内部：只传月名也要连它的季与年一起锁
+    # （真机脚本 scripts/verify_recalc_lock.py 第一版就是在这里露馅的：调用方传原始月名，
+    #  结果只锁住了月，季/年的落库行没人保护，而且不会报任何错）
+    month_only = FakeSession()
+    assert locks.lock_periods(month_only, ["2026-05"]) == ["2026", "2026-05", "2026-Q2"]
+    assert month_only.keys == [locks.lock_key(name) for name in ("2026", "2026-05", "2026-Q2")]
+    assert locks.lock_periods(FakeSession(), ["2026"] + locks.period_lock_set(["2026-05"])) == \
+        ["2026", "2026-05", "2026-Q2"], "传已补全的集合要幂等"
+
+    empty = FakeSession()
+    assert locks.lock_periods(empty, []) == []
+    assert empty.keys == [], "没有期间就不该发语句"

@@ -24,7 +24,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
-from backend import audit, periods as period_mod, rollups
+from backend import audit, locks, periods as period_mod, rollups
 from backend.api_analysis import calculate
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 from backend.scope import Scope, scope_transactions
@@ -174,6 +174,10 @@ def recalculate_periods(db: Session, periods: set[str] | list[str]) -> dict:
     """
     recalculated: list[str] = []
     cleared: list[str] = []
+    # 期间锁：下面「这一期还剩几行 → 有则重算、无则清掉指标」是一段读改写。不加锁的话，
+    # 并发的两个请求可能各自数出「还剩 0 行」或各自读到对方的旧数据，写出错误的指标/落库行。
+    # 锁按期间名排序后一次取全（循环里逐个取会让两个多期请求各持一半、互等对方而 deadlock）。
+    locks.lock_periods(db, locks.period_lock_set(periods))
     # SessionLocal 是 autoflush=False：调用方刚改过的字段还在内存里（更正日期就是这种），
     # 不先落盘，下面的「这一期还剩几行」会数出错的口径（把有数据的一期当成空的清掉）。
     db.flush()
@@ -266,6 +270,13 @@ def correct(db: Session, row_id: int, payload: dict, *, scope: Scope, actor: str
         raise AlreadyReversed("这一行已经冲销，冲销后再改原行会让账更乱；请先撤销冲销（如果有）或重新导入")
     # 旧期间必须在改字段之前取：日期被改到别的月份时，它才是「这一行原来算在哪一期」。
     old_period = period_of(row)
+    # 期间锁要在**改行之前**取，而且要把新旧两期**一次性**锁全：锁的意义是「这一期的行集合
+    # 不再变化」，改完才锁的话另一个正在重算这一期的请求仍会读到改到一半的行集合；
+    # 分两次锁（先锁旧期、改完再锁新期）则可能与「反向搬运」的另一个请求互相等成 deadlock。
+    targets = {old_period}
+    if payload.get("transaction_date") is not None:
+        targets.add(parse_date(payload["transaction_date"]).strftime("%Y-%m"))
+    locks.lock_periods(db, locks.period_lock_set(targets))
     before, after = apply_changes(row, payload)
     row.corrections = (row.corrections or 0) + 1
     new_period = period_of(row)
@@ -290,6 +301,8 @@ def reverse(db: Session, row_id: int, *, scope: Scope, actor: str, reason: str |
         raise AlreadyReversed("这一行已经冲销过")
 
     now = datetime.now(timezone.utc)
+    # 冲销行与原行在同一个月，锁这一期就够；同样要在**改行/加行之前**取锁。
+    locks.lock_periods(db, locks.period_lock_set([period_of(row)]))
     reversal = FinancialTransaction(
         transaction_date=row.transaction_date,
         account_code=row.account_code,

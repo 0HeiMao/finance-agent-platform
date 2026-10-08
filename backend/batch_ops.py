@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit
+from backend import audit, locks
 from backend.models import FinancialTransaction
 from backend.transactions import recalculate_periods
 
@@ -45,6 +45,8 @@ def revert_batch(
         .where(FinancialTransaction.import_batch == batch)
     ).all()
     affected = sorted(row[0] for row in rows)
+    # 期间锁：删行**之前**取锁，删完才锁的话，另一个正在重算这一期的请求已经读到了旧的行集合。
+    locks.lock_periods(db, locks.period_lock_set(affected))
     deleted = db.execute(
         delete(FinancialTransaction).where(FinancialTransaction.import_batch == batch)
     ).rowcount or 0

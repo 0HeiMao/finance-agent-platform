@@ -23,6 +23,7 @@ from decimal import Decimal
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from backend import locks
 from backend import periods as period_mod
 from backend.models import FinancialMetric, FinancialRollup
 from backend.periods import MONTH, QUARTER, YEAR, months_of, period_label
@@ -73,6 +74,11 @@ def rollup(db: Session, *, grains: tuple[str, ...] = DEFAULT_GRAINS,
         targets = target_periods(months, grains=grains)
     else:
         targets = sorted({p for p in periods if period_mod.grain_of(p) in grains}, key=period_mod.sort_key)
+
+    # 期间锁：落库行是「每个目标期间先删后建」，若与「重算某个月」并发，一个请求会把另一个
+    # 刚写好的季度合计覆盖成少算一个月的版本（数字变小且没有任何报错）。锁在 targets 算出来
+    # 之后、读指标之前取；顺序同样交给 lock_periods 排序，与 calculate() 侧保持一致。
+    locks.lock_periods(db, targets)
 
     # 月指标一次读出来按期间分桶，避免每个目标期间各查一遍库。
     buckets: dict[str, list[FinancialMetric]] = {}
