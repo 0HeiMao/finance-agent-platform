@@ -12,7 +12,6 @@ from __future__ import annotations
 import csv
 import io
 import re
-from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -20,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import extract, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit
+from backend import audit, biztime
 from backend.auth import current_user
 from backend.db import get_db
 from backend.files import content_disposition
@@ -257,5 +256,7 @@ def export_alerts(request: Request, period: str | None = Query(None, pattern=PER
 @router.get("/scope")
 def export_scope(user: User = Depends(current_user)):
     """给导出按钮用的口径说明：前端据此在选择非本部门口径时提示。"""
-    return {"scope": scope_payload(scope_of(user)), "generated_at": datetime.now().isoformat(timespec="seconds"),
+    # `generated_at` 原来是 naive 的本机时刻（前端只能当浏览器本地时间猜），现在带业务时区偏移（⑯）。
+    return {"scope": scope_payload(scope_of(user)), "generated_at": biztime.now().isoformat(timespec="seconds"),
+            "timezone": biztime.label(),
             "formats": ["csv", "xlsx"], "limit": EXPORT_LIMIT}

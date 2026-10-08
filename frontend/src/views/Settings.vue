@@ -194,7 +194,22 @@ onMounted(load)
 
         <section class="page-card">
           <div class="card-head"><h2>运行态</h2></div>
+          <p class="muted">
+            业务时区（<code>BUSINESS_TIMEZONE</code>）决定「今天」「本月」这类<strong>日历日口径</strong>：
+            看板的当日口径、报告里的生成时间、审计日志导出的日期边界、Agent 用量的按天窗口，全部按它算，
+            <strong>不跟随服务器所在机房</strong
+            >。所以换行为「今天」的判据、跨月时报告归哪一期，都看这一个配置。
+          </p>
           <div class="settings-grid">
+            <div>
+              <span>业务时区</span>
+              <strong>{{ status.app.business_timezone?.label || '（未上报）' }}</strong>
+              <!-- 业务时刻与业务日是「本来就会变」的内容，截图基线里把它透明掉（data-visual-mask） -->
+              <small data-visual-mask
+                >业务日 {{ status.app.business_timezone?.today || '—' }} · 现在
+                {{ status.app.business_timezone?.now || '—' }}</small
+              >
+            </div>
             <div>
               <span>应用环境</span><strong>{{ status.app.env }}</strong>
             </div>

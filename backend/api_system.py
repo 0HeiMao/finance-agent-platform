@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from backend import biztime
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
@@ -107,6 +108,9 @@ def system_status(db: Session = Depends(get_db), user: User = Depends(current_us
             "log_level": settings.log_level,
             "cors_origins": settings.cors_origin_list,
             "token_expire_minutes": settings.access_token_expire_minutes,
+            # 业务时区（⑯）：页面、报告、审计导出上的「今天/本月」都是这个时区的日历日，
+            # 这里明确说出去（名字 + 当前偏移 + 当下的业务时刻），前端不必再猜服务器在哪。
+            "business_timezone": biztime.describe(),
         },
         "llm": {
             "provider_configured": bool(settings.effective_api_key and settings.effective_base_url),

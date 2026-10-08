@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -2122,6 +2122,90 @@ def test_usage_stats_and_daily_series_fill_the_whole_window(db_session):
     mine = [item for item in admin_stats["by_user"] if item["username"] == user.username]
     assert len(mine) == 1 and mine[0]["answers"] == 2 and mine[0]["total_tokens"] == stats["total_tokens"]
     assert mine[0]["department"] == "不受限"
+
+
+# ---------------------------------------------------------------- 业务时区（⑯）
+
+def test_biztime_unknown_names_raise_and_empty_falls_back():
+    from backend import biztime
+
+    assert biztime.zone("").key == biztime.DEFAULT_TIMEZONE       # 空名 = 用默认，不报错
+    assert biztime.current_name() == "Asia/Shanghai"
+    assert biztime.is_valid("Asia/Shanghai") and biztime.is_valid("America/New_York")
+    assert not biztime.is_valid("Not/AZone") and not biztime.is_valid("UTC+8")
+    with pytest.raises(biztime.TimezoneConfigError) as excinfo:
+        biztime.zone("Not/AZone")
+    assert "tzdata" in str(excinfo.value)                          # Windows 上最常见的坑要写在报错里
+
+
+def test_biztime_reads_naive_timestamps_as_utc():
+    """库里 DateTime(timezone=True) 取回来可能是 naive；猜成本机时区会让结果随部署漂移。"""
+    from backend import biztime
+
+    naive = datetime(2026, 10, 8, 16, 30)
+    assert biztime.to_business(naive) == datetime(2026, 10, 9, 0, 30, tzinfo=biztime.zone("Asia/Shanghai"))
+    aware = datetime(2026, 10, 8, 16, 30, tzinfo=UTC)
+    converted = biztime.to_business(aware)
+    assert converted == naive.replace(tzinfo=UTC).astimezone(biztime.zone("Asia/Shanghai"))
+    assert converted.utcoffset() == timedelta(hours=8)
+    assert biztime.today(name="Asia/Shanghai") == biztime.now(name="Asia/Shanghai").date()
+
+
+def test_biztime_day_bounds_are_left_closed_and_dst_aware():
+    from backend import biztime
+
+    start, end = biztime.day_bounds(date(2026, 10, 9))
+    assert start == datetime(2026, 10, 9, tzinfo=biztime.zone("Asia/Shanghai"))
+    assert end == datetime(2026, 10, 10, tzinfo=biztime.zone("Asia/Shanghai"))
+    assert end - start == timedelta(hours=24)
+    # 跨夏令时的那一天不是 24 小时：硬加 timedelta(days=1) 会把边界算错（美国 2026-03-08 只有 23 小时）。
+    # 注意要先 astimezone(UTC) 再相减——Python 对「同一个 tzinfo 实例」的相减走的是墙上时间
+    # （PEP 495：跳过 UTC 换算），直接 dt2 - dt1 会给出 24 小时，看不出夏令时。
+    dst_start, dst_end = biztime.day_bounds(date(2026, 3, 8), name="America/New_York")
+    assert (dst_end.astimezone(UTC) - dst_start.astimezone(UTC)) == timedelta(hours=23)
+    assert (dst_end - dst_start) == timedelta(hours=24)          # 墙上时间看着还是「一整天」
+    assert dst_start.utcoffset() == timedelta(hours=-5) and dst_end.utcoffset() == timedelta(hours=-4)
+
+
+def test_biztime_month_follows_the_business_calendar_not_utc():
+    """UTC 月末 17:00 已经是业务时区的次月 01:00——预警测试通知的 period 就按这个口径。"""
+    from backend import biztime
+
+    assert biztime.month_of(datetime(2026, 9, 30, 17, 0, tzinfo=UTC)) == "2026-10"
+    assert biztime.month_of(datetime(2026, 9, 30, 15, 59, tzinfo=UTC)) == "2026-09"
+    assert biztime.month_of(datetime(2026, 10, 5, 12, 0)) == "2026-10"          # naive 当 UTC
+    assert biztime.month_of(None, name="America/New_York").count("-") == 1
+
+
+def test_biztime_label_and_describe_say_which_offset_they_used():
+    from backend import biztime
+
+    # 偏移由那一刻算出来，所以夏令时也对
+    assert biztime.offset_text(datetime(2026, 1, 15, tzinfo=biztime.zone("America/New_York"))) == "UTC-05:00"
+    assert biztime.offset_text(datetime(2026, 7, 15, tzinfo=biztime.zone("America/New_York"))) == "UTC-04:00"
+    info = biztime.describe(name="Asia/Shanghai")
+    assert info["name"] == "Asia/Shanghai" and info["offset"] == "UTC+08:00"
+    assert info["label"] == "Asia/Shanghai (UTC+08:00)"
+    assert info["today"] == info["now"][:10] == biztime.today().isoformat()
+
+
+def test_usage_stats_window_is_business_days(db_session):
+    """窗口按业务时区切天：起点是业务日 00:00（UTC 的昨天 16:00），不是 UTC 的 00:00。"""
+    from backend import agent_sessions, biztime
+
+    user = _agent_user(db_session)
+    _, _, assistant = agent_sessions.start_exchange(db_session, user, "窗口按哪个时区算？")
+    agent_sessions.finish_exchange(db_session, assistant, content="业务时区", status="ok",
+                                   usage={"prompt_tokens": 12, "completion_tokens": 6})
+
+    stats = agent_sessions.usage_stats(db_session, user_id=user.id, days=3)
+    start = stats["window_start"]
+    assert start.tzinfo is not None and start.utcoffset() == timedelta(hours=8)
+    assert (start.hour, start.minute, start.second, start.microsecond) == (0, 0, 0, 0)
+    assert start.date() == biztime.today() - timedelta(days=2)
+    series = agent_sessions.daily_series(stats)
+    assert [item["date"] for item in series][-1] == biztime.today().isoformat()
+    assert sum(item["answers"] for item in series) == 1        # 刚写下的这条落在业务「今天」
 
 
 

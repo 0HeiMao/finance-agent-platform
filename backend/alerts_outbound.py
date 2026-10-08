@@ -42,7 +42,7 @@ from email.message import EmailMessage
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from backend import jobs
+from backend import biztime, jobs
 from backend.config import get_settings
 from backend.models import AlertChannel, AlertDelivery, FinancialAlert
 
@@ -468,7 +468,9 @@ def test_channel(db: Session, channel: AlertChannel, *, settings=None) -> dict:
     """同步发一条测试通知（通道连通性自检）。**不写投递台账**：它不是预警，只是探活。"""
     settings = settings or get_settings()
     payload = {
-        "period": _now().strftime("%Y-%m"),
+        # 业务时区（⑯）：这条测试通知里的 period 是给人看的「这个月」，用 UTC 月份的话，
+        # UTC+8 的每月 1 号早上 8 点前会写成上个月。
+        "period": biztime.month_of(),
         "department": "",
         "alert_type": "通道连通性测试",
         "metric_name": "channel_test",

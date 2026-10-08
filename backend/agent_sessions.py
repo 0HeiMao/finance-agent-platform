@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 
+from backend import biztime
 from backend.db import SessionLocal
 from backend.models import AgentMessage, AgentSession, User
 
@@ -343,13 +344,15 @@ def streaming_message(db, session_id: int) -> AgentMessage | None:
 def usage_stats(db, *, user_id: int | None = None, days: int = 30,
                 now: datetime | None = None) -> dict:
     """按天/按状态（管理员再加按人）统计问答用量。`user_id=None` = 全平台口径。"""
-    now = now or datetime.now(UTC)
-    # 窗口是「含今天的 N 个自然日」，起点对齐到那一天的 00:00（UTC）：
+    now = biztime.to_business(now) if now is not None else biztime.now()
+    # 窗口是「含今天的 N 个自然日」，起点对齐到那一天的 00:00（**业务时区**，⑯）；
     # ① by_day 与 daily_series 从同一天开始铺，天数严格对齐，今天的问答不会从图上消失；
     # ② `agent_messages.created_at` 用的是数据库的 now()（事务开始时刻，可能早于这里的
-    #    Python 时刻），若按「此刻」当起点，同一事务里刚写下的行会被 `created_at >= start` 筛掉。
+    #    Python 时刻），若按「此刻」当起点，同一事务里刚写下的行会被 `created_at >= start` 筛掉；
+    # ③ 用业务时区而不是 UTC：UTC+8 的凌晨属于「今天」而不是「昨天」，否则早上八点前的问答
+    #    会被算到前一天，与页面上写的日期对不上。
     start_date = (now - timedelta(days=max(1, days) - 1)).date()
-    start = datetime.combine(start_date, time.min, tzinfo=UTC)
+    start = biztime.day_start(start_date)
     base = [AgentMessage.role == "assistant", AgentMessage.created_at >= start]
     if user_id is not None:
         base.append(AgentMessage.user_id == user_id)
@@ -382,8 +385,11 @@ def usage_stats(db, *, user_id: int | None = None, days: int = 30,
         by_status.append({"status": status, "label": label, "count": int(count or 0)})
     by_status.sort(key=lambda item: item["status"])
 
+    # 按业务时区切天（⑯）：`func.date(timestamptz)` 取的是**数据库会话时区**的日期（通常是 UTC），
+    # 直接 group by 会和上面的窗口起点错开一天，凌晨的回答落到「昨天」那一格。
+    business_day = func.date(func.timezone(biztime.current_name(), AgentMessage.created_at)).label("day")
     by_day_rows = db.execute(
-        select(func.date(AgentMessage.created_at).label("day"),
+        select(business_day,
                func.count(AgentMessage.id),
                func.coalesce(func.sum(AgentMessage.total_tokens), 0))
         .where(*base)
@@ -446,9 +452,9 @@ def daily_series(stats: dict) -> list[dict]:
     filled: dict[str, dict] = defaultdict(lambda: {"answers": 0, "total_tokens": 0})
     for item in stats.get("by_day") or []:
         filled[item["date"]] = {"answers": item["answers"], "total_tokens": item["total_tokens"]}
-    # window_start 由 usage_stats 给出（一定是 datetime），这里的兜底只防手搓的 stats
-    start = stats.get("window_start") or datetime.now(UTC)
-    start_date = start.date()
+    # window_start 由 usage_stats 给出（一定是带业务时区的 datetime），这里的兜底只防手搓的 stats
+    start = stats.get("window_start") or biztime.now()
+    start_date = biztime.to_business(start).date()
     series = []
     for offset in range(days):
         day = str(start_date + timedelta(days=offset))

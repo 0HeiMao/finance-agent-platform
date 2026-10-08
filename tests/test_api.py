@@ -662,6 +662,47 @@ async def test_system_status_requires_token(anon_client):
     assert (await anon_client.get("/api/v1/system/status")).status_code == 401
 
 
+async def test_system_status_publishes_the_business_timezone(anon_client, auth_headers):
+    """业务时区（⑯）要说出去：名字、当前偏移、业务日、当下业务时刻，一个都不能少。"""
+    from datetime import date, datetime
+
+    from backend import biztime
+
+    response = await anon_client.get("/api/v1/system/status", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    info = response.json()["app"]["business_timezone"]
+    assert set(info) == {"name", "label", "offset", "now", "today"}
+    assert info["name"] == "Asia/Shanghai" == biztime.current_name()
+    assert info["offset"] == "UTC+08:00"
+    assert info["label"] == "Asia/Shanghai (UTC+08:00)"
+    assert info["today"] == date.today().isoformat() == biztime.today().isoformat()
+    # now 是带偏移的 ISO 串（±HH:MM 结尾），不是 naive 的
+    moment = datetime.fromisoformat(info["now"])
+    assert moment.tzinfo is not None and moment.utcoffset().total_seconds() == 8 * 3600
+    assert moment.date().isoformat() == info["today"]
+
+
+async def test_dashboard_updated_at_carries_the_business_offset(anon_client, auth_headers):
+    """看板的时间戳以前是 naive 的「服务器本机时刻」，现在必须带业务时区偏移（⑯）。"""
+    from datetime import datetime
+
+    response = await anon_client.get("/api/v1/dashboard", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    moment = datetime.fromisoformat(response.json()["updated_at"])
+    assert moment.tzinfo is not None, "updated_at 仍然没有时区"
+    assert moment.utcoffset().total_seconds() == 8 * 3600
+
+
+async def test_export_scope_reports_the_timezone_it_uses(anon_client, auth_headers):
+    response = await anon_client.get("/api/v1/export/scope", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["timezone"] == "Asia/Shanghai (UTC+08:00)"
+    from datetime import datetime
+
+    assert datetime.fromisoformat(payload["generated_at"]).utcoffset().total_seconds() == 8 * 3600
+
+
 # ---------------------------------------------------------------- 管理员入口
 
 ADMIN_PATHS = ("/api/v1/admin/overview", "/api/v1/admin/users",
@@ -2069,7 +2110,7 @@ async def test_audit_purge_respects_retention_and_is_dry_run_first(anon_client, 
 
 
 async def test_audit_log_filters_by_ip_and_date_range(anon_client, auth_headers, db_session):
-    """IP 前缀与日期范围筛选：日期是本地日历日（含首尾），不是"字符串比大小"。"""
+    """IP 前缀与日期范围筛选：日期是**业务时区**的日历日（含首尾），不是"字符串比大小"。"""
     from datetime import date, datetime, timedelta
 
     from backend.models import AuditLog
@@ -2101,6 +2142,38 @@ async def test_audit_log_filters_by_ip_and_date_range(anon_client, auth_headers,
     matched = await _audit(anon_client, auth_headers, ip=prefix, limit=50)
     assert matched["data"] and all(row["ip"].startswith(prefix) for row in matched["data"])
     assert (await _audit(anon_client, auth_headers, ip="203.0.113.250"))["total"] == 0
+
+
+async def test_audit_log_date_range_follows_the_business_timezone(anon_client, auth_headers, db_session):
+    """审计导出的 `since/until` 是**业务时区**的日历日（⑯）。
+
+    这一条是 UTC+8 的经典坑：北京时间 10-09 00:30 那条记录，UTC 看还在 10-08。
+    以前 `datetime.combine(...).astimezone()` 读的是服务器本机时区，于是同一份数据在
+    容器里（UTC）和本机跑出来的日期不一样，用户看到的「10 月 9 日」会漏掉这条。
+    """
+    from datetime import UTC, datetime
+
+    from backend.models import AuditLog
+
+    # 业务 10-09 00:00 正好等于 UTC 10-08 16:00；左闭右开，边界上的记录算 10-09
+    rows = [
+        ("biztime-edge", datetime(2026, 10, 8, 16, 0, tzinfo=UTC)),      # 业务 10-09 00:00
+        ("biztime-morning", datetime(2026, 10, 8, 16, 30, tzinfo=UTC)),  # 业务 10-09 00:30
+        ("biztime-late", datetime(2026, 10, 8, 15, 30, tzinfo=UTC)),     # 业务 10-08 23:30
+    ]
+    for actor, moment in rows:
+        db_session.add(AuditLog(actor=actor, action="user.login", target_type="user",
+                                target_id=actor, detail={}, ip="198.51.100.9", created_at=moment))
+    db_session.commit()
+
+    ninth = await _audit(anon_client, auth_headers, since="2026-10-09", until="2026-10-09", limit=50)
+    actors = {row["actor"] for row in ninth["data"]}
+    assert {"biztime-edge", "biztime-morning"} <= actors
+    assert "biztime-late" not in actors
+
+    eighth = await _audit(anon_client, auth_headers, since="2026-10-08", until="2026-10-08", limit=50)
+    assert "biztime-late" in {row["actor"] for row in eighth["data"]}
+    assert "biztime-morning" not in {row["actor"] for row in eighth["data"]}
 
 
 # ---------------------------------------------------------------- 分页与筛选

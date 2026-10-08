@@ -300,6 +300,8 @@ GET /dashboard?period=month|quarter|year
 
 `period` 的取值按**库里最新一期**（`financial_metrics` 最大 `period`）推算出自然月/季/年范围，
 而不是当前系统时间；该范围内没有数据就返回 `has_data:false` 与 `message`。
+`updated_at` 是**带业务时区偏移**的时刻（如 `2026-10-09T00:33:45+08:00`，⑯ `BUSINESS_TIMEZONE`）——
+以前是 naive 的本机时刻，前端只能当浏览器本地时间猜。
 
 返回（金额一律为**字符串**，避免 5.8 万亿量级上 float 丢分位）：
 
@@ -333,7 +335,7 @@ GET /dashboard?period=month|quarter|year
 | GET | `/export/transactions` | `period?`（省略=全部期间）、`account?`（科目名模糊匹配）、`department?`、`format` | 交易日期,科目编码,科目名称,部门,摘要,收入金额,成本金额,费用金额,现金流入,现金流出,导入批次 |
 | GET | `/export/metrics` | `period_from?`、`period_to?`、`department?`、`format` | 期间,口径,收入金额,成本金额,费用金额,毛利金额,净利润,毛利率,净利率 |
 | GET | `/export/alerts` | `period?`（单期）或 `period_from?`/`period_to?`（区间，看板按「本年」展示时用）、`level?`、`department?`、`format` | 期间,口径,预警类型,描述,级别,指标,当前值,阈值,需人工复核,预警 id |
-| GET | `/export/scope` | 无 | 给前端按钮用的口径说明：`{scope,formats:["csv","xlsx"],limit}` |
+| GET | `/export/scope` | 无 | 给前端按钮用的口径说明：`{scope,formats:["csv","xlsx"],limit,generated_at,timezone}`；`timezone` 是业务时区的可读文案（如 `Asia/Shanghai (UTC+08:00)`），`generated_at` 带该偏移——下游别去猜机房在哪 |
 
 - `format` 只接受 `csv`（默认）或 `xlsx`，其他值 **422**。
 - 响应头告诉调用方结果规模，前端据此提示，避免「以为导全了其实被截断」：
@@ -454,7 +456,11 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 
 返回 `{app,llm,database,embedding,rag,directories,data,me,config_problems}`：
 
-- `app`：`env`/`is_development`/`strict_config`/`api_prefix`/`cors_origins`/`log_level`/`token_expire_minutes`。
+- `app`：`env`/`is_development`/`strict_config`/`api_prefix`/`cors_origins`/`log_level`/`token_expire_minutes`/
+  `business_timezone`——后者是 `{name,label,offset,now,today}`（如 `{"name":"Asia/Shanghai",
+  "label":"Asia/Shanghai (UTC+08:00)","offset":"UTC+08:00","now":"2026-10-09T00:33:45+08:00",
+  "today":"2026-10-09"}`）：「今天」「本月」到底按哪个日历日算，这里直接给出答案（⑯，见
+  README「业务时区（`BUSINESS_TIMEZONE`）」）。老版本没有这个键，前端显示「（未上报）」而不是报错。
 - `llm`：`provider_configured`（**只报有没有配，不回显密钥**）、`base_url`、`model`、`rerank_model`。
 - `database`：`ok`/`error`/`version`/`url`（口令打码为 `user:***@host`）/`pgvector`。
 - `embedding`：`model`/`dimension`(384)/`using_fallback`。
@@ -522,7 +528,8 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 - **token 两路记账，别把估算当账单**：最后一帧报了用量就是 `usage_source="api"`；被停止 / 出错拿不到用量，
   按 `CHARS_PER_TOKEN = 1.5` 折算为 `estimated`；一次模型都没调用则是 `free`。`data` 里三者分开计数
   （`api_answers` / `estimated_answers` / `free_answers`），`series` 是**含今天的 N 个自然日**（起点对齐
-  那一天的 00:00 UTC），没问的日子补 0。
+  那一天的 00:00，**那一天是业务时区的日历日**：`window_start` 形如 `2026-10-09T00:00:00+08:00`，
+  分组也在 SQL 里按业务时区切），没问的日子补 0。
 - **归属只有一条规则**：会话属于提问的人，别人的会话 id 一律 404（不区分「没有」与「不是你的」）。
   跨用户的用量只在管理员端点 `GET /admin/agent-usage` 看汇总。
 - 令牌与 `X-User-Department` 的口径与其它接口一致：会话的 `scope` 记的是提问时的口径快照。
@@ -537,7 +544,7 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测（含**慢接口告警** `observability.slow_paths`） |
-| GET | `/admin/agent-usage?days=7` | **全员** Agent 用量（`days` 取 1..365，越界 422）：`{data,series,status_labels}`，比 `GET /ai/agent/usage` 多一份按用户的 `data.by_user`（每行 `{user_id,username,department,answers,total_tokens}`，未受限账号的 `department` 是「不受限」）。管理概览页的「Agent 用量」卡就走它，**它挂掉不该影响整页概览** |
+| GET | `/admin/agent-usage?days=7` | **全员** Agent 用量（`days` 取 1..365，越界 422，窗口口径与 `GET /ai/agent/usage` 完全一致：业务时区的自然日、含今天）：`{data,series,status_labels}`，比 `GET /ai/agent/usage` 多一份按用户的 `data.by_user`（每行 `{user_id,username,department,answers,total_tokens}`，未受限账号的 `department` 是「不受限」）。管理概览页的「Agent 用量」卡就走它，**它挂掉不该影响整页概览** |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
 | GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、登录态三个字段 `failed_attempts`/`locked_until`/`locked`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
@@ -805,9 +812,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 - `action` / `actor` / `target_type` 都是精确匹配；`ip` 是**前缀匹配**（前端下拉直接给整串，
   手工传 `127` 这种前缀也能用）；`limit` 默认 50，`offset` 用于翻页，`total` 不受 `limit` 影响
   （`total` 是筛选后的总行数，筛选发生在 count 与 limit 之前）。
-- `since` / `until` 是**日期**（`YYYY-MM-DD`，含首尾两天，按服务器本机日历日）：内部用
-  `astimezone()` 转成带时区的时刻再比，所以 UTC+8 机器上「今天 8 点前的记录」不会漏。
-  只给 `since` 表示「从那天的 00:00 起」。
+- `since` / `until` 是**日期**（`YYYY-MM-DD`，含首尾两天，按**业务时区**的日历日——`BUSINESS_TIMEZONE`，
+  默认 `Asia/Shanghai`，不是服务器本机时区）：窗口取 `[since 00:00, until+1 00:00)` 再换算成 UTC 比较，
+  所以 UTC+8 的凌晨（那一刻机器本机 UTC 还停在昨天）筛「今天」既不会漏也不会多。只给 `since` 表示
+  「从那天的 00:00 起」。**这一口径只管筛选边界**：行内的 `at` 是带偏移的显式 UTC、导出 CSV 的表头
+  也是「时间(UTC)」，审计页把行内时刻按**浏览器本机时间**显示、列头写「时间（本机）」。
 - `ips` 是最近出现过的来源 IP（空 IP 不进下拉），`retention_days` 是当前保留期，
   `export_limit` 是导出的单次上限——三个字段都由后端给，前端不写死。
 - **detail 已脱敏**：键名含 `password`/`token`/`secret`/`authorization`/`api_key`/`apikey`/`hash` 的字段

@@ -118,6 +118,8 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
+| `verify_timezone.py` | 业务时区 25 项（**不改任何数据**：只登录、读接口、导一次审计 CSV）：`app.business_timezone` 五字段齐全且 `now` 带 `+08:00`、上报的业务时刻与本机时钟偏差 < 300 秒（证明不是写死的常量）、`today` 等于脚本按 IANA 规则**独立**算出的那一天、业务日与 UTC 日确实不同（跑在 UTC+8 凌晨时业务 `2026-10-09` / UTC `2026-10-08`）且同一瞬间在 UTC/上海/纽约可以落在不同的日历日、`/dashboard` 的 `updated_at` 带偏移且就是刚才那一刻、`/export/scope` 报出 `Asia/Shanghai (UTC+08:00)`、**本次登录在「业务今天」的审计窗口里但不在「业务昨天」里**（那一刻按 UTC 算还停在昨天——这条最硬）、审计行时间戳是带偏移的显式 UTC 且按业务时区算确实落在今天、审计 CSV 用业务日窗口能导出并回报条数、`/ai/agent/usage` 与 `/admin/agent-usage` 的窗口起点是业务日 `00:00:00+08:00` 且最后一天是业务今天、本机 `biztime` 的时区名/文案与真机上报一致、`UTC+8`/`Not/AZone`/空串在两处判定都被拒、取非法时区抛 `TimezoneConfigError`、纽约夏令时那天只有 23 小时。**第一组检查顺带抓「跑着的后端还是旧进程」**：老进程里没有 `business_timezone` 字段，会直接红（⑮ 的同类检查真抓到过一次） |
+
 还有七个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
@@ -172,7 +174,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 256 项、前端 48 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 272 项、前端 49 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -356,8 +358,8 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **256** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**）、
-`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
+`tests/` 下三个文件共 **272** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
 管理员看到的一直是全公司行→**多部门账号**：绑定两个部门后看板/汇总/报告都是并集（金额相加、比率按合计
@@ -419,7 +421,10 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 （`answers` 从 1 到 2、tokens 相加）且不覆盖已有标题、未知 `session_id` 404、
 生成期间占位行确实是 `streaming` 时停止请求被受理并在收尾时变成 `stopped`（正文只留已生成部分）、
 没有正在生成的回答时再停止是 409、四个会话/用量端点匿名 401 而部门受限账号看管理端点 403、看自己的用量照常
-（`days=0` → 422）。
+（`days=0` → 422）→**业务时区**：`/system/status` 的 `app.business_timezone` 五字段齐全且 `today` 等于按 IANA 规则算出的那一天、
+看板 `updated_at` 带业务时区偏移、`/export/scope` 回报 `timezone` 文案、
+**审计的日期窗口按业务时区切**（真库插三行 UTC 16:00Z / 16:30Z / 15:30Z，前两行落在业务 `2026-10-09` 的窗口里、第三行落在业务 `2026-10-08`——
+那一刻按服务器本机 UTC 算还停在昨天，所以这条用例真的能抓到「照旧读本机时区」）。
 异步用例用 **anyio** 插件（`pytestmark = pytest.mark.anyio`，用例 id 显示 `[asyncio]`），
 不依赖未安装的 pytest-asyncio；数据库不可用时自动 `pytest.skip` 而不是失败。
 测试自身在外层事务里跑，结束整体回滚，不会污染库里数据。
@@ -582,8 +587,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 256 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 48 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 272 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 49 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -1033,6 +1038,10 @@ pgvector 是否安装、Embedding 模型与维度、大模型是否已配置、�
 以及「退出登录（作废全部令牌）」按钮——令牌是无状态的，退出不是清本地那一份，而是把账号的会话版本 +1
 （详见「会话版本号与强制下线（退出登录）」）。
 
+「运行态」卡还显示**业务时区**（`app.business_timezone.label`，如 `Asia/Shanghai (UTC+08:00)`）与它算出的
+业务日、当下时刻——「今天」「本月」到底按哪个日历日算，页面上直接能看见，不用去读代码或猜机房在哪
+（详见「业务时区（`BUSINESS_TIMEZONE`）」）。老后端没这个字段时显示「（未上报）」，页面其余部分照常。
+
 ### 上传件的去留（有意的不对称）
 
 `data/uploads/` 下现在只有知识库文档，**财务导入的临时件处理完就删**：
@@ -1450,6 +1459,50 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 静默失败——页面提示照常出现，磁盘上却没有文件），所以延迟 60 秒再释放。
 注意：在无头浏览器里无法验证「文件真的落盘」——实测连一个 10 字节的 `text/plain` blob 都不会写入
 下载目录，属环境限制；因此 `/reports/pptx` 的浏览器侧验收只断言到「取到 blob 并显示已保存（38 KB）」。
+
+## 业务时区（`BUSINESS_TIMEZONE`）
+
+「今天」「本月」「近 7 天」这类**日历日**口径过去是隐式读服务器本机时区（`datetime.now()` 与
+`datetime.combine(..., time.min).astimezone()`）：容器时区是 UTC、开发机是 UTC+8，同一份数据在两个环境里
+会算出不同的「今天」——北京时间 10-09 凌晨 00:30，UTC 那边还是 10-08。
+
+现在它是一条显式声明的配置：`BUSINESS_TIMEZONE`（IANA 名，默认 `Asia/Shanghai`，见 `backend/biztime.py`）。
+启动时校验（`Settings.validate()` 里那条 `BUSINESS_TIMEZONE=... 不是合法的 IANA 时区名`），
+非法名会出现在 `/system/status` 的 `config_problems` 里；Windows 上还需要 `tzdata` 包（venv 里已装）。
+
+按它算的一共这几处，都是**日历日边界**，不是「把时间显示成哪个时区」：
+
+| 位置 | 口径 |
+| --- | --- |
+| 看板「今天」（`backend/api_dashboard.py`） | `biztime.now()` 作为当日锚点；`updated_at` 带业务时区偏移 |
+| 报告 `generated_at`（`backend/api_export.py`） | 带业务时区偏移；`/export/scope` 额外回报 `timezone`（如 `Asia/Shanghai (UTC+08:00)`），别让下游猜 |
+| 审计日志的 `since`/`until`（`backend/api_admin.py` 的 `_audit_window`） | 页面上的日期 = **业务时区**的日历日，左闭右开；以前用 `.astimezone()` 读服务器本机时区，换台机器筛出来的条数就变 |
+| 预警外发测试通知的 `period`（`backend/alerts_outbound.py`） | `biztime.month_of()`：UTC 看还停在上个月的月末，业务口径已经是新月份 |
+| Agent 用量窗口（`backend/agent_sessions.py`） | 窗口起点是业务日 00:00、`by_day` 按业务日分组（SQL 里 `timezone('Asia/Shanghai', created_at)`），「近 7 天」含今天 |
+
+有意**不**改的两处，写在这里免得下次被当 bug：
+
+- **审计行内的时间戳保持 UTC**（`audit.serialize()` 里 `"at"` 是 `+00:00`，导出 CSV 的表头就是「时间(UTC)」）。
+  逐行时刻是给人对数的，UTC 最不容易吵；审计页把它换算成**浏览器本机时间**并把列头写成「时间（本机）」。
+  于是页面上同时存在两个口径：筛选边界按业务时区、行内时刻按看表人本机——两个都显式标出来，不让人猜。
+- Agent/审计的**库里仍存 UTC**，只在查询与展示边界换算，避免出现「半套数据换了时区」。
+
+运行态与验证：
+
+- `GET /api/v1/system/status` 的 `app.business_timezone` 回报 `{name, label, offset, now, today}`；
+  System 设置页「运行态」卡把它显示出来（业务日与当下时刻标了 `data-visual-mask`，否则截图基线每天都红）。
+- 真机验证是 `scripts/verify_timezone.py`（25 项）：断言业务日与 UTC 日确实不同、`today` 等于脚本按 IANA
+  规则独立算出的那一天、`updated_at`/`generated_at`/用量窗口都带 `+08:00`、**本次登录在「业务今天」的审计窗口里
+  但不在「业务昨天」里**（这条最硬：那一刻按 UTC 算还停在昨天）、纽约夏令时那天只有 23 小时。
+  它同时能抓「跑着的后端还是旧进程」：老进程里没有 `business_timezone` 字段，第一组检查就红。
+- 单测：`tests/test_units.py`（`biztime` 的取值、naive 时间戳按 UTC 读、`day_bounds` 左闭右开与夏令时、
+  `month_of` 跟业务日历、`label/describe` 说清用了哪个偏移、`usage_stats` 窗口是业务日）、
+  `tests/test_config.py`（默认值与非法名）、`tests/test_api.py`（`/system/status`、看板 `updated_at`、
+  `/export/scope`、审计日期窗口）。
+
+> 一个坑：**同一 tzinfo 实例**的两个 aware datetime 相减走墙上时间（PEP 495），
+> `day_bounds` 在夏令时那天直接相减仍是 24 小时；要看出 23 小时必须先 `astimezone(UTC)` 再减。
+> 第一版断言就是这么写错的。
 
 ## 看板口径
 

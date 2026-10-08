@@ -1063,6 +1063,99 @@ test('管理概览（⑮）：Agent 用量卡按用户列 token，它自己挂�
   view.app.unmount()
 })
 
+const SYSTEM_STATUS = {
+  app: {
+    env: 'development',
+    strict_config: false,
+    is_development: true,
+    api_prefix: '/api/v1',
+    log_level: 'INFO',
+    cors_origins: ['http://localhost:5173'],
+    token_expire_minutes: 720,
+    business_timezone: {
+      name: 'Asia/Shanghai',
+      label: 'Asia/Shanghai (UTC+08:00)',
+      offset: 'UTC+08:00',
+      now: '2026-10-09T00:26:56+08:00',
+      today: '2026-10-09'
+    }
+  },
+  llm: {
+    provider_configured: true,
+    model: 'deepseek-chat',
+    base_url: 'https://api.deepseek.com',
+    rerank_model: ''
+  },
+  database: {
+    url: 'postgresql+psycopg://finance:***@localhost:5432/finance',
+    version: '16.4',
+    pgvector: true,
+    ok: true
+  },
+  embedding: {
+    model: 'finance-embedding',
+    dimension: 384,
+    configured: 'data/models/finance-embedding',
+    using_fallback: false
+  },
+  rag: { max_distance: 0.62, candidate_k: 8, upload_dir: 'data/uploads' },
+  directories: [{ name: '财务导入上传目录', path: 'data/uploads', exists: true, writable: true }],
+  data: {
+    periods: ['2026-10', '2026-09'],
+    latest_period: '2026-10',
+    counts: { transactions: 8909, metrics: 196, alerts: 68, knowledge_chunks: 5, users: 5 },
+    scope: { mode: 'all', label: '全公司', departments: [] }
+  },
+  me: {
+    id: 1,
+    username: 'demo_analyst',
+    department: null,
+    departments: [],
+    unrestricted: true,
+    token_version: 0
+  },
+  config_problems: []
+}
+
+test('系统设置（⑯）：运行态里写明业务时区，业务日与当下时刻只作展示且标了 data-visual-mask', async () => {
+  await seedUser({ unrestricted: true, departments: [] })
+  let missingTimezone = false
+  useRoutes([
+    {
+      path: '/api/v1/system/status',
+      response: () => {
+        const payload = structuredClone(SYSTEM_STATUS)
+        if (missingTimezone) delete payload.app.business_timezone
+        return jsonResponse(payload)
+      }
+    }
+  ])
+  const router = makeRouter()
+  router.push('/dashboard')
+  await router.isReady()
+  const Settings = (await import('../src/views/Settings.vue')).default
+  const view = mount(Settings, { global: { plugins: [router] } })
+
+  assert.ok(await waitFor(() => view.text().includes('业务时区')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /Asia\/Shanghai \(UTC\+08:00\)/)
+  assert.match(view.text(), /业务日\s*2026-10-09/)
+  assert.match(view.text(), /现在\s*2026-10-09T00:26:56\+08:00/)
+  assert.match(view.text(), /看板的当日口径、报告里的生成时间、审计日志导出的日期边界、Agent 用量的按天窗口/)
+
+  // 这一格每分每秒都在变，必须带上 data-visual-mask：否则截图基线每天都要重拍
+  const masked = view.find((node) => node.props && 'data-visual-mask' in node.props)
+  assert.ok(masked, '业务日/业务时刻没有标注 data-visual-mask')
+  assert.match(textOf(masked), /业务日\s*2026-10-09/)
+
+  // 旧后端（还没有这个字段）不能让整页炸掉：显示「未上报」，其余信息照常
+  missingTimezone = true
+  await view.click('↻ 重新读取')
+  assert.ok(await waitFor(() => view.text().includes('（未上报）')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /配置体检通过/) // 页面其它内容仍在（不是错误页）
+  assert.doesNotMatch(view.text(), /读取系统状态失败/)
+  view.app.unmount()
+})
+
 test.after(() => {
   resetShims()
   clearCurrentUser()

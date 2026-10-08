@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from backend import biztime
 from backend.auth import current_user
 from backend.db import get_db
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
@@ -56,7 +57,9 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
     # 这样"本月/本季/本年"指向的是有数据的期间，而不是空响应的当前自然月。
     # 用 scope_metric 取，受限账号拿到的是自己部门的期间，不会跟着别人的数据走。
     latest_metric = db.scalars(scope_metric(select(FinancialMetric), scope).order_by(desc(FinancialMetric.period))).first()
-    today = datetime.now()
+    # 没有指标可依据时，退回「业务时区里的今天」（⑯）：原来用 `datetime.now()` 读的是服务器
+    # 本机时区，容器里通常是 UTC，UTC+8 的早上 8 点前「今天」会少一天。
+    today = biztime.now()
     year = int(latest_metric.period.split("-")[0]) if latest_metric and "-" in latest_metric.period else today.year
     if period == "month":
         start_month = 12 if latest_metric and latest_metric.period.endswith("-12") else (int(latest_metric.period.split("-")[1]) if latest_metric else today.month)
@@ -127,7 +130,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
         "period": period,
         "period_label": period_label,
         "has_data": True,
-        "updated_at": datetime.now().isoformat(),
+        "updated_at": biztime.now().isoformat(timespec="seconds"),
         "range": {"year": year, "months": months, "label": f"{months[0]}~{months[-1]}"},
         "compare": compare,
         "scope": scope_payload(scope, requested=explicit),

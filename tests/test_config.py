@@ -94,3 +94,44 @@ def test_startup_check_noop_when_config_is_clean(monkeypatch):
     stub = SimpleNamespace(validate=list, is_development=False, strict_config=True)
     monkeypatch.setattr(main, "get_settings", lambda: stub)
     main.check_startup_config()
+
+
+# ---------------------------------------------------------------- 业务时区（⑯）
+
+def _prod_settings(**overrides):
+    base = {"app_env": "production", "auth_secret_key": "x" * 48, "cors_origins": "http://localhost:5173"}
+    return Settings(**{**base, **overrides})
+
+
+def test_business_timezone_defaults_to_shanghai_and_other_iana_names_are_clean():
+    assert _prod_settings().business_timezone == "Asia/Shanghai"
+    assert _prod_settings().validate() == []
+    # 换时区不是错误：只要名字是 IANA 的
+    assert _prod_settings(business_timezone="America/New_York").validate() == []
+    assert _prod_settings(business_timezone="Asia/Shanghai").validate() == []
+
+
+@pytest.mark.parametrize("value", ["Not/AZone", "UTC+8", ""])
+def test_invalid_business_timezone_is_reported(value):
+    """`UTC+8` 这种「看着像时区」的写法、以及空串（.env 里写了键没写值）都要在体检里点名。"""
+    problems = _prod_settings(business_timezone=value).validate()
+    assert any("BUSINESS_TIMEZONE" in problem for problem in problems), problems
+
+
+def test_business_timezone_with_padding_is_accepted():
+    """`.env` 里手写难免带空格，两处判定都先 strip 再校验，不该因为一个尾随空格拦住启动。"""
+    from backend.config import _valid_timezone
+
+    assert _valid_timezone(" Asia/Shanghai ") is True
+    assert _prod_settings(business_timezone=" Asia/Shanghai ").validate() == []
+
+
+def test_config_timezone_check_and_biztime_agree_on_valid_names():
+    """两处各有一套判定（config 用 zoneinfo、biztime 再包一层），口径必须一致。"""
+    from backend import biztime
+    from backend.config import _valid_timezone
+
+    for name in ("Asia/Shanghai", "America/New_York", "Europe/London", "Not/AZone", "UTC+8"):
+        assert _valid_timezone(name) is biztime.is_valid(name), name
+    # 唯一的有意分歧：空串在 config 里算「写错了」，在 biztime 里算「用默认值」（避免请求 500）
+    assert _valid_timezone("") is False and biztime.is_valid("") is True

@@ -16,7 +16,7 @@ import csv
 import io
 import logging
 import re
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import agent_sessions, alerts_outbound, audit, batch_ops, jobs, lockout, rollups
+from backend import agent_sessions, alerts_outbound, audit, batch_ops, biztime, jobs, lockout, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
@@ -1372,12 +1372,13 @@ class AuditPurgeRequest(BaseModel):
 def _audit_window(since: date | None, until: date | None) -> tuple[datetime | None, datetime | None]:
     """把页面上的日期（含首含尾）转成时间窗：`since` 当天 00:00 起、`until` 次日 00:00 止。
 
-    用户填的是本机日历日，库里存的是带时区的 UTC 时刻，所以这里用 `astimezone()` 把
-    「本地某天的 00:00」变成带时区的时刻再比——直接拿裸日期比会整体差掉一个时区偏移，
-    在 UTC+8 的机器上表现为「今天早上 8 点前的记录查不到」。
+    页面上的日期是**业务时区**的日历日（⑯ `backend/biztime.py`），库里存的是带时区的 UTC 时刻。
+    这里原来用 `datetime.combine(...).astimezone()`——那读的是「服务器本机时区」，于是同一份审计
+    在 UTC 容器与 UTC+8 的机器上查出来的范围不一样（UTC+8 的机器上表现为「今天早上 8 点前的记录
+    查不到」）。现在按业务时区取边界，口径与页面、报告、用量窗口一致。
     """
-    start = datetime.combine(since, time.min).astimezone() if since else None
-    end = datetime.combine(until + timedelta(days=1), time.min).astimezone() if until else None
+    start = biztime.day_bounds(since)[0] if since else None
+    end = biztime.day_bounds(until + timedelta(days=1))[0] if until else None
     return start, end
 
 

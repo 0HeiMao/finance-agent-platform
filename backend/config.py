@@ -119,6 +119,24 @@ def _is_local_host(host: str) -> bool:
         return True
     return host.endswith(".local")
 
+def _valid_timezone(name: str) -> bool:
+    """BUSINESS_TIMEZONE 体检（⑯）。
+
+    这里直接用 `zoneinfo` 而不是 `backend.biztime.is_valid()`：biztime 要读配置，
+    两边模块级互相 import 会成环。判定口径与 biztime 保持一致（只认 IANA 名字）。
+    """
+    candidate = (name or "").strip()
+    if not candidate:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(candidate)
+    except Exception:
+        return False
+    return True
+
+
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
 except ImportError:  # 允许仅安装 FastAPI 的骨架环境启动
@@ -210,6 +228,10 @@ if BaseSettings is not None:
         # 默认开：不认这个参数的兼容网关会直接报错，backend/llm.py 会在"一个字都没吐出去"
         # 时自动不带该参数重试一次；想彻底不冒这个险就把它设成 false（用量退回按字数估算）。
         llm_include_usage: bool = True
+        # 业务时区（⑯，见 backend/biztime.py）：库里存 UTC，但「今天/本月」这类日历日口径
+        # 必须有唯一答案。默认 Asia/Shanghai；写成不存在的时区名会进 config_problems
+        # （STRICT_CONFIG=1 时直接拒绝启动），而不是悄悄退回默认值。
+        business_timezone: str = "Asia/Shanghai"
 
         model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
@@ -254,6 +276,11 @@ if BaseSettings is not None:
                     host = _origin_host(origin)
                     if host and not _is_local_host(host):
                         problems.append(f"CORS_ORIGINS 里的 {origin} 不是本机地址，请确认这是预期的对外来源")
+            if not _valid_timezone(self.business_timezone):
+                problems.append(
+                    f"BUSINESS_TIMEZONE={self.business_timezone!r} 不是合法的 IANA 时区名"
+                    "（例如 Asia/Shanghai、America/New_York）；Windows 上还需要 tzdata 包"
+                )
             return problems
 
 else:
@@ -306,6 +333,7 @@ else:
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
         llm_include_usage = os.getenv("LLM_INCLUDE_USAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
+        business_timezone = os.getenv("BUSINESS_TIMEZONE", "Asia/Shanghai")
 
         @property
         def cors_origin_list(self) -> list[str]:
@@ -333,6 +361,8 @@ else:
                 problems.append("AUTH_SECRET_KEY 仍是仓库里的占位值，必须换成随机串")
             if "*" in self.cors_origin_list:
                 problems.append("CORS_ORIGINS 含通配 '*'")
+            if not _valid_timezone(self.business_timezone):
+                problems.append(f"BUSINESS_TIMEZONE={self.business_timezone!r} 不是合法的 IANA 时区名")
             return problems
 
 @lru_cache

@@ -220,7 +220,7 @@ onMounted(load)
             <span>到</span>
             <input v-model="untilFilter" class="select" type="date" />
           </label>
-          <span class="muted">命中 {{ total }} 条（含首尾两天，按本机日历日）</span>
+          <span class="muted">命中 {{ total }} 条（含首尾两天，按业务时区的日历日）</span>
         </div>
 
         <p v-if="notice" class="notice">{{ notice }}</p>
@@ -243,7 +243,7 @@ onMounted(load)
             <table class="audit-table">
               <thead>
                 <tr>
-                  <th>时间</th>
+                  <th>时间（本机）</th>
                   <th>操作人</th>
                   <th>动作</th>
                   <th>对象</th>
@@ -253,7 +253,9 @@ onMounted(load)
               </thead>
               <tbody>
                 <tr v-for="row in rows" :key="row.id">
-                  <!-- 接口给的是 UTC（导出的 CSV 也保持 UTC 便于对数），页面上换算成本机时间 -->
+                  <!-- 接口给的是 UTC（导出的 CSV 也保持 UTC 便于对数），这一列按浏览器本机时间显示。
+                       注意「从/到」是按业务时区（BUSINESS_TIMEZONE）的日历日切的，与这一列口径不同：
+                       筛选边界是账本口径、行内时刻是看表人口径，两个都显式标出来，别让人猜。 -->
                   <td class="nowrap">{{ formatTime(row.at) }}</td>
                   <td>
                     <strong>{{ row.actor }}</strong>
