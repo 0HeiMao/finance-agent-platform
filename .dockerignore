@@ -1,0 +1,23 @@
+# 构建上下文里不需要的东西：`.venv` 有几百 MB、`node_modules` 上万个小文件、
+# `data/` 是运行时卷、`.git` 与 `output/` 与镜像无关。少了这个文件，一次 `docker build`
+# 会把整棵目录树（含 470MB 模型）都送到 daemon，慢且没有意义。
+.venv/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+data/
+output/
+.git/
+.gitignore
+.githooks/
+.idea/
+.vscode/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+pip-*/
+pytest-of-*/
+torchinductor_*/
+*.log
+.env

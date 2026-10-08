@@ -8,6 +8,10 @@
 智能财务分析平台/
 ├── backend/              # FastAPI 应用：按域拆成 api_*.py（看板在 api_dashboard.py，不再内联在 main.py）
 ├── frontend/             # Vue 3 + Vite 界面；纯函数在 src/utils/，`npm test` 零依赖单测
+│   ├── Dockerfile        # 前端镜像：node 里构建 → nginx 托管静态包并反代 /api
+│   └── nginx.conf        # SPA 回退、/api 反代、SSE 关缓冲
+├── Dockerfile            # 后端镜像（python:3.11-slim + 单独的 CPU 版 torch）
+├── docker-compose.yml    # 一条命令起 postgres + backend + frontend（项目名显式写死，见下）
 ├── tests/                # pytest 用例（真 PostgreSQL + 真 ASGI 接口）
 ├── data/
 │   ├── raw/              # 原始销售、费用、银行流水等 CSV/Excel，只读保存
@@ -217,8 +221,18 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 `--remote-debugging-port` 的 `--screenshot` 一次性模式换到 CDP，是因为前者不设设备指标，
 窗口宽 375 时页面仍按更大的布局视口渲染，截图会被误读成「溢出」。
 
+核对**容器里的构建产物**要加 `--inject-token`：那条临时自动登录页只存在于 Vite 根目录，
+不在 `vite build` 的产物里，所以容器里打不开它（直接扫会一路量到登录页的登录卡片上）：
+
+```powershell
+# 对着 nginx 容器（8080）核对，token 由 CDP 直接写进同源 localStorage
+.\.venv\Scripts\python.exe scripts\check_pages.py --base-url http://127.0.0.1:8080 `
+    --api-base http://127.0.0.1:8080 --inject-token
+```
+
 已核对结果：16 页 × 3 档共 48 组全部 `scrollWidth == clientWidth`，无横向溢出（`.table-wrap` 内表格
-属预期横向滚动，脚本已排除）；截图见 `output/charts/check_*.png`。首轮扫描抓到的唯一一处真实溢出是
+属预期横向滚动，脚本已排除）；截图见 `output/charts/check_*.png`。**容器里的构建产物同样跑过这 48 组
+（`--base-url http://127.0.0.1:8080 --inject-token`，exit 0）**，所以打包后界面与 dev server 一致。首轮扫描抓到的唯一一处真实溢出是
 `/financial/import @375`（`scrollWidth=429`，`.upload-box` 里的「确认导入」按钮被挤出视口），
 已在 `frontend/src/style.css` 给 `.upload-box` 加 `flex-wrap:wrap` 并让 `<input type=file>` 可收缩后归零。
 管理员页面的表格与列表同样在三档下核对过：宽表用 `.table-wrap` 横滚，知识库、体检项与部门列表用
@@ -274,6 +288,52 @@ cd frontend; npm test        # 等价于 node --test tests/*.test.mjs
 `npm run build` 在本机沙箱会因 esbuild 清理临时文件被拒而失败
 （`[vite:esbuild-transpile] remove …: Access is denied.`），所以界面验收不靠构建产物，
 而是 dev server 转译 + 无头浏览器（见上）。
+把 `$env:TEMP`/`$env:TMP` 指到工作区内的临时目录后构建就能过（容器里没这个限制，
+`frontend/Dockerfile` 里就是普通的 `npm run build`）。
+
+## 容器化部署（Docker）
+
+```powershell
+docker compose up -d --build      # 起 postgres + backend + frontend
+# 浏览器打开 http://127.0.0.1:8080（演示账号 demo_analyst / demo_password_2026）
+.\.venv\Scripts\python.exe scripts\docker_smoke.py   # 从外面验收这套栈
+docker compose down
+```
+
+三个服务的分工与几个**必须这么写**的点：
+
+| 服务 | 端口 | 说明 |
+| --- | --- | --- |
+| `postgres` | 5432 | `pgvector/pgvector:pg16`，卷 `finance_postgres_data`。与本地开发**共用同一个卷**，所以容器里看到的还是本地导入的那批数据 |
+| `backend` | 8000 | `uvicorn` 跑 `backend.main:app`；`data/` 以卷挂进 `/app/data`（470MB 的向量模型不进镜像） |
+| `frontend` | 8080 | nginx 托管 `vite build` 的静态包，并把 `/api/` 反代到 `backend:8000` |
+
+- **`name: finance-platform` 是必须的**：compose 默认拿目录名当项目名，而本仓库目录是中文
+  （`智能财务分析平台`），实测直接报 `project name must not be empty`。目录名改成英文也能绕过，
+  但写死更稳。
+- **前端只走同源 `/api`**：`frontend/src/api/client.js` 的 `API_BASE` 默认就是相对路径 `/api/v1`，
+  所以镜像里**不需要**在构建期烧进后端地址；换机器、换域名都不用重新构建。
+- **后端不对外发布端口**（`ports` 是给本机验证用的，生产删掉这一行就只暴露 frontend）：
+  nginx 已经在 `X-Forwarded-For` 里传真实来源 IP，uvicorn 用 `--proxy-headers
+  --forwarded-allow-ips '*'` 解析它。不这么做的话审计日志与登录限流看到的 IP 会全是 nginx 容器地址
+  （实测：反代后审计里记的是 `172.23.0.1`，也就是宿主机的真实来源，而不是 `172.23.0.x` 的容器 IP）。
+- **`proxy_buffering off`**：Agent 的流式问答走 SSE，nginx 默认会把响应攒起来再吐，
+  界面上就成了「等半天然后一整段蹦出来」。
+- **torch 单独装 CPU 版**：PyPI 上 linux x86_64 的默认 torch 是 CUDA 版，会顺带拖
+  `nvidia-cudnn`（单个 553MB）等一堆轮子，镜像直接膨胀到 7GB 以上；这个服务只做 CPU 推理，
+  所以 `Dockerfile` 先 `pip install --index-url https://download.pytorch.org/whl/cpu torch`
+  再装 `requirements.txt`（torch 已满足，pip 不会再换成 CUDA 版）。实测后端镜像 **2.4GB**。
+- **基础镜像拉不动时的办法**：本机 Docker Hub 的元数据解析会卡住，而 `docker.m.daocloud.io`
+  这类镜像源是通的，所以先 `docker pull docker.m.daocloud.io/library/python:3.11-slim`
+  再 `docker tag` 成本地 `python:3.11-slim`，`docker compose build` 就会直接用本地镜像不再联网解析。
+
+`scripts/docker_smoke.py` 是这套栈的验收脚本：`compose config` 是否合法、三个容器是否 healthy、
+前端首页是不是 nginx 发的 SPA 外壳、`/api/v1/health` 经反代是否通、同源登录能不能拿到 token、
+带 token 拉看板有没有数据、SPA 深链接（`/admin/audit`）会不会 404、容器里挂到的是不是宿主机的
+`data/models/finance-embedding`、nginx 配置里有没有关掉缓冲。
+它用文件重定向而不是 `subprocess` 管道收 docker 输出——在本机受限沙箱里，python 用管道接子进程时
+docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesktopLinuxEngine`），
+那种环境下脚本会把容器相关几项标 SKIP、只验 HTTP 部分。
 
 ## 页面
 

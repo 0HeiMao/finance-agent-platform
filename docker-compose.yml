@@ -1,3 +1,16 @@
+# 一条命令起整套：`docker compose up -d --build`
+#
+#   postgres  pgvector/pgvector:pg16（向量检索要 pgvector 扩展，原版 postgres 镜像没有）
+#   backend   Dockerfile 构建的 FastAPI/uvicorn
+#   frontend  frontend/Dockerfile 构建的 nginx（静态包 + /api 反代）
+#
+# 访问 http://127.0.0.1:8080（前端），API 走同源 /api 反代；8000 只是为排查方便而发布。
+# 这些服务与本地开发用的是**同一个数据库卷**：compose 起来后看到的就是本地导入的那批数据。
+#
+# `name` 必须显式写：compose 默认把项目名取成目录名，而本项目目录是中文
+# （`智能财务分析平台`），拿不到合法项目名时会直接报 "project name must not be empty"。
+name: finance-platform
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -10,6 +23,57 @@ services:
       - "5432:5432"
     volumes:
       - finance_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # backend 要等数据库能接受连接再起，否则启动时的建表/补列会整个跳过
+      test: ["CMD-SHELL", "pg_isready -U finance -d finance"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-backend
+    env_file:
+      - .env
+    environment:
+      # 容器内的数据库主机名是服务名 postgres，不是宿主机 .env 里的 localhost
+      DATABASE_URL: postgresql+psycopg://finance:finance@postgres:5432/finance
+      # 模型与上传件都从宿主机 data/ 挂进去（见下面的 volumes）
+      EMBEDDING_MODEL: data/models/finance-embedding
+    volumes:
+      # 整棵 data/ 一起挂：data/models 是 470MB 的本地向量模型（不进镜像），
+      # data/uploads 与 data/raw 是导入件与知识库落盘文档，容器重建后要还在。
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finance-frontend
+    ports:
+      # 8080 而不是 80：宿主机 80 常被别的服务（或其它 compose 项目）占着
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
 volumes:
   finance_postgres_data:

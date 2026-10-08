@@ -285,6 +285,23 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 不截图、不依赖 matplotlib）、口径与限制。风险预警页同样带 `alert_type`，口径与限制页随文档一起下发
 （否则「毛利率 100.00%」会被读成经营结论）。未安装依赖返回 503 与安装命令。
 
+## 容器化部署时的调用方式
+
+`docker compose up -d --build` 起三个容器（前端 nginx `8080` / 后端 uvicorn `8000` / postgres `5432`），
+**前端只走同源 `/api`**：
+
+| 场景 | 基地址 |
+| --- | --- |
+| 浏览器（界面、Agent 流式问答） | `http://127.0.0.1:8080/api/v1/...`（nginx 转给 `backend:8000`） |
+| 本机脚本/验收 | 同源地址，或 `http://127.0.0.1:8000/api/v1/...` 直连后端发布端口 |
+
+两点与契约相关的后果：
+
+- 反代带 `X-Forwarded-For`，uvicorn 以 `--proxy-headers --forwarded-allow-ips '*'` 解析它，
+  所以审计里的 `ip` 是真实来源（实测 `172.23.0.1`）而不是 nginx 容器地址；生产部署应删掉后端的
+  `ports`，只暴露前端。
+- SSE（`/ai/agent/chat/stream`）依赖 nginx `proxy_buffering off`，否则流式回答会被攒成一次性响应。
+
 ## 系统状态
 
 | 方法 | 路径 | 说明 |

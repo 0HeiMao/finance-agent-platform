@@ -149,7 +149,7 @@ class CdpSession:
 
 
 async def _drive(ws_url: str, args, pages, sizes, out_dir: Path, base_url: str,
-                 viewport_only: bool = False) -> int:
+                 viewport_only: bool = False, token: str = "") -> int:
     import websockets
 
     failures = 0
@@ -161,8 +161,17 @@ async def _drive(ws_url: str, args, pages, sizes, out_dir: Path, base_url: str,
         session = attached["sessionId"]
         await cdp.send("Page.enable", session_id=session)
 
-        # 先过一遍自动登录页，把 token 写进 localStorage；同源之后所有页面都能直接用。
-        await cdp.navigate(f"{base_url}/_autologin.html?to=%2Fdashboard", session)
+        if token:
+            # 容器化部署：前端是 vite build 的静态产物，Vite 根目录里的 `_autologin.html`
+            # 不在包里（它只对 dev server 有效）。所以先开一次应用首页，再直接往同源的
+            # localStorage 里写 token——同一个源，之后所有路由都能直接用。
+            await cdp.navigate(f"{base_url}/", session)
+            await cdp.send("Runtime.evaluate",
+                           {"expression": f"localStorage.setItem('access_token', {json.dumps(token)});"},
+                           session_id=session)
+        else:
+            # 先过一遍自动登录页，把 token 写进 localStorage；同源之后所有页面都能直接用。
+            await cdp.navigate(f"{base_url}/_autologin.html?to=%2Fdashboard", session)
 
         for route in pages:
             for size in sizes:
@@ -212,6 +221,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=9333)
     parser.add_argument("--viewport-only", action="store_true",
                         help="只截视口（长页面整页截图会超过 8192px，图片工具打不开）")
+    parser.add_argument("--inject-token", action="store_true",
+                        help="不开临时登录页，直接用 CDP 往同源 localStorage 写 token（容器里验构建产物时用）")
     args = parser.parse_args()
 
     browser = args.browser or _browser()
@@ -221,8 +232,11 @@ def main() -> int:
 
     token = _post_json(f"{args.api_base}/api/v1/auth/login",
                        {"username": args.username, "password": args.password})["access_token"]
-    page = _auto_login_page(token)
-    print(f"登录成功：{args.username}；临时登录页 {page.relative_to(PROJECT_ROOT)}")
+    page = _auto_login_page(token) if not args.inject_token else None
+    if page:
+        print(f"登录成功：{args.username}；临时登录页 {page.relative_to(PROJECT_ROOT)}")
+    else:
+        print(f"登录成功：{args.username}；用 CDP 直接注入 token（不开临时登录页）")
 
     process = subprocess.Popen(
         [browser, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
@@ -235,7 +249,7 @@ def main() -> int:
     try:
         ws_url = _debugger_url(args.port)
         return asyncio.run(_drive(ws_url, args, args.pages, args.sizes, out_dir, args.base_url,
-                                  args.viewport_only))
+                                  args.viewport_only, token if args.inject_token else ""))
     finally:
         process.terminate()
         try:
@@ -249,7 +263,8 @@ def main() -> int:
             if not profile.exists():
                 break
             time.sleep(0.5)
-        page.unlink(missing_ok=True)
+        if page:
+            page.unlink(missing_ok=True)
         print("已关闭无头浏览器并删除临时登录页")
 
 
