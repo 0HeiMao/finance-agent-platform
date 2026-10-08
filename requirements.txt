@@ -14,6 +14,9 @@ pgvector>=0.3,<1.0
 psycopg[binary]>=3.2,<4.0
 pytest>=8.0,<9.0
 pytest-asyncio>=0.24,<2.0
+# 覆盖率门槛（`scripts/check_coverage.py`）：阈值不写进 pytest.ini 的 addopts，
+# 否则 `pytest -k xxx` 这类过滤运行会因为「只跑了一小部分用例」而判失败。
+pytest-cov>=7.0,<8.0
 python-jose[cryptography]>=3.3,<4.0
 passlib[bcrypt]>=1.7,<2.0
 openpyxl>=3.1,<4.0

@@ -86,7 +86,8 @@
 ## 回归与演示脚本
 
 `scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节）：
+（第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节）：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -121,11 +122,11 @@
 ### 一键自检
 
 本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检、后端 pytest 与前端
-`npm ci`/`npm test`/`npm run build`（见下面「持续集成」一节）；而这台开发机上没有 CI 服务可挂，所以
-「CI」同时落成一个谁都能在本机跑的入口：
+`npm ci`/`npm test`/`npm run build`（两边各自还带一条覆盖率门槛，见下面「持续集成」一节）；而这台开发机上
+没有 CI 服务可挂，所以「CI」同时落成一个谁都能在本机跑的入口：
 
 ```powershell
-# 编码/语法体检 + 后端 pytest + 前端 node --test
+# 编码/语法体检 + 后端 pytest + 覆盖率门槛 + 前端 node --test + 覆盖率门槛
 .\.venv\Scripts\python.exe scripts\check_all.py
 # 只做编码与语法体检（几秒钟，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
@@ -154,7 +155,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 - **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
-  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 171 项与前端 35 项一起跑。
+  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 173 项与前端 35 项一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
   而钩子是 shell 脚本，行尾多一个 CR 会让 shebang 变成 `/bin/sh\r`，钩子直接报 bad interpreter。
@@ -289,7 +290,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **171** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**）、
+`tests/` 下三个文件共 **173** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -381,14 +382,49 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 把 `$env:TEMP`/`$env:TMP` 指到工作区内的临时目录后构建就能过（容器里没这个限制，
 `frontend/Dockerfile` 里就是普通的 `npm run build`）。
 
+### 覆盖率门槛
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_coverage.py            # 后端：语句 + 分支
+.\.venv\Scripts\python.exe scripts\check_frontend_coverage.py   # 前端：固定名单的模块
+```
+
+两条门槛都**不**写进 `pytest.ini` / `package.json`，而是各自的脚本：`--cov-fail-under` 一旦进了
+`addopts`，`pytest -k rollup` 这种「只跑一小部分用例定位问题」的运行会因为覆盖率天然很低而必然失败 ——
+一个必然失败的过滤器等于没有过滤器。覆盖率只有在整套用例跑完时才有意义，所以这两个脚本不接受任何
+用例过滤器，CI 与 `check_all.py` 调用的也是它们。
+
+| 范围 | 实测水位 | 门槛 | 口径 |
+| --- | --- | --- | --- |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.93%、分支 87.44% | **87.0% / 86.0%** | 全量 173 项跑完后的 TOTAL 行 |
+| 前端（node `--experimental-test-coverage`） | 平均语句 96.06%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
+
+两侧都还有一条比百分比更要紧的检查：
+
+- 后端：**跳过数必须是 0**。`tests/conftest.py` 连不上库就 `pytest.skip`，那时覆盖率会掉下来；
+  更阴的是给一批用例加上 skip 标记、总覆盖率仍然达标 —— 这条拦住「用跳过冒充通过」。
+- 前端：**名单里的模块必须出现在覆盖表里**。node 的覆盖表只列被加载过的文件，删掉一个用例会让
+  对应模块直接从表里消失，而 `all files` 的百分比反而可能升高；这正是覆盖率门槛最容易被骗过去的地方。
+  名单是脚本里的 `COVERED_MODULES`（12 个模块），加新模块时同步加进去并抬阈值。
+
+阈值只写在一个地方：脚本里的 `STATEMENT_THRESHOLD` / `BRANCH_THRESHOLD`（前端是 `LINE_THRESHOLD`），
+`scripts/verify_ci_workflow.py` 会核对这节里的数字与脚本一致 —— 阈值和文档分开维护时，下一个人就会
+用「把阈值调低」代替「补用例」。缺口集中在要真模型 / 真 API Key 的路径（`ai_service.py`、`llm.py`、
+`rag/answer.py`、`rag/rerank.py`），跑完的覆盖表会直接列出缺口行号（满覆盖的文件不打印）。
+
+前端那两个数字是**真的跨 node 版本对齐过**的：本机 node 24（树形表）与 `node:20` 容器（平铺表）的真实
+输出喂给同一份解析，都是 12/12 个模块、平均语句 96.06%、平均分支 88.37% —— 这正是「只算固定名单的
+平均值、不看 `all files`」的原因（`all files` 在两个版本里分别是 97.00% 与 97.95%，因为 node 20 把
+`tests/*.test.mjs` 也算进去了）。
+
 ## 持续集成（CI）
 
 `.github/workflows/ci.yml` 只做两件能在干净机器上完全复现的事：
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick` → `verify_ci_workflow.py` → `python -m pytest` | 结构体检（编码/语法）+ 后端全量 171 项 |
-| `frontend` | node 20 + `npm ci` → `npm test` → `npm run build` | 前端 35 项 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick` → `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ 后端全量 173 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -397,7 +433,11 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
   生成随机串并往工作区写 `.env`。
 - **镜像必须是 `pgvector/pgvector:pg16`**：换成普通 postgres，`document_chunks` 会以
   `type "vector" does not exist` 失败。
-- **pytest 要用 `python -m pytest`**：`-m` 才会把仓库根放进 `sys.path`，直接 `pytest` 会 `ModuleNotFoundError: backend`。
+- **覆盖率门槛脚本内部要用 `python -m pytest`**：`-m` 才会把仓库根放进 `sys.path`，
+  直接 `pytest` 会 `ModuleNotFoundError: backend`；阈值与理由见上「覆盖率门槛」一节。
+  `verify_ci_workflow.py` 自己也要读 `backend/config.py`，所以它在开头把仓库根插进 `sys.path` ——
+  `python scripts/xxx.py` 只把 `scripts/` 放进去，这条在本地（带 `PYTHONPATH` 手跑）看不出来，
+  是拿掉 `PYTHONPATH` 复现 CI 命令时才发现的一条真失败。
 
 这套流水线不是「补个仪式」，它一上来就抓到两个只在**从零建的库**上出现的问题（`ensure_schema()` 少建
 `document_chunks`、`vector` 扩展没装），以及一个**断言依赖演示数据**的用例
@@ -419,7 +459,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 ### 工作流自检（`scripts/verify_ci_workflow.py`）
 
 CI 配置本身没有测试，而它「绿」不等于它真的在测东西，所以这份 YAML 由
-`scripts/verify_ci_workflow.py` 静态核对 28 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
+`scripts/verify_ci_workflow.py` 静态核对 32 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
 没人跑的死代码）。它卡住的都是具体的事：镜像 tag 与 `docker-compose.yml` 漂了、少设 `DATABASE_URL`
 （全 skip）、`continue-on-error` 把失败吞了、环境变量名写错退化成默认值、脚本改名后工作流指向一个不存在的
 路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉。
@@ -431,7 +471,7 @@ docker exec finance-postgres psql -U finance -d postgres -c "CREATE DATABASE fin
 $env:DATABASE_URL='postgresql+psycopg://finance:finance@localhost:5432/finance_ci'
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
 .\.venv\Scripts\python.exe scripts\verify_ci_workflow.py
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_coverage.py
 Remove-Item Env:\DATABASE_URL      # 记得切回主库，跑完把 finance_ci 删掉
 ```
 
@@ -439,6 +479,7 @@ Remove-Item Env:\DATABASE_URL      # 记得切回主库，跑完把 finance_ci �
 
 ```powershell
 docker run --rm -v "${PWD}\frontend:/src:ro" -w /build node:20 sh -c "cp -r /src/. /build/ && npm ci && npm test && npm run build"
+.\.venv\Scripts\python.exe scripts\check_frontend_coverage.py   # 覆盖门槛跑同一套用例，只是带 --experimental-test-coverage
 ```
 
 ## 容器化部署（Docker）

@@ -7,6 +7,8 @@ __pycache__/
 
 # 测试与工具残渣（pytest / pip / torch 会在仓库根目录随手建目录）
 .pytest_cache/
+# 覆盖率门槛（scripts/check_coverage.py）跑完留下的数据文件，下次跑会覆盖
+.coverage
 pytest-of-*/
 pip-*/
 pip-build-tracker-*/
@@ -30,6 +32,8 @@ frontend/.build-tmp/
 output/charts/
 output/reports/
 output/_*
+# 前端覆盖率门槛（scripts/check_frontend_coverage.py）把 node 的临时目录也指到这里
+output/node-coverage-tmp/
 
 # 上传件（导入的表格、知识库文档）不是原始数据，不入库；data/raw 的原始文件仍然要提交
 data/uploads/

@@ -1,17 +1,22 @@
 """一键自检：源文件编码/语法体检 + 后端单元测试 + 前端单元测试（可选：真机页面扫描）。
 
-为什么是这个形态：这个仓库**没有 CI 服务**（没有 .github，也没接别的流水线），所以「CI」落到一个
-谁都能在本机跑的入口上，并且由 `.githooks/pre-commit` 在每次提交前跑 `--quick`（见
-`scripts/init_git.py`）；它同时兜住一类真实事故 —— 用 PowerShell 的
+为什么是这个形态：门禁分两层 —— `.github/workflows/ci.yml` 在 push / PR 时跑「不需要演示数据、
+不需要向量模型、不需要模型 Key」的那部分（编码/语法体检 + 后端 pytest + 前端 `npm ci`/`npm test`/
+`npm run build`）；而这台开发机上没有 CI 服务可挂，所以同一套东西还需要一个谁都能在本机跑的入口，
+就是这个脚本（`--quick` 由 `.githooks/pre-commit` 在每次提交前跑，见 `scripts/init_git.py`）。
+它同时兜住一类真实事故 —— 用 PowerShell 的
 `Get-Content` / `Set-Content -Encoding utf8` 往返 UTF-8 源文件，会按系统 ANSI 代码页
 （本机 cp936）重写内容，结果文件开头多出 BOM、正文变成 mojibake（`涓嶄緷璧栨暟鎹簱` 这种），
 python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第一步永远是编码体检。
 
 用法：
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + 后端 + 前端
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + 后端 + 前端（两边都含覆盖率门槛）
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只体检编码与语法
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 16 页 × 3 档扫描
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描
       （--with-pages 需要后端 127.0.0.1:8000 与前端 127.0.0.1:5173 已启动）
+
+后端/前端两步分别委托给 `scripts/check_coverage.py` 与 `scripts/check_frontend_coverage.py`：
+覆盖率只有在整套用例都跑完时才有意义，所以阈值判定不放 `pytest.ini`（理由见 README「覆盖率门槛」）。
 """
 from __future__ import annotations
 
@@ -133,38 +138,42 @@ def _run(command: list[str], cwd: Path) -> tuple[int, str]:
     return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
 
 
+def _final_line(output: str, prefix: str) -> str:
+    """取门槛脚本最后那行小结（`覆盖率门槛通过：语句 …`）。比数点更可读，也不怕多一层 -q。"""
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith(prefix):
+            return line
+    return ""
+
+
 def run_pytest() -> Step:
-    step = Step("后端单元测试（pytest -q）")
-    code, output = _run([_venv_python(), "-m", "pytest", "-q"], PROJECT_ROOT)
+    step = Step("后端单元测试 + 覆盖率门槛（scripts/check_coverage.py）")
+    # 走门槛脚本而不是直接 `pytest -q`：覆盖率阈值只能由「跑完整套用例」的运行来判，
+    # 所以这一步的入口就是那个不接受过滤器的脚本（理由见 README 的「覆盖率门槛」一节）。
+    code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_coverage.py")], PROJECT_ROOT)
     if code != 0:
-        step.detail = f"退出码 {code}\n{_tail(output)}"
+        step.detail = f"退出码 {code}\n{_tail(output, 20)}"
         return step
-    # pytest.ini 里 addopts = -q --strict-markers，不打统计行，只能数点。
-    passed = output.count(".")
-    step.pass_(f"退出码 0（约 {passed} 个用例通过）")
+    step.pass_(_final_line(output, "覆盖率门槛通过") or "退出码 0")
     return step
 
 
 def run_frontend_tests() -> Step:
-    step = Step("前端单元测试（node --test）")
-    npm = shutil.which("npm")
-    node = shutil.which("node")
-    if node is None:
+    step = Step("前端单元测试 + 覆盖率门槛（scripts/check_frontend_coverage.py）")
+    if shutil.which("node") is None:
         step.skip("本机没有 node，跳过")
         return step
-    command = [npm, "test"] if npm else [node, "--test", "tests/format.test.mjs", "tests/markdown.test.mjs"]
-    code, output = _run(command, PROJECT_ROOT / "frontend")
+    code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_frontend_coverage.py")], PROJECT_ROOT)
     if code != 0:
-        step.detail = f"退出码 {code}\n{_tail(output)}"
+        step.detail = f"退出码 {code}\n{_tail(output, 20)}"
         return step
-    pass_line = next((line for line in output.splitlines() if line.strip().startswith("ℹ pass")), "")
-    count = pass_line.split()[-1] if pass_line else "?"
-    step.pass_(f"退出码 0（{count} 个用例通过）")
+    step.pass_(_final_line(output, "前端覆盖率门槛通过") or "退出码 0")
     return step
 
 
 def run_pages() -> Step:
-    step = Step("真机页面扫描（16 页 × 3 档）")
+    step = Step("真机页面扫描（17 页 × 3 档）")
     code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_pages.py")], PROJECT_ROOT)
     if code != 0:
         step.detail = "有页面横向溢出或服务未启动\n" + _tail(output, 25)

@@ -18,13 +18,17 @@
 3. `DATABASE_URL` / `AUTH_SECRET_KEY` 必须显式给，且**变量名在 `backend/config.py` 里真实存在**
    （写错一个字母就静默变成默认值）；密钥不许是仓库里的占位值。
 4. 工作流引用到的脚本/文件都真实存在（否则 CI 在跑一个不存在的路径，报错要到远端才看见）。
-5. pytest 必须是 `python -m pytest`（`-m` 才会把项目根放进 `sys.path`，裸 `pytest` 在 runner 上会
+5. 后端测试步骤必须走 `scripts/check_coverage.py`（覆盖率门槛），而这个门槛脚本内部必须是
+   `python -m pytest`（`-m` 才会把项目根放进 `sys.path`，裸 `pytest` 在 runner 上会
    `ModuleNotFoundError: backend`）。
-6. 前端用 `npm ci`（按 lockfile 精确还原）并跑 `npm test` 与 `npm run build`。
+6. 前端用 `npm ci`（按 lockfile 精确还原）并跑 `npm test`、`scripts/check_frontend_coverage.py`
+   （前端覆盖率门槛）与 `npm run build`。
 7. 自检脚本自己必须出现在工作流里 —— 否则这份自检会悄悄变成「没人跑的死代码」。
 8. 需要演示数据 / 向量模型 / 模型 Key 的真机脚本（`check_pages.py`、`ui_components_smoke.py`、
    `scripts/verify_*.py`）**不许**进流水线：它们只会长期红着，比不跑更糟。这条边界同时要求
    README 的「持续集成」一节写明（脚本顺手核对，免得文档和流水线各说各话）。
+9. 两个门槛脚本里的阈值必须在 README 的「覆盖率门槛」一节里出现 —— 阈值和文档分开维护时，
+   下一个人就会用「把阈值调低」代替「补用例」。
 """
 from __future__ import annotations
 
@@ -33,6 +37,11 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# `python scripts/xxx.py` 只会把 `scripts/` 放进 sys.path（不是当前目录），而 CI 里就是这么调用的 ——
+# 少了这一行，「环境变量名与 backend/config.py 对齐」这条会在 runner 上退化成
+# `ModuleNotFoundError: No module named 'backend'`（本地手跑时通常带着 PYTHONPATH，看不出来）。
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 COMPOSE_PATH = PROJECT_ROOT / "docker-compose.yml"
@@ -46,6 +55,11 @@ ALLOWED_EXTRA_ENV = {"PYTHONIOENCODING", "PYTHONUNBUFFERED", "PYTHONPATH", "GITH
 LIVE_ONLY_SCRIPTS = ("check_pages.py", "ui_components_smoke.py")
 PATH_RE = re.compile(r"(?:frontend/|scripts/)?[\w][\w./-]*\.(?:py|txt|json|ini|yml|yaml|lock)")
 README_CI_HEADING = "## 持续集成"
+# 两个覆盖率门槛脚本（⑤ 的 CI 与 ⑥ 的阈值）：CI 必须调用它们，README 必须写明它们的阈值。
+COVERAGE_GATE = "check_coverage.py"
+FRONTEND_COVERAGE_GATE = "check_frontend_coverage.py"
+README_COVERAGE_HEADING = "### 覆盖率门槛"
+THRESHOLD_RE = re.compile(r"^(?:STATEMENT|BRANCH|LINE)_THRESHOLD\s*=\s*([\d.]+)", re.MULTILINE)
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -175,9 +189,15 @@ def commands(data: dict) -> None:
     gate = next((run.strip() for run in backend_runs if "check_all.py" in run and "--quick" in run), "")
     check("后端 job 跑了结构门禁 check_all.py --quick", bool(gate), gate or "（没有这一步）")
     check("自检脚本自己也被 CI 调用", any(SELF_NAME in run for run in backend_runs))
-    check("pytest 用 `python -m pytest`（裸 pytest 在 runner 上 import 不到 backend）",
-          any(re.search(r"\bpython -m pytest\b", run) for run in backend_runs)
-          and not any(re.match(r"\s*pytest\b", run) for run in backend_runs))
+    coverage_gate = next((run.strip() for run in backend_runs if COVERAGE_GATE in run), "")
+    check("后端 job 跑了覆盖率门槛（它就是 pytest 全量）", bool(coverage_gate),
+          coverage_gate or "（没有这一步：覆盖率没有门槛，只有一份没人看的报告）")
+    check("CI 里没有裸 pytest 调用（裸 pytest 在 runner 上 import 不到 backend）",
+          not any(re.match(r"\s*pytest\b", run) for run in backend_runs))
+    gate_script = PROJECT_ROOT / "scripts" / COVERAGE_GATE
+    check(f"{COVERAGE_GATE} 自己用 `python -m pytest` 跑全量",
+          gate_script.exists() and re.search(r'"-m",\s*"pytest"', gate_script.read_text(encoding="utf-8")) is not None,
+          "门槛脚本里应能看到 `\"-m\", \"pytest\"`")
     check("装了 CPU 版 torch（Linux 上默认会拉 2.5GB 的 CUDA 版）",
           any("download.pytorch.org/whl/cpu" in run for run in backend_runs))
     check("跑 pytest 前先装 requirements.txt",
@@ -197,6 +217,9 @@ def commands(data: dict) -> None:
           any(re.match(r"\s*npm test\b", run) for run in frontend_runs)
           and any(re.match(r"\s*npm run build\b", run) for run in frontend_runs),
           " / ".join(run.strip() for run in frontend_runs))
+    frontend_gate = next((run.strip() for run in frontend_runs if FRONTEND_COVERAGE_GATE in run), "")
+    check("前端 job 跑了覆盖率门槛", bool(frontend_gate),
+          frontend_gate or "（没有这一步：覆盖率没有门槛，只有一份没人看的报告）")
     check("前端 lockfile 已入库（npm ci 要求它存在）",
           (PROJECT_ROOT / "frontend" / "package-lock.json").exists())
 
@@ -231,6 +254,34 @@ def live_only_scripts(data: dict) -> None:
           "skip" in section, "")
 
 
+def coverage_docs() -> None:
+    """两个门槛脚本的阈值必须在 README 里对得上 —— 数字只写在一个地方，另一处对着抄。"""
+    if not README_PATH.exists():
+        check("README 存在", False, str(README_PATH))
+        return
+    text = README_PATH.read_text(encoding="utf-8")
+    index = text.find(README_COVERAGE_HEADING)
+    if index < 0:
+        check(f"README 有「{README_COVERAGE_HEADING}」一节", False,
+              "阈值与理由得写下来，不然下一个人只会把阈值调低")
+        return
+    rest = text[index + len(README_COVERAGE_HEADING):]
+    end = rest.find("\n#")
+    section = rest if end < 0 else rest[:end]
+    check("README 的「覆盖率门槛」一节写明了两个门槛脚本",
+          all(name in section for name in (COVERAGE_GATE, FRONTEND_COVERAGE_GATE)),
+          f"该节 {len(section)} 字符")
+    for script, label in ((COVERAGE_GATE, "后端"), (FRONTEND_COVERAGE_GATE, "前端")):
+        path = PROJECT_ROOT / "scripts" / script
+        if not path.exists():
+            check(f"{script} 存在", False, "门槛脚本不在，阈值也就无从谈起")
+            continue
+        values = sorted(set(THRESHOLD_RE.findall(path.read_text(encoding="utf-8"))))
+        check(f"README 写明{label}阈值（与 {script} 一致）",
+              bool(values) and all(value in section for value in values),
+              "、".join(f"{value}%" for value in values) or "这脚本里没读到阈值常量")
+
+
 def main() -> int:
     print(f"工作流：{WORKFLOW_PATH.relative_to(PROJECT_ROOT)}", flush=True)
     data = structure()
@@ -240,6 +291,7 @@ def main() -> int:
         referenced_paths(data)
         commands(data)
         live_only_scripts(data)
+    coverage_docs()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 项通过", flush=True)
     return 0 if passed == len(RESULTS) else 1

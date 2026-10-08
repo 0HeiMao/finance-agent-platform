@@ -1,8 +1,10 @@
 # 持续集成：push / PR 时跑「不需要演示数据、不需要向量模型、不需要模型 Key」的那部分门禁。
 #
 # 覆盖（两项，各自完全可复现）：
-#   后端 job — scripts/check_all.py --quick、scripts/verify_ci_workflow.py、python -m pytest 全量
-#   前端 job — npm ci、npm test（node --test 全量）、npm run build
+#   后端 job — scripts/check_all.py --quick、scripts/verify_ci_workflow.py、
+#              scripts/check_coverage.py（覆盖率门槛，内部就是 pytest 全量）
+#   前端 job — npm ci、npm test（node --test 全量）、scripts/check_frontend_coverage.py
+#              （覆盖率门槛，跑同一套用例）、npm run build
 #
 # 有意**不**覆盖（见 README「持续集成（CI）」）：需要演示库 / 470MB 向量模型 / 真模型 API Key 的
 # 真机脚本（scripts/verify_*.py、scripts/check_pages.py、scripts/ui_components_smoke.py）。
@@ -34,7 +36,7 @@ env:
 
 jobs:
   backend:
-    name: 后端（结构门禁 + pytest 全量）
+    name: 后端（结构门禁 + 覆盖率门槛）
     runs-on: ubuntu-latest
     # 必须和 docker-compose.yml 用同一个镜像：`document_chunks.embedding` 是 VECTOR(384)，
     # 换成普通 postgres 会在建这张表时报 `type "vector" does not exist`（这是真发生过的）。
@@ -74,10 +76,11 @@ jobs:
         run: python scripts/check_all.py --quick
       - name: 工作流自检（镜像/环境变量/脚本路径的不变量）
         run: python scripts/verify_ci_workflow.py
-      # 必须用 `python -m pytest`：`-m` 会把项目根放进 sys.path，
-      # 裸 `pytest` 在 runner 上会 `ModuleNotFoundError: backend`。
-      - name: 后端测试（空库，从零建表）
-        run: python -m pytest
+      # 覆盖率门槛脚本内部就是 `python -m pytest`：`-m` 会把项目根放进 sys.path，
+      # 裸 `pytest` 在 runner 上会 `ModuleNotFoundError: backend`。跑完再由它卡住
+      # 语句/分支覆盖率，并在有用例被跳过时直接失败。
+      - name: 后端测试 + 覆盖率门槛（空库，从零建表）
+        run: python scripts/check_coverage.py
 
   frontend:
     name: 前端（node --test + 生产构建）
@@ -98,5 +101,10 @@ jobs:
         run: npm ci
       - name: 前端测试（node --test）
         run: npm test
+      # node 自带的覆盖表由脚本自己解析并卡阈值（`--test-coverage-lines` 要 node 22+，
+      # 而这里固定 node 20）。它跑的是同一套用例，所以与 `npm test` 并排、不替代它。
+      - name: 前端覆盖率门槛
+        working-directory: .
+        run: python3 scripts/check_frontend_coverage.py
       - name: 生产构建
         run: npm run build

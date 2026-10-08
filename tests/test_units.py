@@ -13,10 +13,15 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from backend.api_financial import AMOUNT_COLUMNS, validate_row
 from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of
 from backend.rag.document_parser import extract_text, split_text
+from check_coverage import parse_counts, parse_total
+from check_frontend_coverage import COVERED_MODULES, parse_coverage_table
 
 
 # ---------------------------------------------------------------- 导入校验
@@ -657,3 +662,72 @@ def test_password_normalize_undoes_leet_and_trailing_digits():
     assert passwords.normalize("Demo_Analyst") == "demoanalyst"
     assert passwords.normalize("password99") == "password"
     assert passwords.normalize("") == ""
+
+
+# ---------------------------------------------------------------- 覆盖率门槛（⑥）
+
+# node 20 的覆盖表：一行一个完整相对路径，行首是 `# `（同一份代码在 node 22+ 换成了下面的树形）。
+COVERAGE_FLAT_NODE20 = """# start of coverage report
+# -------------------------------------------------------------------------------------------
+# file                               | line % | branch % | funcs % | uncovered lines
+# -------------------------------------------------------------------------------------------
+# src/api/client.js                  |  71.74 |    60.71 |   60.00 | 12-16 18-20
+# src/components/AgentChat.vue       |  96.13 |    83.33 |   90.00 | 133-134 149
+# src/utils/markdown.js              | 100.00 |   100.00 |  100.00 |
+# -------------------------------------------------------------------------------------------
+# all files                          |  97.95 |    88.03 |   87.45 |
+# -------------------------------------------------------------------------------------------
+# end of coverage report
+"""
+
+# node 22+ 的树形覆盖表：分组与文件分三行，靠缩进表示层级，行首是 `ℹ `（本机 node 24 的真实输出）。
+COVERAGE_TREE_NODE24 = """\u2139 start of coverage report
+\u2139 ------------------------------------------------------------------------------
+\u2139 file                  | line % | branch % | funcs % | uncovered lines
+\u2139 ------------------------------------------------------------------------------
+\u2139 src                   |        |          |         |
+\u2139  api                  |        |          |         |
+\u2139   client.js           |  71.74 |    60.71 |   60.00 | 12-16 18-20
+\u2139  components           |        |          |         |
+\u2139   AgentChat.vue       |  96.13 |    83.33 |   90.00 | 133-134 149
+\u2139  utils                |        |          |         |
+\u2139   markdown.js         | 100.00 |   100.00 |  100.00 |
+\u2139 all files             |  97.00 |    85.58 |   84.52 |
+\u2139 ------------------------------------------------------------------------------
+\u2139 end of coverage report
+"""
+
+
+def test_frontend_coverage_table_parses_both_node_layouts():
+    """两种覆盖表格式必须解析成同一组路径 —— 少了哪一种，门槛在某台机器上就读不到数。"""
+    flat = parse_coverage_table(COVERAGE_FLAT_NODE20)
+    tree = parse_coverage_table(COVERAGE_TREE_NODE24)
+    for rows in (flat, tree):
+        assert rows["src/api/client.js"] == (71.74, 60.71, 60.00)
+        assert rows["src/components/AgentChat.vue"] == (96.13, 83.33, 90.00)
+        assert rows["src/utils/markdown.js"] == (100.00, 100.00, 100.00)
+        assert "all files" in rows
+    # `all files` 的总分在两个 node 版本里不一样（测试文件算不算进去），所以门槛只算固定名单的平均值。
+    assert flat["all files"][0] == 97.95 and tree["all files"][0] == 97.00
+    assert len(COVERED_MODULES) == 12 and all("/" in module for module in COVERED_MODULES)
+
+
+def test_backend_coverage_gate_parses_pytest_output():
+    """pytest-cov 的 TOTAL 行与用例计数：解析一旦偏了，门槛就会把低覆盖率读成高覆盖率。"""
+    output = """\
+---------- coverage: platform win32, python 3.11.9-final-0 ----------
+Name                             Stmts   Miss Branch BrPart  Cover   Missing
+--------------------------------------------------------------------------
+backend\\ai_service.py               60     42     12      3    30%
+--------------------------------------------------------------------------
+TOTAL                             3628    438    900    113    86%
+7 files skipped due to complete coverage.
+
+171 passed in 84.42s (0:01:24)
+"""
+    assert parse_total(output) == (3628, 438, 900, 113, 86)
+    counts = parse_counts(output)
+    assert counts == {"passed": 171}
+    # 「N files skipped due to complete coverage」不能被当成用例被跳过（门槛里跳过数必须是 0）。
+    assert "skipped" not in counts
+    assert parse_total("没有覆盖表") is None
