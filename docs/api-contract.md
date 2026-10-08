@@ -2,6 +2,13 @@
 
 Base URL：`http://localhost:8000/api/v1`
 
+> 本文件是**手写**的散文契约（顺序、文案、脱敏这类「生成不出来的东西」都在这里）。机器可读的那一半由
+> FastAPI 生成并冻结在仓库里：`docs/openapi.json`（当前 70 个接口 / 23 个模型）。两者由
+> `scripts/check_openapi_snapshot.py` 守着 —— 它核对本文件接口表里点名的每个「方法 + 路径」都真实存在、
+> 快照与当前代码逐字节一致、每个接口都带一句说明。改接口后跑
+> `.\.venv\Scripts\python.exe scripts\check_openapi_snapshot.py --update` 并把快照一起提交（这一步在
+> `check_all.py --quick`、也就是 CI 与提交前钩子里会跑到，所以忘了就会在提交那一刻红）。
+
 ## 认证
 
 除 `POST /auth/login`、`POST /auth/register`、`GET /health` 外，**所有接口**（含 `/rag/*`）都必须携带：

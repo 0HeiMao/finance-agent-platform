@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,12 +18,14 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from check_coverage import parse_counts, parse_total
-from check_frontend_coverage import COVERED_MODULES, parse_coverage_table
+import check_openapi_snapshot as snapshot_gate  # noqa: E402
+from check_coverage import parse_counts, parse_total  # noqa: E402
+from check_frontend_coverage import COVERED_MODULES, parse_coverage_table  # noqa: E402
 
-from backend.api_financial import AMOUNT_COLUMNS, validate_row
-from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of
-from backend.rag.document_parser import extract_text, split_text
+from backend.api_financial import AMOUNT_COLUMNS, validate_row  # noqa: E402
+from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of  # noqa: E402
+from backend.main import app  # noqa: E402
+from backend.rag.document_parser import extract_text, split_text  # noqa: E402
 
 # ---------------------------------------------------------------- 导入校验
 
@@ -731,3 +734,86 @@ TOTAL                             3628    438    900    113    86%
     # 「N files skipped due to complete coverage」不能被当成用例被跳过（门槛里跳过数必须是 0）。
     assert "skipped" not in counts
     assert parse_total("没有覆盖表") is None
+
+
+# ---------------------------------------------------------------- 接口契约快照（⑧）
+
+def _snapshot() -> dict:
+    return json.loads(snapshot_gate.SNAPSHOT_PATH.read_text(encoding="utf-8"))
+
+
+def test_openapi_snapshot_file_matches_live_schema():
+    """快照必须与当前代码生成的接口一致；不一致时把「改了哪些接口」写在断言里，省一轮定位。"""
+    schema = snapshot_gate.build_schema()
+    saved = snapshot_gate.SNAPSHOT_PATH.read_text(encoding="utf-8")
+    changes = snapshot_gate.describe_changes(json.loads(saved), schema)
+    assert saved == snapshot_gate.dump_text(schema), (
+        "接口与 docs/openapi.json 不一致（接口改动是有意的就跑 "
+        "`python scripts/check_openapi_snapshot.py --update` 并一起提交）：\n  " + "\n  ".join(changes))
+
+
+def test_openapi_snapshot_lists_exactly_the_live_routes():
+    """双向核对：漏掉一个接口的快照没有价值，留着一个已删接口的快照会把前端带沟里。"""
+
+    def live_routes(routes) -> set[str]:
+        found: set[str] = set()
+        for route in routes:
+            path = getattr(route, "path", None)
+            if path and path.startswith("/api/") and getattr(route, "include_in_schema", True):
+                found |= {f"{method.upper()} {path}" for method in getattr(route, "methods", None) or ()}
+            # `app.include_router()` 挂上来的是嵌套对象：新版 FastAPI 存成 `_IncludedRouter`
+            # （原 router 在 `.original_router` 里），老版直接把子路由放在 `.routes` 上。
+            nested = getattr(route, "routes", None) or getattr(
+                getattr(route, "original_router", None), "routes", None)
+            if nested:
+                found |= live_routes(nested)
+        return found
+
+    snapshot_routes = {f"{method} {path}" for method, path in snapshot_gate.operations(_snapshot())}
+    declared = live_routes(app.routes)
+    assert declared, "路由都收不到，这条检查就没意义了"
+    assert declared - snapshot_routes == set(), "这些真实路由不在快照里"
+    assert snapshot_routes - declared == set(), "快照里这些路由已经不存在了"
+
+
+def test_contract_doc_only_names_real_endpoints():
+    """`docs/api-contract.md` 表格点名的接口必须真实存在 —— 手写契约同样不许漂。"""
+    drift = snapshot_gate.contract_drift(snapshot_gate.build_schema())
+    assert drift == [], "接口表里写了代码里没有的接口：" + "、".join(drift)
+
+
+def test_every_operation_in_the_contract_has_a_summary():
+    """接口光秃秃地出现在契约里就是文档债（FastAPI 的 summary 来自路由函数 docstring）。"""
+    missing = snapshot_gate.undocumented(snapshot_gate.build_schema())
+    assert missing == [], "这些接口没有一句说明：" + "、".join(missing)
+
+
+def test_snapshot_diff_names_operations_and_models():
+    """差异要打印成人话：131 KB 的 JSON diff 没人看得懂，等于把问题丢给下一个人。"""
+    old = {"openapi": "3.1.0", "info": {"version": "1.0.0"},
+           "paths": {"/api/v1/old": {"get": {"summary": "旧接口"}}},
+           "components": {"schemas": {"OldModel": {"type": "object"}}}}
+    new = {"openapi": "3.1.0", "info": {"version": "1.0.0"},
+           "paths": {"/api/v1/new": {"post": {"summary": "新接口"}}},
+           "components": {"schemas": {"NewModel": {"type": "object"}}}}
+    lines = snapshot_gate.describe_changes(old, new)
+    assert "+ 新增接口 POST /api/v1/new" in lines
+    assert "- 删除接口 GET /api/v1/old" in lines
+    assert "+ 新增模型 NewModel" in lines
+    assert "- 删除模型 OldModel" in lines
+    assert snapshot_gate.describe_changes(old, json.loads(json.dumps(old))) == []
+
+    changed = json.loads(json.dumps(old))
+    changed["paths"]["/api/v1/old"]["get"]["summary"] = "改了说明"
+    assert "~ 接口改动 GET /api/v1/old（参数/请求体/响应变了）" in snapshot_gate.describe_changes(old, changed)
+    # 版本与文档信息的变化也要点名（否则「换了 fastapi 版本」会被当成接口改动）。
+    bumped = json.loads(json.dumps(old))
+    bumped["info"]["version"] = "1.1.0"
+    assert any(line.startswith("~ 文档信息") for line in snapshot_gate.describe_changes(old, bumped))
+
+
+def test_snapshot_path_normalization_treats_parameter_names_as_the_same_route():
+    """`{id}` 与 `{transaction_id}` 是同一个路由 —— 否则契约文档里的写法会误报成漂移。"""
+    assert snapshot_gate.normalize_path("/api/v1/financial/transactions/{id}") == \
+        snapshot_gate.normalize_path("/api/v1/financial/transactions/{transaction_id}")
+    assert snapshot_gate.normalize_path("/api/v1/health/") == "/api/v1/health"

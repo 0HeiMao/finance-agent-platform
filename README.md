@@ -88,6 +88,7 @@
 `scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
 （第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
+`check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `npm run lint`/`npm run format:check` 承担，
 见「代码风格与 lint」一节）：
 
@@ -123,15 +124,15 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 
 ### 一键自检
 
-本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检（含 ruff lint）、
-后端 pytest 与前端 `npm ci`/`npm run lint`/`npm run format:check`/`npm test`/`npm run build`（两边各自还带
+本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检（含 ruff lint
+与接口契约快照）、后端 pytest 与前端 `npm ci`/`npm run lint`/`npm run format:check`/`npm test`/`npm run build`（两边各自还带
 一条覆盖率门槛，见下面「持续集成」一节）；而这台开发机上没有 CI 服务可挂，所以「CI」同时落成一个谁都能
 在本机跑的入口：
 
 ```powershell
-# 编码/语法体检 + 后端 ruff + 后端 pytest + 覆盖率门槛 + 前端 node --test + 覆盖率门槛 + eslint + prettier
+# 编码/语法体检 + 后端 ruff + 接口契约快照 + 后端 pytest + 覆盖率门槛 + 前端 node --test + 覆盖率门槛 + eslint + prettier
 .\.venv\Scripts\python.exe scripts\check_all.py
-# 只做编码/语法体检 + 后端 ruff（几秒钟，适合改完文件先自查）
+# 只做编码/语法体检 + 后端 ruff + 接口契约快照（几秒钟、不碰数据库，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
 # 再加 17 页 × 3 档的真机页面扫描（要求前后端已启动）
 .\.venv\Scripts\python.exe scripts\check_all.py --with-pages
@@ -141,8 +142,8 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 用 PowerShell 的 `Get-Content` / `Set-Content -Encoding utf8` 往返源文件时，它按系统 ANSI 代码页
 （本机 cp936）重写内容，结果文件开头多出 BOM、正文变成 mojibake，python 直接报
 `SyntaxError: invalid non-printable character U+FEFF`。**改源文件一律用编辑器/工具链的读写，不要用
-PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨兵（顺带带上 ruff —— 它不碰数据库、
-不到一秒，够快才可能次次都跑）。
+PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨兵（顺带带上 ruff 与接口契约快照 —— 它们
+不碰数据库、几秒钟，够快才可能次次都跑）。
 
 `npm run build` 在本机沙箱会失败（见下），所以自检不含构建步骤，界面验收走 `--with-pages`。
 
@@ -158,8 +159,9 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 
 - **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
-- **钩子默认只跑 `--quick`**（编码 + 语法 + ruff，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
-  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 173 项、前端 35 项与两侧的 lint/覆盖率门槛
+- **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
+  mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 179 项、前端 35 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -295,7 +297,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **173** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**）、
+`tests/` 下三个文件共 **179** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -402,7 +404,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 173 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 179 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -454,13 +456,47 @@ ignore 掉的（`E402`、`E701`/`E702`、`B008`、`UP031`）各有理由，都�
 三个配置文件都有守卫：`scripts/verify_ci_workflow.py` 会核对它们存在、CI 里真的跑了 eslint 与
 prettier、并且这一节写明了「写错」与「排版」的边界 —— 否则下一个人把排版规则打开，两套工具就会打架。
 
+### 接口契约快照（OpenAPI）
+
+`docs/api-contract.md` 是**手写**的散文契约（先 409 再 400 的顺序、两处 429 的文案必须一字不差、
+`session_version` 为什么不能叫 `token_version`），写得细，但**没有任何东西保证它和代码一致** ——
+删掉一个接口、把 `period` 从必填改成可选、给响应模型加一个字段，散文不会自己跟着变。
+机器可读的那一半由 FastAPI 生成，整份冻结成 `docs/openapi.json`（当前 70 个接口 / 23 个模型 / 128 KB）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_openapi_snapshot.py           # 比对（check_all --quick 里已经包含这一步）
+.\.venv\Scripts\python.exe scripts\check_openapi_snapshot.py --update  # 接口确实改了：重新生成，然后把快照和代码一起提交
+```
+
+它查三件事：快照与**当前代码生成的**接口逐字节一致；`docs/api-contract.md` 接口表里点名的每个
+「方法 + 路径」都真实存在；每个接口都带一句说明（`summary` / `description`，即路由函数的 docstring）。
+不一致时它打印的是人话差异，而不是让人自己去看 128 KB 的 JSON diff：
+
+```text
++ 新增接口 POST /api/v1/admin/rollups/rebuild
+- 删除接口 GET /api/v1/health
+~ 模型改动 FinancialTransaction（字段或约束变了）
+```
+
+几个刻意的选择：
+
+- **放在 `--quick` 这一层**（`check_all.py --quick` → 也就是 CI 与 `.githooks/pre-commit`）：
+  它要导入应用（约 2 秒，**不连数据库**），而「接口改了却没更新快照」正是最该在提交那一刻就红的事，
+  等 CI 才发现就变成了「先提交、再补一个 fixup」。
+- **快照是确定性文本**：`sort_keys` + `ensure_ascii=False` + 显式 LF 换行（仓库 `.gitattributes`
+  把文本统一成 LF）。所以 diff 里只有真实变化，没有序列化抖动；中文说明保持可读。
+- **依赖升级也可能让它合法地变化**（fastapi / pydantic / starlette 写进 OpenAPI 的细节）：同样跑
+  `--update` 再 review diff —— 而不是把这项检查关掉。
+- 守卫在 `scripts/verify_ci_workflow.py`：这项检查要是从 `check_all.py --quick` 里消失了、快照文件
+  被删了、或者这一节没了（更新方式没人写下来），工作流自检就会红。
+
 ## 持续集成（CI）
 
 `.github/workflows/ci.yml` 只做两件能在干净机器上完全复现的事：
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 后端全量 173 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 179 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -496,11 +532,13 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 ### 工作流自检（`scripts/verify_ci_workflow.py`）
 
 CI 配置本身没有测试，而它「绿」不等于它真的在测东西，所以这份 YAML 由
-`scripts/verify_ci_workflow.py` 静态核对 42 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
+`scripts/verify_ci_workflow.py` 静态核对 46 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
 没人跑的死代码）。它卡住的都是具体的事：镜像 tag 与 `docker-compose.yml` 漂了、少设 `DATABASE_URL`
 （全 skip）、`continue-on-error` 把失败吞了、环境变量名写错退化成默认值、脚本改名后工作流指向一个不存在的
 路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉、lint 或覆盖率门槛从流水线里
-悄悄消失（含 README 里写的阈值/配置文件与脚本对不上）。
+悄悄消失（含 README 里写的阈值/配置文件与脚本对不上），以及**契约快照这一步被人从 `check_all.py --quick`
+里摘掉、快照文件被删、README 那节没写怎么 `--update`**。它自己也有个坑：`python scripts/xxx.py` 只把
+`scripts/` 放进 `sys.path`，所以脚本开头得自己把仓库根插进去 —— 这条在本地（带 `PYTHONPATH` 手跑）看不出来。
 
 真机等价地跑一遍整条 `backend` job（不需要 GitHub，用空库代替干净的服务）：
 

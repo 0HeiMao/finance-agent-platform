@@ -14,13 +14,15 @@ prettier（`frontend/.prettierrc.json`）——「代码写错了」和「代码
 python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第一步永远是编码体检。
 
 用法：
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + lint + 后端 + 前端（两边都含覆盖率门槛）
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只做编码/语法体检 + 后端 ruff（不碰数据库、不需要 npm）
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + lint + 接口快照 + 后端 + 前端（两边都含覆盖率门槛）
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只做编码/语法体检 + 后端 ruff + 接口契约快照（不碰数据库、不需要 npm）
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描
       （--with-pages 需要后端 127.0.0.1:8000 与前端 127.0.0.1:5173 已启动）
 
 后端/前端两步分别委托给 `scripts/check_coverage.py` 与 `scripts/check_frontend_coverage.py`：
 覆盖率只有在整套用例都跑完时才有意义，所以阈值判定不放 `pytest.ini`（理由见 README「覆盖率门槛」）。
+接口契约快照（`docs/openapi.json`）也在 `--quick` 这一层：它要导入应用（约 2 秒，不连数据库），
+而「接口改了却没更新快照」正是最该在提交那一刻就红的事（理由见 README「接口契约快照」）。
 """
 from __future__ import annotations
 
@@ -206,6 +208,18 @@ def check_backend_lint() -> Step:
     return step
 
 
+def check_openapi_snapshot() -> Step:
+    """⑧ 接口契约快照：接口改了却没跑 `--update`，这一步会在提交时就红（差异会打印成人话）。"""
+    step = Step("接口契约快照（scripts/check_openapi_snapshot.py）")
+    code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_openapi_snapshot.py")], PROJECT_ROOT)
+    if code != 0:
+        step.detail = ("退出码 " + f"{code}（接口改动是有意的：跑 check_openapi_snapshot.py --update，"
+                       "把 docs/openapi.json 和代码一起提交）\n" + _tail(output, 20))
+        return step
+    step.pass_(_final_line(output, "接口快照检查通过") or "退出码 0")
+    return step
+
+
 def check_frontend_lint() -> Step:
     step = Step("前端 lint（npm run lint = eslint .）")
     if _npm() is None:
@@ -245,13 +259,14 @@ def run_pages() -> Step:
 
 def main() -> int:
     _console()
-    parser = argparse.ArgumentParser(description="一键自检：编码/语法/lint + 后端测试 + 前端测试")
-    parser.add_argument("--quick", action="store_true", help="只做编码/语法/lint 体检（不碰数据库）")
+    parser = argparse.ArgumentParser(description="一键自检：编码/语法/lint + 接口快照 + 后端测试 + 前端测试")
+    parser.add_argument("--quick", action="store_true",
+                        help="只做编码/语法/lint 体检与接口契约快照（不碰数据库、不需要 npm）")
     parser.add_argument("--with-pages", action="store_true", help="追加真机页面扫描（需前后端已启动）")
     args = parser.parse_args()
 
     print(f"一键自检（项目根目录：{PROJECT_ROOT}）")
-    steps = [check_encoding(), check_python_syntax(), check_backend_lint()]
+    steps = [check_encoding(), check_python_syntax(), check_backend_lint(), check_openapi_snapshot()]
     if not args.quick:
         steps.append(run_pytest())
         steps.append(run_frontend_tests())

@@ -34,6 +34,9 @@
     （`frontend/.prettierrc.json`）。规则集不写死在配置文件里，「换个机器红绿不同」就要重演。
 11. README 必须有一节把「eslint 只管写错了、排版全归 prettier」这件事写下来 —— 否则下一个人
     会把 eslint 的排版规则打开，然后和 prettier 互相改来改去。
+12. 接口契约快照（`docs/openapi.json`，由 `scripts/check_openapi_snapshot.py` 生成与比对）必须挂在
+    `check_all.py --quick` 上 —— 也就是随 CI 一起跑；README 还得写明怎么更新（`--update`）与快照
+    文件在哪。少任何一半，下一个人就会用「删掉这项检查」来让流水线变绿。
 """
 from __future__ import annotations
 
@@ -71,6 +74,10 @@ ESLINT_CONFIG = "frontend/eslint.config.js"
 PRETTIER_CONFIG = "frontend/.prettierrc.json"
 CHECK_ALL = "check_all.py"
 README_LINT_HEADING = "### 代码风格与 lint"
+# ⑧ 的接口契约快照：CI 靠 `check_all.py --quick` 覆盖它，README 必须写明怎么更新。
+SNAPSHOT_GATE = "check_openapi_snapshot.py"
+SNAPSHOT_PATH = PROJECT_ROOT / "docs" / "openapi.json"
+README_SNAPSHOT_HEADING = "### 接口契约快照"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -340,6 +347,37 @@ def coverage_docs() -> None:
               "、".join(f"{value}%" for value in values) or "这脚本里没读到阈值常量")
 
 
+def snapshot_gates() -> None:
+    """⑧ 的接口契约快照挂在 `check_all.py --quick` 上 —— 这一句就是「CI 真的在跑它」的证据。"""
+    check_all = PROJECT_ROOT / "scripts" / CHECK_ALL
+    check(f"{CHECK_ALL} --quick 里跑了 {SNAPSHOT_GATE}（契约快照随 CI 一起跑）",
+          check_all.exists() and SNAPSHOT_GATE in check_all.read_text(encoding="utf-8"),
+          f"核对了 {check_all.name}")
+    check("docs/openapi.json 已提交", SNAPSHOT_PATH.exists(),
+          "快照不在的话，这项检查等于没接上" if not SNAPSHOT_PATH.exists()
+          else f"{SNAPSHOT_PATH.stat().st_size // 1024} KB")
+
+
+def snapshot_docs() -> None:
+    """README 得说清快照文件在哪、接口改了怎么更新 —— 否则下一个人只会把这项检查删掉。"""
+    if not README_PATH.exists():
+        check("README 存在", False, str(README_PATH))
+        return
+    text = README_PATH.read_text(encoding="utf-8")
+    index = text.find(README_SNAPSHOT_HEADING)
+    if index < 0:
+        check(f"README 有「{README_SNAPSHOT_HEADING}」一节", False,
+              "不说清怎么更新（--update），这项检查下次就会被删掉")
+        return
+    rest = text[index + len(README_SNAPSHOT_HEADING):]
+    end = rest.find("\n#")
+    section = rest if end < 0 else rest[:end]
+    check("README 的「接口契约快照」一节写明了怎么更新快照",
+          SNAPSHOT_GATE in section and "--update" in section, f"该节 {len(section)} 字符")
+    check("README 写明了快照文件就是 docs/openapi.json",
+          "docs/openapi.json" in section, "")
+
+
 def main() -> int:
     print(f"工作流：{WORKFLOW_PATH.relative_to(PROJECT_ROOT)}", flush=True)
     data = structure()
@@ -352,6 +390,8 @@ def main() -> int:
         live_only_scripts(data)
     coverage_docs()
     lint_docs()
+    snapshot_gates()
+    snapshot_docs()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 项通过", flush=True)
     return 0 if passed == len(RESULTS) else 1
