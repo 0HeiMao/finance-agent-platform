@@ -80,6 +80,24 @@ def sanitize_proxy_env() -> None:
             os.environ[name] = cleaned
 
 
+def _parse_slow_path_overrides(raw: str) -> dict[str, int]:
+    """把 `SLOW_PATH_OVERRIDES` 解析成 `{路径: 毫秒}`，坏条目跳过（见 Settings.slow_path_thresholds）。"""
+    result: dict[str, int] = {}
+    for item in (raw or "").split(","):
+        text = item.strip()
+        if not text or "=" not in text:
+            continue
+        path, _, value_text = text.rpartition("=")
+        path = path.strip()
+        try:
+            value = int(value_text.strip())
+        except ValueError:
+            continue
+        if path and value > 0:
+            result[path] = value
+    return result
+
+
 def _origin_host(origin: str) -> str:
     """从 CORS 来源里取出主机名，取不到就返回空串。"""
     text = origin.strip()
@@ -144,6 +162,12 @@ if BaseSettings is not None:
         rag_upload_dir: str = "data/uploads/documents"
         # 审计日志的保留天数：超过这个天数才算过期，只有 POST /admin/audit/purge 会删（并留痕）。
         audit_retention_days: int = 180
+        # 慢接口告警：单次请求超过阈值就记一条 WARNING，并按路径限流（见 backend/observability.py）。
+        # 默认 1000ms：本地演示库上的正常接口都在 100ms 内，而 Agent 问答/报告导出本来就要几秒，
+        # 所以那几条重接口用 SLOW_PATH_OVERRIDES 单独放宽，而不是把全局阈值调到没人会超。
+        slow_path_ms: int = 1000
+        slow_path_overrides: str = ""
+        slow_path_log_seconds: int = 60
         # 出口配额（每分钟、按账号）：导出一次能把整库拉走，问答一次要花模型的钱，
         # 两个都必须是"脚本打不动、人用不着"的量级——回归脚本一次要连问 28 个问题，
         # 所以默认给到 60，不是 10 那种会误伤自己的数字。
@@ -167,6 +191,14 @@ if BaseSettings is not None:
         @property
         def effective_base_url(self) -> str:
             return self.model_base_url or self.deepseek_base_url
+
+        @property
+        def slow_path_thresholds(self) -> dict[str, int]:
+            """按路径覆盖慢接口阈值，写法 `/api/v1/ai/agent/chat=5000,/api/v1/rag/search=2000`。
+
+            解析失败的条目直接跳过而不是抛异常：这是个「调优用的旋钮」，写错一个逗号不该让服务起不来。
+            """
+            return _parse_slow_path_overrides(self.slow_path_overrides)
 
         @property
         def is_development(self) -> bool:
@@ -215,6 +247,9 @@ else:
         upload_dir = os.getenv("UPLOAD_DIR", "data/uploads")
         rag_upload_dir = os.getenv("RAG_UPLOAD_DIR", "data/uploads/documents")
         audit_retention_days = int(os.getenv("AUDIT_RETENTION_DAYS", "180"))
+        slow_path_ms = int(os.getenv("SLOW_PATH_MS", "1000"))
+        slow_path_overrides = os.getenv("SLOW_PATH_OVERRIDES", "")
+        slow_path_log_seconds = int(os.getenv("SLOW_PATH_LOG_SECONDS", "60"))
         export_max_per_minute = int(os.getenv("EXPORT_MAX_PER_MINUTE", "30"))
         ai_max_per_minute = int(os.getenv("AI_MAX_PER_MINUTE", "60"))
         database_url = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@localhost:5432/finance")
@@ -233,6 +268,10 @@ else:
         @property
         def effective_base_url(self) -> str:
             return self.model_base_url or self.deepseek_base_url
+
+        @property
+        def slow_path_thresholds(self) -> dict[str, int]:
+            return _parse_slow_path_overrides(self.slow_path_overrides)
 
         @property
         def is_development(self) -> bool:

@@ -66,6 +66,18 @@ Retry-After: 42
   观测性里按 `429:路径` 计数，`GET /admin/overview` 的 `observability.requests` 能看到。
 - **边界**：与登录限流同一实现（`backend/ratelimit.py`，进程内滑动窗口、无 Redis），重启清零、不跨副本。
 
+### 慢接口告警（按路径耗时阈值）
+
+配额管的是「请求太多」，阈值管的是「单次太慢」。没有阈值就必须有人盯管理页；有了阈值，
+超标的请求自己写一条 `WARNING` 到应用日志：
+
+| 项 | 默认 | 配置项 | 说明 |
+| --- | --- | --- | --- |
+| 全局阈值 | 1000 ms | `SLOW_PATH_MS` | 单次耗时 ≥ 阈值即计入 `slow_paths` |
+| 按路径覆盖 | 空 | `SLOW_PATH_OVERRIDES` | 形如 `/api/v1/ai/rag/chat=15000,/api/v1/ai/agent/chat/stream=300000`；坏条目逐条跳过、不让服务起不来 |
+| 同路径告警间隔 | 60 秒 | `SLOW_PATH_LOG_SECONDS` | 窗口内的后续超阈值请求只记账（`suppressed`）、不重复写日志 |
+
+
 > 部门不要走请求头自述：早期实现用 `X-User-Department: finance-admin` 当管理员凭证，属于可伪造提权，
 > 现在只有「用户自己没设部门」时才兼容这个旧头，其他情况一律忽略（见 `backend/api_rag.py: user_department_of`）。
 > 财务数据也认**服务端记录的 `User.department`**，但不认请求头：`backend/api_ai.py` 里知识库片段允许走旧头
@@ -428,7 +440,7 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测 |
+| GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测（含**慢接口告警** `observability.slow_paths`） |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
 | GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
@@ -551,7 +563,12 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
                "hint": "指标与明细一一对应"}],
   "observability": {"requests": {"200:/api/v1/health": 3}, "total": 12, "p95_duration_ms": 309.05,
                     "paths": {"/api/v1/analysis/calculate": {"count": 2, "p95_ms": 412.3, "max_ms": 501.8}},
-                    "samples_per_path": 200},
+                    "samples_per_path": 200,
+                    "slow_default_ms": 1000, "slow_overrides": {"/api/v1/ai/rag/chat": 15000},
+                    "slow_log_seconds": 60,
+                    "slow_paths": [{ "path": "/api/v1/ai/rag/chat", "threshold_ms": 15000,
+                                     "exceeded": 2, "suppressed": 1, "worst_ms": 16179.58,
+                                     "last_ms": 16179.58, "last_at": "2026-10-08T11:22:25+00:00" }]},
   "me": {"id": 16, "username": "demo_analyst", "department": ""}
 }
 ```
@@ -563,6 +580,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   `requests` 按 `状态码:路径` 分桶计数，`paths` 给出**每条路径**的 `count` / `p95_ms` / `max_ms`
   （每路径只留最近 `samples_per_path` 次采样）——「哪个接口慢」看 `paths`，不要拿全局 P95 猜。
   `GET /api/v1/observability/metrics` 返回同一份 `snapshot()`，无需登录。
+  慢接口部分是**主动告警**而不是事后统计：`slow_paths` 只收「单次耗时 ≥ 该路径阈值」的请求，
+  `threshold_ms` 是这条路径实际生效的阈值（`slow_overrides` 里没有它就回落 `slow_default_ms`），
+  `exceeded` 是累计超阈值次数、`suppressed` 是按 `slow_log_seconds` 窗口被压掉（只记账不写日志）
+  的次数，`worst_ms`/`last_ms`/`last_at` 是最慢与最近一次。每超一次阈值，后端还会写一条
+  `WARNING 慢接口告警 path=… duration_ms=… threshold_ms=… 累计超阈值=… 次` 到应用日志。
 
 `DELETE /admin/batches/{batch}` 返回 `{"batch","deleted_rows","recalculated","cleared"}`：
 对每个受影响期间，还有剩余明细就重算指标与预警（`recalculated`），没有就一并删掉（`cleared`）。

@@ -85,7 +85,7 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下七个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下八个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -96,6 +96,7 @@
 | `verify_alert_rule_tiers.py` | 预警规则分档 30 项：建期间档/部门+期间档、409 同范围、422 两维都空与非法指标/期间、400 删默认规则、真库重算里三条口径各得三种结果（期间档盖默认、部门+期间档盖期间档）、对照期间不受影响、删掉后回落默认，跑完复原期间并清掉临时规则 |
 | `verify_rollups.py` | 季度/年度落库 24 项：重算季/年落库、季度 `source=stored` 且等于三个月月指标之和、比率按合计重算、年度缺月如实点名、受限账号只读本部门落库行、管理端 403、三种 422、重算某月后季度幂等、没落库的期间现算兜底且不写库、审计留痕 |
 | `verify_transactions.py` | 明细更正/冲销 45 项：按期间/部门口径/关键字/批次筛选与分页、受限账号 403（别的部门与全公司行都不许动）、更正后重算并让指标跟着变、改日期同时重算新旧期间、冲销新增负数行且原行保留（同期间合计为 0）、重复冲销与更正已冲销行 409、非法金额/带时区日期/未知字段 422、审计留 `transaction.update`/`transaction.reverse`，跑完撤销整批探针数据并删临时账号 |
+| `verify_slow_paths.py` | 慢接口告警 16 项：默认阈值 1000ms 且按路径可覆盖、启动日志写明阈值、真发一次 `POST /ai/rag/chat`（检索 + 大模型，实测 16 秒）后 `slow_paths` 里出现该路径且超阈值次数 +1、`worst_ms`/`last_ms`/`last_at` 如实、**后端日志里真有一条 `WARNING 慢接口告警 path=… duration_ms=… threshold_ms=…`**、紧接着再发一次只记账不重复刷日志（`suppressed` = 1）、快请求 `/health` 不被记账、`/admin/overview` 给管理页的同一份观测里也有这条 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -108,7 +109,7 @@
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
 | `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
-| `ui_components_smoke.py` | 在真浏览器里点三个自研组件 22 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
+| `ui_components_smoke.py` | 在真浏览器里点三个自研组件 26 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）、管理概览的慢接口告警区块（标题在、区块不是空白、告警行点名路径与次数，并把这张卡片截到 `output/charts/ui_slow_alerts.png`）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
 
 六个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
@@ -121,7 +122,7 @@
 .\.venv\Scripts\python.exe scripts\check_all.py
 # 只做编码与语法体检（几秒钟，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
-# 再加 16 页 × 3 档的真机页面扫描（要求前后端已启动）
+# 再加 17 页 × 3 档的真机页面扫描（要求前后端已启动）
 .\.venv\Scripts\python.exe scripts\check_all.py --with-pages
 ```
 
@@ -215,7 +216,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 属于环境限制，改用 dev server 转译 + 无头浏览器核对：
 
 ```powershell
-# 16 个页面 × 1440/768/375 三档：打印 scrollWidth/clientWidth 并列出超宽元素，同时整页截图
+# 17 个页面 × 1440/768/375 三档：打印 scrollWidth/clientWidth 并列出超宽元素，同时整页截图
 .\.venv\Scripts\python.exe scripts\check_pages.py
 # 只核对某一页某一档
 .\.venv\Scripts\python.exe scripts\check_pages.py --sizes 375x812 --pages /reports/pptx
@@ -239,8 +240,8 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
     --api-base http://127.0.0.1:8080 --inject-token
 ```
 
-已核对结果：16 页 × 3 档共 48 组全部 `scrollWidth == clientWidth`，无横向溢出（`.table-wrap` 内表格
-属预期横向滚动，脚本已排除）；截图见 `output/charts/check_*.png`。**容器里的构建产物同样跑过这 48 组
+已核对结果：17 页 × 3 档共 51 组全部 `scrollWidth == clientWidth`，无横向溢出（`.table-wrap` 内表格
+属预期横向滚动，脚本已排除）；截图见 `output/charts/check_*.png`。**容器里的构建产物也跑过同一脚本
 （`--base-url http://127.0.0.1:8080 --inject-token`，exit 0）**，所以打包后界面与 dev server 一致。首轮扫描抓到的唯一一处真实溢出是
 `/financial/import @375`（`scrollWidth=429`，`.upload-box` 里的「确认导入」按钮被挤出视口），
 已在 `frontend/src/style.css` 给 `.upload-box` 加 `flex-wrap:wrap` 并让 `<input type=file>` 可收缩后归零。
@@ -253,7 +254,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **142** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样）、
+`tests/` 下三个文件共 **145** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -663,6 +664,29 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
 - **前端错误信息**：`frontend/src/api/client.js` 新增 `errorMessage()`，把 FastAPI 的 422
   （`detail: [{loc,msg}]`）拼成一句人话——之前会显示成「导出失败：[object Object]」。
 
+### 慢接口告警（按路径耗时阈值）
+
+按路径统计 P95 有个致命前提：**得有人去看**。值班的人不会盯管理页，出问题时只会在事后翻日志，
+所以单次请求一旦超过阈值就主动写一条 WARNING（`backend/observability.py` 的
+`logger = logging.getLogger("finance-api.slow")`），文案是
+`慢接口告警 path=%s duration_ms=%s threshold_ms=%s 累计超阈值=%s 次`：
+
+- **默认阈值 1000ms**，配置项 `SLOW_PATH_MS`；**按路径可覆盖**（`SLOW_PATH_OVERRIDES`，
+  形如 `/api/v1/ai/rag/chat=15000,/api/v1/ai/agent/chat/stream=300000`）——把全局阈值调到
+  「谁都不会超」等于把告警关掉，重接口（一次要调模型的、长连接的 SSE）反而需要单独放宽。
+  解析器对坏条目（缺 `=`、值不是数字、值非正、路径为空）**逐条跳过而不是启动失败**：调优旋钮
+  写错一个逗号不该让服务起不来，跳过的条目在启动日志里看得出来。
+- **按路径限流**（`SLOW_PATH_LOG_SECONDS`，默认 60 秒）：同一个路径在窗口内的后续超阈值请求
+  不逐条写日志，条数累计进下一次告警（`另有 N 次被限流未逐条上报`）。不限流的话一条几十秒的
+  SSE 连接会把日志刷满，真正该看的告警被埋掉。
+- **启动日志先说清阈值**：`慢接口告警阈值：默认 1000 ms；按路径覆盖 …；同路径告警间隔 60 秒` ——
+  看日志的人得先知道「超过多少才算慢」。
+- **管理概览**的「接口运行观测」卡片里新增「慢接口告警（单次超过阈值）」区块
+  （`observability.snapshot()["slow_paths"]`）：路径、超阈值次数、阈值/最慢/最近耗时与时间戳；
+  「最慢的接口」那段的等级颜色也改用同一套阈值判定（原先写死 500ms，与可真调的阈值不一致）。
+- 真机验证：`scripts/verify_slow_paths.py`（16 项）发一次真模型问答（实测 16 秒）确认告警落到
+  **日志文件**里，再立刻发第二次确认只记账不刷日志，并核对 `/health` 这类快请求不被记账。
+
 ### 管理员入口
 
 权限模型没有引入角色字段，而是沿用上面同一条语义：**部门列表为空 = 不受部门限制 = 管理员**。
@@ -693,6 +717,8 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   规模数字里的「期间指标 / 预警」只数全公司口径行（`department IS NULL`），另用
   `metric_rows` / `alert_rows` 报出含部门行的总行数——一次 `calculate` 会给每个部门各写一行，
   不分口径地数会看着像涨了几十倍。
+  同一张卡片里还有**慢接口告警**（`observability.snapshot()["slow_paths"]`）：单次请求超过阈值的那几条路径，
+  带「超阈值 N 次 / 阈值 / 最慢 / 最近」——它是下面那条「P95 只是观测、阈值才是告警」的落地位置。
 - **用户管理**：改部门立即改变该账号**财务数据与知识库**的可见范围；部门栏可以填**多个**部门
   （用「、」分隔，后端收 `departments` 数组），留空等于清空（升级为管理员）。多部门账号那一行的
   角色列写「限定 N 个部门」。

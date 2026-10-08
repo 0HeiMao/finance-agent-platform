@@ -43,6 +43,14 @@ const slowPaths = computed(() => {
     .slice(0, SLOW_PATH_LIMIT)
 })
 
+// 超过阈值的路径：这些是「已经该有人去看一眼」的，按超阈值次数排序（后端已排好）。
+// 与「最慢的接口」的区别是：重接口的阈值被特意放宽，P95 高但没有一次超过阈值就不算告警。
+const slowAlerts = computed(() => data.value?.observability?.slow_paths || [])
+const slowDefaultMs = computed(() => data.value?.observability?.slow_default_ms ?? 1000)
+function isOverThreshold(row) {
+  return row.p95_ms >= (data.value?.observability?.slow_overrides?.[row.path] ?? slowDefaultMs.value)
+}
+
 // 季/年落库：正常路径由重算指标自动刷新，这里给「老库回填」和「怀疑数字不对时手工重算」兜底。
 const rebuilding = ref(false)
 const rebuildNotice = ref('')
@@ -212,9 +220,25 @@ onMounted(load)
             <li v-for="row in slowPaths" :key="row.path">
               <div class="dir-head">
                 <strong class="path-text">{{ row.path }}</strong>
-                <span class="level" :class="row.p95_ms >= 500 ? 'high' : 'low'">{{ row.p95_ms }} ms</span>
+                <span class="level" :class="isOverThreshold(row) ? 'high' : 'low'">{{ row.p95_ms }} ms</span>
               </div>
               <small class="quality-hint">采样 {{ row.count }} 次 · 最慢 {{ row.max_ms }} ms</small>
+            </li>
+          </ul>
+          <h3 class="sub-head">慢接口告警（单次超过阈值）</h3>
+          <p v-if="!slowAlerts.length" class="muted">
+            本次进程没有请求超过阈值（默认 {{ slowDefaultMs }} ms，重接口可在 .env 里用
+            <code>SLOW_PATH_OVERRIDES</code> 单独放宽）。
+          </p>
+          <ul v-else class="dir-list">
+            <li v-for="row in slowAlerts" :key="row.path">
+              <div class="dir-head">
+                <strong class="path-text">{{ row.path }}</strong>
+                <span class="level high">超阈值 {{ row.exceeded }} 次</span>
+              </div>
+              <small class="quality-hint">
+                阈值 {{ row.threshold_ms }} ms · 最慢 {{ row.worst_ms }} ms · 最近 {{ row.last_ms }} ms（{{ row.last_at }}）
+              </small>
             </li>
           </ul>
           <p class="quality-hint">每路径只保留最近 {{ data.observability.samples_per_path }} 次采样；进程重启即清零。</p>

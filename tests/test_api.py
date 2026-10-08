@@ -708,6 +708,13 @@ async def test_admin_overview_counts_and_quality_checks(anon_client, auth_header
     for path, stat in observability["paths"].items():
         assert set(stat) == {"count", "p95_ms", "max_ms"}, path
         assert stat["count"] >= 1 and stat["max_ms"] >= stat["p95_ms"] >= 0
+    # 慢接口告警：管理页要能直接说「哪条路径超过阈值、超了几次」，阈值本身也要下发
+    assert {"slow_paths", "slow_default_ms", "slow_overrides", "slow_log_seconds"} <= set(observability)
+    assert observability["slow_default_ms"] >= 1
+    for row in observability["slow_paths"]:
+        assert set(row) == {"path", "threshold_ms", "exceeded", "worst_ms", "last_ms",
+                            "last_at", "suppressed"}, row
+        assert row["exceeded"] >= 1 and row["worst_ms"] >= row["threshold_ms"]
     # periods 来自 financial_metrics：还没算指标的期间不该出现
     assert period not in payload["periods"]["all"]
     checks = {item["name"]: item for item in payload["quality"]}
@@ -727,8 +734,30 @@ async def test_admin_overview_counts_and_quality_checks(anon_client, auth_header
     assert period not in rechecked["有指标但无明细的期间"]["hint"]
 
 
-async def test_admin_user_department_update_and_self_protection(anon_client, auth_headers, credentials):
-    # credentials 夹具已经通过 auth_headers 注册并登录（该账号部门为空 → 管理员）
+async def test_slow_path_alert_is_reported_by_observability_endpoint(anon_client):
+    """阈值调低后真发几个请求走一遍中间件：观测接口必须报出「哪条路径超过了阈值」。
+
+    这条用例把「中间件采样 → 阈值判定 → 接口下发」串起来；单测只覆盖了判定本身。
+    """
+    from backend import observability
+
+    observability.reset()
+    observability.set_thresholds(default_ms=1, log_seconds=0)
+    try:
+        for _ in range(5):
+            assert (await anon_client.get("/api/v1/health")).status_code == 200
+        payload = (await anon_client.get("/api/v1/observability/metrics")).json()
+    finally:
+        observability.reset()
+
+    assert payload["slow_default_ms"] == 1
+    row = next((item for item in payload["slow_paths"] if item["path"] == "/api/v1/health"), None)
+    assert row is not None, payload["paths"]
+    assert row["threshold_ms"] == 1 and row["exceeded"] >= 1
+    assert row["worst_ms"] >= 1
+
+
+async def test_admin_user_department_update_and_self_protection(anon_client, auth_headers, credentials):    # credentials 夹具已经通过 auth_headers 注册并登录（该账号部门为空 → 管理员）
     target = {"username": f"managed_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
     assert (await anon_client.post("/api/v1/auth/register", json=target)).status_code == 200
 

@@ -291,6 +291,65 @@ def test_observability_reports_duration_per_path():
     assert snapshot()["requests"]["500:/api/v1/unit-slow"] == 1
 
 
+def test_slow_path_alert_threshold_and_log_rate_limit(caplog):
+    """超过阈值要主动告警，并且**按路径限流**——否则一个慢接口能把日志刷满。
+
+    这正是「按路径耗时阈值告警」的实现要点：阈值可以按路径覆盖（重接口单独放宽），
+    同一条路径在 `log_seconds` 内的后续超阈值请求不逐条上报，但条数要累计进下一次告警。
+    """
+    import logging
+
+    from backend import observability
+
+    observability.reset()
+    observability.set_thresholds(
+        default_ms=100, overrides={"/api/v1/unit-heavy": 500}, log_seconds=60)
+    try:
+        with caplog.at_level(logging.WARNING, logger="finance-api.slow"):
+            observability.record_request("/api/v1/unit-fast", 200, 50.0)
+            observability.record_request("/api/v1/unit-slow", 200, 150.0)   # 第 1 次告警
+            observability.record_request("/api/v1/unit-slow", 200, 800.0)   # 被限流
+            observability.record_request("/api/v1/unit-heavy", 200, 400.0)  # 未超覆盖阈值
+            observability.record_request("/api/v1/unit-heavy", 200, 900.0)  # 第 2 次告警
+            assert observability.threshold_for("/api/v1/unit-heavy") == 500
+            assert observability.threshold_for("/api/v1/unit-nothing") == 100
+
+        alerts = [record.getMessage() for record in caplog.records if "慢接口告警" in record.getMessage()]
+        assert len(alerts) == 2, alerts
+        assert any("path=/api/v1/unit-slow" in text and "累计超阈值=1 次" in text for text in alerts)
+        assert any("path=/api/v1/unit-heavy" in text and "threshold_ms=500" in text for text in alerts)
+
+        snapshot = observability.snapshot()
+        assert snapshot["slow_default_ms"] == 100
+        assert snapshot["slow_overrides"] == {"/api/v1/unit-heavy": 500}
+        # 超阈值次数多的排前面；「最慢的接口」不受影响（unit-fast 也在里面）
+        assert [row["path"] for row in snapshot["slow_paths"]] == ["/api/v1/unit-slow", "/api/v1/unit-heavy"]
+        slow = snapshot["slow_paths"][0]
+        assert (slow["threshold_ms"], slow["exceeded"], slow["worst_ms"]) == (100, 2, 800.0)
+        assert snapshot["paths"]["/api/v1/unit-fast"]["p95_ms"] == 50.0
+
+        # 限流窗口过去之后，下一批要把被压掉的次数报出来，而不是永远闭嘴
+        observability.set_thresholds(log_seconds=0)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="finance-api.slow"):
+            observability.record_request("/api/v1/unit-slow", 200, 160.0)
+        assert any("累计超阈值=3 次" in record.getMessage()
+                   and "另有 1 次被限流" in record.getMessage() for record in caplog.records)
+    finally:
+        observability.reset()
+
+
+def test_slow_path_overrides_parser_skips_bad_entries():
+    """`SLOW_PATH_OVERRIDES` 是调优旋钮：写坏一项只跳过它，不能让服务或解析崩。"""
+    from backend.config import _parse_slow_path_overrides
+
+    assert _parse_slow_path_overrides("/api/v1/rag/search=2000, /api/v1/ai/agent/chat=5000") == {
+        "/api/v1/rag/search": 2000, "/api/v1/ai/agent/chat": 5000}
+    # 缺等号、值不是数字、值非正、空路径一律忽略
+    assert _parse_slow_path_overrides("bad,/a=xyz,/b=0,=100,/c=7") == {"/c": 7}
+    assert _parse_slow_path_overrides("") == {}
+
+
 # ---------------------------------------------------------------- 期间口径与落库
 
 

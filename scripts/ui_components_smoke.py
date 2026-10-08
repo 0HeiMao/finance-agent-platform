@@ -10,6 +10,8 @@
 3. Agent 对话框：真发一问看流式回答；再用 CDP 把 `chat/stream` 断掉制造真实错误，
    输入框此时已被清空——点「重试」必须重发**上一条问题**（这正是单元测试抓到、
    修掉的那个 bug：原来重试读的是空输入框，点了等于没点）。
+4. 管理概览的**慢接口告警**区块：标题在、区块不是空白（要么有空态说明、要么有点了名的告警行），
+   并把这张卡片截图存到 `output/charts/ui_slow_alerts.png`。
 
 用法（要求后端 8000 与前端 dev server 5173 在跑）：
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import shutil
 import subprocess
@@ -331,6 +334,63 @@ async def drive(ws_url: str, base: str, api: str, keep_open: bool) -> int:
             (() => { const b = [...document.querySelectorAll('button')]
                 .find(x => x.textContent.trim() === '清空会话'); if (b) b.click(); return true; })()
             """)
+
+        # ---------- 慢接口告警：/admin 的「接口运行观测」卡片（⑪） ----------
+        # ⑪ 的告警是写给日志的，但值班的人先看管理页；这一页必须真的把 slow_paths 渲染出来，
+        # 而且不能是「卡片在、里面全空」——空态也要有一句说清阈值是多少的说明。
+        await open_page(cdp, session, base, "/admin")
+        check("管理概览：慢接口告警区块渲染出来", await wait_js(
+            cdp, session,
+            "document.body.innerText.includes('慢接口告警（单次超过阈值）')"))
+        alert_rows = await evaluate(cdp, session, """
+        (() => {
+          const head = [...document.querySelectorAll('h3.sub-head')]
+            .find(x => x.textContent.includes('慢接口告警'));
+          if (!head) return '[]';
+          // 只认紧跟在标题后面的那张列表：整个 section 里还有「最慢的接口」那一段，
+          // 用 parentElement.querySelectorAll('ul.dir-list > li') 会把它的行也捞进来。
+          const list = head.nextElementSibling;
+          if (!list || !list.matches('ul.dir-list')) return '[]';
+          return JSON.stringify([...list.children].map(li => li.innerText.replace(/\\s+/g, ' ').trim()));
+        })()
+        """)
+        alert_rows = json.loads(alert_rows) if alert_rows else []
+        empty_hint = await evaluate(cdp, session, """
+        (() => {
+          const p = [...document.querySelectorAll('p.muted')]
+            .find(x => x.textContent.includes('没有请求超过阈值'));
+          return p ? p.textContent.replace(/\\s+/g, ' ').trim() : '';
+        })()
+        """)
+        check("管理概览：告警区不是空白（空态说明或有告警行）", bool(alert_rows) or bool(empty_hint),
+              f"告警行 {alert_rows[:2]}；空态：{empty_hint[:90]}")
+        if alert_rows:
+            check("管理概览：告警行点名路径与超阈值次数",
+                  all("/" in row and "超阈值" in row for row in alert_rows), alert_rows[0][:140])
+
+        # 顺手把这张卡片截下来（⑪ 的证据要看得见，而不只是「断言过了」）
+        box = await evaluate(cdp, session, """
+        (() => {
+          const head = [...document.querySelectorAll('h3.sub-head')]
+            .find(x => x.textContent.includes('慢接口告警'));
+          if (!head) return '';
+          const rect = head.parentElement.getBoundingClientRect();
+          return JSON.stringify({ x: Math.max(0, Math.round(rect.x)),
+                                  y: Math.max(0, Math.round(rect.y + window.scrollY)),
+                                  width: Math.round(rect.width), height: Math.round(rect.height) });
+        })()
+        """)
+        if box:
+            area = json.loads(box)
+            shot = await cdp.send(
+                "Page.captureScreenshot",
+                {"format": "png", "captureBeyondViewport": True, "clip": {**area, "scale": 1}},
+                session_id=session)
+            target_png = PROJECT_ROOT / "output" / "charts" / "ui_slow_alerts.png"
+            target_png.parent.mkdir(parents=True, exist_ok=True)
+            target_png.write_bytes(base64.b64decode(shot["data"]))
+            check("管理概览：慢接口告警卡片截图已保存", target_png.exists(),
+                  f"{target_png.relative_to(PROJECT_ROOT)}（{area['width']}x{area['height']}）")
 
     return finish(keep_open)
 

@@ -23,6 +23,7 @@ from backend.api_dashboard import router as dashboard_router
 from backend.db import engine
 from backend.migrations import ensure_schema, missing_columns
 from sqlalchemy.orm import Session
+from backend import observability
 from backend.observability import record_request, snapshot
 from backend.config import get_settings
 from backend.jobs import reap_stale_jobs
@@ -107,6 +108,12 @@ def _validate_config_on_startup() -> None:
             logger.info("启动清理：%s 条未完成的后台任务已标记为失败", reaped)
     except Exception as exc:  # noqa: BLE001
         logger.error("后台任务清理失败：%s", exc)
+
+    # 慢接口告警的阈值只在启动时说一次：出问题时看日志的人得知道「超过多少才算慢」，
+    # 否则一条告警到底严不严无从判断。
+    limits = observability.thresholds()
+    logger.info("慢接口告警阈值：默认 %s ms；按路径覆盖 %s；同路径告警间隔 %s 秒",
+                limits["default_ms"], limits["overrides"] or "无", limits["log_seconds"])
 
 
 class ChatRequest(BaseModel):
