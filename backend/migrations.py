@@ -38,14 +38,36 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("financial_alerts", "reviewed_at", "TIMESTAMP WITH TIME ZONE"),
     # 预警规则可配置
     ("alert_rules", "require_metric", "VARCHAR(100)"),
+    # 预警规则分档：空表示「所有部门 / 所有期间」
+    ("alert_rules", "department", "VARCHAR(100)"),
+    ("alert_rules", "period", "VARCHAR(7)"),
     # 多部门账号：权威值是一个 JSON 数组，老的单值列 department 作为回落与展示保留。
     # 已有账号不需要数据迁移：departments 为 NULL 时 scope_of() 会自动回落到 department。
     ("users", "departments", "JSONB"),
 ]
 
+# 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。
+# Postgres 给列级 `unique=True` 自动起的名字就是 `<表>_<列>_key`，所以这里按名字精确删——
+# 不用通配符，也不会误伤别的约束。删约束的 DDL 同样只在「确实存在」时执行。
+DROPPED_CONSTRAINTS: list[tuple[str, str, str]] = [
+    ("alert_rules", "alert_rules_alert_type_key",
+     "alert_type 不再唯一：同一类型可以按部门/期间分档成多条规则，"
+     "留着唯一约束会让第二条规则插入时报 UniqueViolation"),
+]
+
+# 需要**从唯一索引换成普通索引**的索引：(表名, 索引名, 列名, 为什么要换)。
+# `unique=True, index=True` 在 Postgres 里生成的是 `CREATE UNIQUE INDEX ix_<表>_<列>`——
+# 它是索引而不是约束，既不进 `pg_constraint`（上面那段删不到），也不受表约束影响，
+# 所以分档规则第二条会报 `duplicate key value violates unique constraint "ix_alert_rules_alert_type"`。
+# 处理方式：确认它确实是 UNIQUE 就删掉再按模型现在的定义（`index=True`、不唯一）建回来。
+PLAIN_INDEXES: list[tuple[str, str, str, str]] = [
+    ("alert_rules", "ix_alert_rules_alert_type", "alert_type",
+     "alert_type 要能一个类型多条（按部门/期间分档），索引保留做前缀查询即可，唯一性必须去掉"),
+]
+
 
 def ensure_schema(engine: Engine | None = None) -> list[str]:
-    """建缺失的表 + 补缺失的列，返回本次真正执行的 DDL 描述（空列表 = 结构已是最新）。"""
+    """建缺失的表 + 补缺失的列 + 去掉过时的唯一约束/唯一索引，返回本次真正执行的 DDL 描述（空列表 = 结构已是最新）。"""
     target = engine if engine is not None else default_engine
     Base.metadata.create_all(bind=target)
     applied: list[str] = []
@@ -59,6 +81,25 @@ def ensure_schema(engine: Engine | None = None) -> list[str]:
                 continue
             connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
             applied.append(f"{table}.{column}")
+        for table, name, _why in DROPPED_CONSTRAINTS:
+            exists = connection.scalar(
+                text("SELECT 1 FROM pg_constraint WHERE conname = :name"
+                     " AND conrelid = CAST(:table AS regclass)"),
+                {"name": name, "table": table})
+            if not exists:
+                continue
+            connection.execute(text(f"ALTER TABLE {table} DROP CONSTRAINT {name}"))
+            applied.append(f"{table}.-{name}")
+        for table, name, column, _why in PLAIN_INDEXES:
+            definition = connection.scalar(
+                text("SELECT indexdef FROM pg_indexes"
+                     " WHERE schemaname = current_schema() AND tablename = :table AND indexname = :name"),
+                {"table": table, "name": name})
+            if definition is None or "UNIQUE" not in definition.upper():
+                continue
+            connection.execute(text(f"DROP INDEX {name}"))
+            connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+            applied.append(f"{table}.{name}→非唯一")
     return applied
 
 

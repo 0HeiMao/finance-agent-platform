@@ -379,8 +379,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | DELETE | `/admin/batches/{batch}` | 撤销批次：删明细 + 重算或清空受影响期间 |
 | GET | `/admin/knowledge?source=&document_type=&limit=&offset=` | 按来源聚合的知识库片段（一行 = 一个来源；返回 `total` 来源数、`matched_chunks` 片段数、`all_chunks` 全库片段数、`document_types`，`limit` 上限 500） |
 | DELETE | `/admin/knowledge?source=` | 按来源整份删除片段，并清理**没有别的来源再引用**的上传件（返回 `{"source","deleted_chunks","removed_files"}`；`stored_path` 落在 `rag_upload_dir` 之外的一律不删） |
-| GET | `/admin/alert-rules` | 预警规则一览（含 `comparators` 与可选指标的中文名 `metrics`）；首次访问会补齐默认两条 |
-| PUT | `/admin/alert-rules/{alert_type}` | 改规则：`{threshold_value, level, enabled, description}`，只传要改的字段 |
+| GET | `/admin/alert-rules` | 预警规则一览（含 `comparators`、指标中文名 `metrics`、级别 `levels`、分档选项 `departments`/`periods`）；首次访问会补齐默认两条 |
+| POST | `/admin/alert-rules` | 新建**分档规则**：`{alert_type, department?, period?, metric_name, comparator, threshold_value, level, require_metric?, description?, enabled?}`，成功 **201** |
+| PUT | `/admin/alert-rules/id/{rule_id}` | 按 id 改一条规则（默认与分档同一端点）：`{department?, period?, metric_name?, comparator?, threshold_value?, level?, require_metric?, description?, enabled?}` |
+| DELETE | `/admin/alert-rules/id/{rule_id}` | 删一条**分档**规则；默认规则 → 400 |
+| PUT | `/admin/alert-rules/{alert_type}` | 兼容入口：只改**默认规则**（全公司 · 所有期间）：`{threshold_value, level, enabled, description}` |
 | GET | `/admin/audit?action=&actor=&target_type=&ip=&since=&until=&limit=&offset=` | 审计日志（倒序，返回 `data/total/limit/offset/actions/actors/ips/retention_days/export_limit`） |
 | GET | `/admin/audit/export?action=&actor=&target_type=&ip=&since=&until=` | 导出审计 CSV（带 BOM，Excel 可直接打开） |
 | POST | `/admin/audit/purge` | 按保留期清理审计（默认 `dry_run` 只报数，真删留痕） |
@@ -429,10 +432,12 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   「已限定部门」（兼容 `department` 为 `NULL` 或空白字符串两种历史写法）。
 
 
-`PUT /admin/alert-rules/{alert_type}` 的响应：
+`PUT /admin/alert-rules/id/{rule_id}` 的响应（`POST` 返回同一形状，`GET` 的 `data[]` 也是）：
 
 ```json
-{ "alert_type": "成本率异常", "metric_name": "cost_ratio", "metric_label": "成本率（成本 ÷ 收入）",
+{ "id": 8, "alert_type": "成本率异常", "department": "018", "period": "2026-10",
+  "scope_label": "018 · 2026-10", "is_default": false,
+  "metric_name": "cost_ratio", "metric_label": "成本率（成本 ÷ 收入）",
   "comparator": "gt", "comparator_label": "大于", "threshold_value": "0.5000",
   "level": "high", "require_metric": "revenue_amount", "description": "成本占收入超过 50%",
   "enabled": true, "updated_at": "2026-10-08 15:42" }
@@ -444,6 +449,33 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   结论对不上。`require_metric` 为空或 `enabled=false` 时该规则不参与判定。
 - 规则形状（比哪个指标、`gt`/`lt`）不开放编辑——平台只有「某指标超过/低于阈值」这一种真实需求，
   做成表达式编辑器反而无法验证。
+
+### 预警规则分档（同一个 `alert_type` 多条共存）
+
+`alert_type` **不再唯一**：同一个类型可以按**部门**、按**期间**各配一条阈值。一次重算里，对每个
+`(期间, 部门)` 只取**最具体的一条**——优先级 `部门+期间(2) > 只限一个维度(1) > 默认规则(0)`，
+同级按 `id` 小的胜出；**命中即覆盖，不叠加**（`backend/alert_rules.py` 的 `scope_rank` / `resolve_rules`，
+返回时按 `(alert_type, id)` 排序）。所以「部门 018 在 2026-10 从严」不会顺手改掉兄弟部门或其它月份的口径。
+
+| 情况 | 结果 |
+| --- | --- |
+| `POST` 的 `department` 与 `period` 都空 | **422**「分档规则至少要限定部门或期间之一；全公司全期间的阈值请改默认规则」 |
+| `period` 不是 `YYYY-MM` | 422（Pydantic 的 `string_pattern_mismatch`） |
+| `metric_name`/`require_metric` 不在允许集合 | 422「metric_name 只能是 …」 |
+| 同「类型 + 部门 + 期间」已存在 | **409**「已有同样范围的「…」规则（018 · 2026-10），请直接改那一条」 |
+| `PUT .../id/{id}` 把分档规则改成两个维度都空 | **422**「…要回到全公司口径请新建默认规则」 |
+| `PUT .../id/{id}` 改成与另一条同范围 | **409** |
+| `DELETE .../id/{id}` 指向默认规则 | **400**「全公司口径的默认规则不能删除，请改用停用（enabled=false）」 |
+
+- 默认规则**只能停用不能删**：删了那个 `alert_type` 就彻底不报了，而「不报」和「停用」在页面上看起来
+  一样、后果差很远。
+- 改动留痕：`alert_rule.create` / `alert_rule.update` / `alert_rule.delete` 三条审计动作，detail 里带
+  `scope`（如 `018 · 2026-10`）与改前改后快照。
+- **老库升级**要同时补 `alert_rules.department`/`period` 两列，并去掉 `alert_type` 的唯一性。注意模型里的
+  `unique=True, index=True` 在 Postgres 里是 **UNIQUE INDEX**，`information_schema`/`pg_constraint` 都查不到，
+  得按 `pg_indexes.indexdef` 判断再 `DROP INDEX` + `CREATE INDEX`（`migrations.py` 的 `PLAIN_INDEXES`），
+  否则插入第二条同类型的分档规则会 `UniqueViolation: duplicate key value violates unique constraint
+  "ix_alert_rules_alert_type"`。
 
 `GET /admin/overview` 返回：
 

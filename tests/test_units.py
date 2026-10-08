@@ -152,6 +152,68 @@ def test_user_department_reads_multi_department_list():
     assert user_department_of(legacy) == ("部门B",)
 
 
+# ---------------------------------------------------------------- 预警规则分档
+
+
+def _rule(alert_type, *, department=None, period=None, threshold="0.8", rule_id=1, level="high"):
+    """不碰数据库的规则对象：分档逻辑是纯函数，没必要为了测它建表。"""
+    return SimpleNamespace(id=rule_id, alert_type=alert_type, department=department, period=period,
+                           metric_name="cost_ratio", comparator="gt", threshold_value=Decimal(threshold),
+                           level=level, require_metric=None, description="", enabled=True)
+
+
+def test_scope_rank_counts_limited_dimensions():
+    from backend.alert_rules import scope_rank
+
+    assert scope_rank(_rule("成本率异常"), period="2097-10", department="部门A") == 0
+    assert scope_rank(_rule("成本率异常", department="部门A"), period="2097-10", department="部门A") == 1
+    # 部门限定了但不匹配 → 这条规则对这个部门根本不适用，不是「不具体」
+    assert scope_rank(_rule("成本率异常", department="部门B"), period="2097-10", department="部门A") is None
+    assert scope_rank(_rule("成本率异常", period="2097-10"), period="2097-09", department=None) is None
+    both = _rule("成本率异常", department="部门A", period="2097-10")
+    assert scope_rank(both, period="2097-10", department="部门A") == 2
+    # 空部门规则对全公司那一行（department=None）同样适用
+    assert scope_rank(_rule("成本率异常", period="2097-10"), period="2097-10", department=None) == 1
+
+
+def test_resolve_rules_picks_most_specific_and_overrides():
+    """同一个 alert_type 只留最具体的一条：覆盖而不是叠加，否则一个部门会同时收到两条同类预警。"""
+    from backend.alert_rules import resolve_rules
+
+    default = _rule("成本率异常", rule_id=1)
+    by_department = _rule("成本率异常", department="部门A", rule_id=2, threshold="0.85")
+    by_period = _rule("成本率异常", period="2097-10", rule_id=3, threshold="0.9")
+    both = _rule("成本率异常", department="部门A", period="2097-10", rule_id=4, threshold="0.95")
+    other = _rule("利润异常", rule_id=5)
+    rules = [default, by_department, by_period, both, other]
+
+    chosen = resolve_rules(rules, period="2097-10", department="部门A")
+    assert [(rule.alert_type, rule.id) for rule in chosen] == [("利润异常", 5), ("成本率异常", 4)]
+    # 其它部门/期间每个 alert_type 同样只留一条（返回按 alert_type、id 排序）
+    assert [rule.id for rule in resolve_rules(rules, period="2097-10", department="部门B")] == [5, 3]
+    assert [rule.id for rule in resolve_rules(rules, period="2097-09", department="部门A")] == [5, 2]
+    assert [rule.id for rule in resolve_rules(rules, period="2097-09", department=None)] == [5, 1]
+
+
+def test_resolve_rules_same_specificity_prefers_lowest_id():
+    """同级按 id 小的胜出：库里存了重复规则时结果也要稳定、可复现，不能随机挑。"""
+    from backend.alert_rules import resolve_rules
+
+    older = _rule("成本率异常", department="部门A", rule_id=7, threshold="0.85")
+    newer = _rule("成本率异常", department="部门A", rule_id=9, threshold="0.99")
+    chosen = resolve_rules([newer, older], period="2097-10", department="部门A")
+    assert [rule.id for rule in chosen] == [7]
+
+
+def test_rule_scope_label_reads_both_dimensions():
+    from backend.alert_rules import rule_scope_label
+
+    assert rule_scope_label(_rule("成本率异常")) == "全公司 · 所有期间"
+    assert rule_scope_label(_rule("成本率异常", department="018")) == "018 · 所有期间"
+    assert rule_scope_label(_rule("成本率异常", period="2026-10")) == "全公司 · 2026-10"
+    assert rule_scope_label(_rule("成本率异常", department="018", period="2026-10")) == "018 · 2026-10"
+
+
 def test_user_department_ignores_forged_legacy_header():
     user = SimpleNamespace(department=None)
     assert user_department_of(user, "部门B") is None

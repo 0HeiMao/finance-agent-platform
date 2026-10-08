@@ -82,7 +82,7 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下四个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下五个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -90,18 +90,20 @@
 | `verify_embedding_model.py` | 本地 Embedding 模型可加载、维度 384、两条中文检索样例 |
 | `verify_crawled_import.py` | 爬取文件全链路 122 项断言（见上），含看板新字段（环比 reason、KPI 标签集合、图表口径说明）与报告导出（标题/小节/金额格式/401） |
 | `verify_financial_agent.py` | Agent 证据层（财务数据 + 知识库 + 重排）、`/rag/*` 鉴权、上传去重、上传落盘目录、真实 SSE 端到端 28 项断言 |
+| `verify_alert_rule_tiers.py` | 预警规则分档 30 项：建期间档/部门+期间档、409 同范围、422 两维都空与非法指标/期间、400 删默认规则、真库重算里三条口径各得三种结果（期间档盖默认、部门+期间档盖期间档）、对照期间不受影响、删掉后回落默认，跑完复原期间并清掉临时规则 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
-还有三个不查数据、只查界面的脚本：
+还有四个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
 | `check_pages.py` | 16 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/` |
 | `ui_scope_smoke.py` | 在真浏览器里点「查看口径」下拉与导出按钮：下拉选项、切口径后 KPI 与提示条变化、导出文件名/行数。**只有它能发现「控件在但点了没反应」** —— 写它时当场抓到 `ScopeSwitcher` 的 `onMounted` 竞态 |
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
+| `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
 
-三个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
+四个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
 ### 一键自检
 
@@ -244,7 +246,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **125** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/按路径耗时采样）、
+`tests/` 下三个文件共 **130** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/按路径耗时采样）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -252,6 +254,10 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 重算）、能收窄到其中一个、切没绑定的部门 403、`/admin/users?department=X` 两个部门都能查到这个账号、
 `/system/status` 的 `me.departments` 给的是完整列表（只给单值列会让设置页把多部门账号缩成一个部门）、
 `/analysis/departments` 的 `switchable` 对多部门账号是 `true`（换口径的下拉要对它开放）→预警处理闭环（状态继承、误报必填原因、跨口径 403、规则可编辑且对重算生效）→
+**预警规则分档**：新增/改/删分档规则（同类型可按部门、按期间各配一条）、两个维度都空 422、
+同「类型+部门+期间」重复 409、默认规则不能删只能停用（400）、
+真库重算里期间档盖住默认规则而部门+期间档又盖住期间档（三条口径同时给出三种结果）、
+对照期间不受影响（越界参数 422）→
 **审计日志**：注册/登录/登录失败留痕且不含密码、七类写操作各一条、按动作与操作人过滤翻页、
 `_scrub` 脱敏单测、审计行没有改/删入口、按 IP 前缀与日期范围筛选（本地日历日、含首尾）、
 导出 CSV 带 BOM 且筛选在导出前生效、导出本身留一条 `audit.export`、清理默认只预览、
@@ -359,7 +365,7 @@ docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesk
 | `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs` |
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
 | `/admin/departments` | 部门权限（账号绑部门、各部门数据规模） | `GET /admin/departments`、`PATCH /admin/users/{id}` |
-| `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述） | `GET /admin/alert-rules`、`PUT /admin/alert-rules/{alert_type}` |
+| `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述；按部门、按期间分档） | `GET /admin/alert-rules`、`POST /admin/alert-rules`、`PUT /admin/alert-rules/id/{id}`、`DELETE /admin/alert-rules/id/{id}`、`PUT /admin/alert-rules/{alert_type}`（只改默认规则） |
 | `/admin/audit` | 审计日志（按动作/操作人/IP/日期范围筛选、翻页、导出 CSV、按保留期清理） | `GET /admin/audit`、`GET /admin/audit/export`、`POST /admin/audit/purge` |
 
 所有业务页面共用 `frontend/src/components/AppSidebar.vue` 侧边栏；页面统一有三态：加载（骨架屏或
@@ -507,6 +513,16 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   `/admin/alert-rules` 上调；**改完只对下一次重算生效，不追溯改写历史预警**——历史预警是当时口径下的判断，
   追改会让当月报告与当时的结论对不上。规则形状（比哪个指标、大于还是小于）不开放编辑：
   平台只有「某指标超过/低于阈值」这一种真实需求，做成表达式编辑器反而无法验证。
+- **规则可以分档**：同一个 `alert_type` 允许存在多条规则，分别限定**部门**、**期间**或两者。
+  重算时对每个 `(期间, 部门)` 只取**最具体的一条**：部门+期间 > 只限一个维度 > 默认规则，
+  **命中即覆盖，不叠加**（`backend/alert_rules.py` 的 `resolve_rules`）。所以「部门 018 在 2026-10 从严」
+  不会顺手改掉兄弟部门或其它月份的口径。默认规则（两个维度都空）**只能停用、不能删**：
+  删了那个 `alert_type` 就彻底不报了，而「不报」和「停用」在页面上看起来一样、后果差很远。
+  分档规则必须至少限定一个维度（两个都空的 422，请改默认规则）；同一「类型+部门+期间」重复 409。
+  老库升级要同时**补 `department`/`period` 两列**并**去掉 `alert_type` 的唯一性**——
+  注意模型里的 `unique=True, index=True` 在 Postgres 里是 **UNIQUE INDEX**，
+  `information_schema`/`pg_constraint` 都查不到，必须按 `pg_indexes.indexdef` 判断再 `DROP INDEX` +
+  `CREATE INDEX`，否则第二次插入同样类型的分档规则会 `UniqueViolation`（`migrations.py` 的 `PLAIN_INDEXES`）。
 - 预警监控页顶部有各状态计数（`GET /api/v1/analysis/alerts/stats`）与状态筛选；统计**不跟着筛选项走**，
   否则一筛「待处理」就再也看不到自己在处理什么。
 
@@ -667,9 +683,14 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   否则库里会留下与明细对不上的幽灵报表。`data/raw/` 下的原始文件按只读约定不动。
   这等价于 `scripts/import_via_api.py --remove` 的语义，现在在界面上就能做。批次多了会分页。
 - **预警规则**（`/admin/alert-rules`）：`GET /api/v1/admin/alert-rules` 列出每条规则的指标、比较符、
-  阈值、级别、启用开关与更新时间，行内改完点保存走 `PUT /api/v1/admin/alert-rules/{alert_type}`。
-  `ensure_rules()` 会在首次访问时补齐默认两条（成本率 > 0.8、净利润 < 0），所以老库打开就有内容；
+  阈值、级别、启用开关与更新时间，表格多一列「适用范围」（`默认`/`分档` 标签 + `scope_label`），
+  行内改完点保存一律走 `PUT /api/v1/admin/alert-rules/id/{id}`（默认与分档同一端点，页面不必记用哪条 URL）。
+  下方「新增分档规则」卡片按部门、按期间各选一个维度后 `POST /api/v1/admin/alert-rules`；
+  分档规则多一个删除按钮（`DELETE /api/v1/admin/alert-rules/id/{id}`），默认规则的删除按钮**禁用**并给出原因。
+  页面草稿按 **`rule.id`** 存：`alert_type` 不再唯一，按类型存会让「部门 018 的 0.95」和「全期间的 0.05」
+  互相覆盖。`ensure_rules()` 会在首次访问时补齐默认两条（成本率 > 0.8、净利润 < 0），所以老库打开就有内容；
   阈值绝对值 ≥ 1e16 会被拒（422「阈值超出可表示范围」），级别只接受 `high|medium|low`。
+  旧的 `PUT /api/v1/admin/alert-rules/{alert_type}` 仍然可用，但只匹配**默认规则**。
 - **知识库管理**：按来源聚合片段数、类型、向量模型与首段预览。删除按整份来源生效（管理员操作，
   不受部门限制）**并顺手清掉孤儿的落盘文档**（还有别的来源引用就保留，越界路径不碰，见「上传件的去留」）；
   `embedding_model` 为空或与当前模型不一致的片段本来就不参与检索，删除后可用

@@ -38,18 +38,62 @@ def ensure_rules(db: Session) -> list[AlertRule]:
 
     建表放在这里而不是只放在 `scripts/init_pgvector_db.py`：老库升级时不会有人再跑一次初始化脚本，
     而管理页和重算都会调到这里，顺手建表最省事（`checkfirst=True` 是幂等的）。
+
+    补默认规则时看的是「**全公司全期间**的那条在不在」，不是「这个类型有没有规则」：
+    分档规则（部门 018 的成本率 0.85）不能顶替默认规则，否则那个类型一旦分档，
+    其它部门/期间就没有兜底规则了。
     """
     Base.metadata.create_all(bind=db.get_bind(), tables=[AlertRule.__table__], checkfirst=True)
-    existing = {rule.alert_type for rule in db.scalars(select(AlertRule)).all()}
+    existing = {(rule.alert_type, rule.department or "", rule.period or "")
+                for rule in db.scalars(select(AlertRule)).all()}
     added = False
     for item in DEFAULT_RULES:
-        if item["alert_type"] in existing:
+        if (item["alert_type"], "", "") in existing:
             continue
         db.add(AlertRule(**item))
         added = True
     if added:
         db.flush()
-    return db.scalars(select(AlertRule).order_by(AlertRule.alert_type)).all()
+    return db.scalars(select(AlertRule).order_by(AlertRule.alert_type, AlertRule.id)).all()
+
+
+def rule_scope_label(rule: AlertRule) -> str:
+    """规则的适用范围文案：「全公司 · 所有期间」「部门 018 · 2026-10」。"""
+    department = rule.department or "全公司"
+    period = rule.period or "所有期间"
+    return f"{department} · {period}"
+
+
+def scope_rank(rule: AlertRule, *, period: str, department: str | None) -> int | None:
+    """规则对 (期间, 部门) 的匹配程度：2 = 两个维度都限定且命中，1 = 只限定一个维度，0 = 都不限定。
+
+    不匹配返回 None。空 `department` 的规则对任何部门都适用（包括全公司那一行）。
+    """
+    if rule.department and rule.department != (department or ""):
+        return None
+    if rule.period and rule.period != period:
+        return None
+    return (1 if rule.department else 0) + (1 if rule.period else 0)
+
+
+def resolve_rules(rules: list[AlertRule], *, period: str, department: str | None) -> list[AlertRule]:
+    """挑出这次重算真正生效的规则：**同一个 alert_type 只取最具体的一条**。
+
+    分档是「覆盖」而不是「叠加」——叠加的话同一个部门会同时收到「成本率 > 0.8」和
+    「成本率 > 0.85」两条同类型预警，处理完一条还剩一条，用户没法判断哪条才算数。
+    同级（都只限定了部门，或都只限定了期间）按 id 小的胜出，保证同样的库每次算出同样的结果。
+    """
+    best: dict[str, tuple[int, int, AlertRule]] = {}
+    for rule in rules:
+        rank = scope_rank(rule, period=period, department=department)
+        if rank is None:
+            continue
+        key = (-rank, rule.id or 0)
+        current = best.get(rule.alert_type)
+        if current is None or key < current[:2]:
+            best[rule.alert_type] = (key[0], key[1], rule)
+    chosen = sorted(best.values(), key=lambda item: (item[2].alert_type, item[1]))
+    return [item[2] for item in chosen]
 
 
 def metric_values(metric: FinancialMetric) -> dict[str, Decimal]:

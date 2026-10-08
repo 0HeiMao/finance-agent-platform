@@ -44,6 +44,8 @@ ACTIONS: dict[str, str] = {
     "knowledge.delete": "删除知识库来源",
     "alert.review": "处理预警",
     "alert_rule.update": "修改预警规则",
+    "alert_rule.create": "新增分档规则",
+    "alert_rule.delete": "删除分档规则",
     "audit.export": "导出审计日志",
     "audit.purge": "清理过期审计",
 }

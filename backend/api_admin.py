@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,7 +26,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from backend import audit, batch_ops, jobs
-from backend.alert_rules import COMPARATORS, ensure_rules
+from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.api_analysis import calculate
 from backend.auth import current_user
 from backend.config import get_settings
@@ -50,6 +51,9 @@ METRIC_LABELS = {
     "gross_profit_ratio": "毛利率",
     "net_profit_ratio": "净利率",
 }
+
+# 预警级别（与 FinancialAlert.level 的取值一致）
+LEVELS = {"high": "高", "medium": "中", "low": "低"}
 
 
 def is_admin(user: User) -> bool:
@@ -649,17 +653,76 @@ def delete_knowledge(
 # ------------------------------------------------------------------ 预警规则
 
 class AlertRuleUpdate(BaseModel):
-    """改一条预警规则。只给阈值/级别/开关/说明——规则形状本身（比较哪个指标、怎么比）不给改，
-    否则前端要长成一个表达式编辑器，而平台只有「某指标超过/低于某阈值」这一种真实需求。"""
+    """改**默认规则**（全公司 · 所有期间）的阈值/级别/开关/说明。
+
+    只给阈值/级别/开关/说明——规则形状本身（比较哪个指标、怎么比）不给改，
+    否则前端要长成一个表达式编辑器，而平台只有「某指标超过/低于某阈值」这一种真实需求。
+    要按部门或期间换阈值，请用 `POST /admin/alert-rules` 新建一条分档规则。
+    """
     threshold_value: Decimal | None = Field(None, description="阈值，允许负数")
     level: str | None = Field(None, pattern="^(high|medium|low)$")
     enabled: bool | None = None
     description: str | None = Field(None, max_length=200)
 
 
+class AlertRuleCreate(BaseModel):
+    """新建一条**分档**规则：按部门、按期间，或两者同时限定。
+
+    必须至少限定一个维度。全公司全期间的那条每个 `alert_type` 只该有一条（默认规则），
+    再建一条 scope 全空的规则会和它抢同一个类型，谁生效只看 id 大小，用户没法解释。
+    """
+    alert_type: str = Field(..., min_length=1, max_length=100)
+    department: str = Field("", max_length=100)
+    period: str = Field("", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$")
+    metric_name: str = Field(..., min_length=1, max_length=100)
+    comparator: str = Field("gt", pattern="^(gt|lt)$")
+    threshold_value: Decimal = Field(..., description="阈值，允许负数")
+    level: str = Field("high", pattern="^(high|medium|low)$")
+    require_metric: str = Field("", max_length=100)
+    description: str = Field("", max_length=200)
+    enabled: bool = True
+
+
+class AlertRuleScope(BaseModel):
+    """按 id 改一条规则（含分档维度）。空串 = 清空该维度，`None` = 不改。"""
+    department: str | None = Field(None, max_length=100)
+    period: str | None = None
+    metric_name: str | None = Field(None, min_length=1, max_length=100)
+    comparator: str | None = Field(None, pattern="^(gt|lt)$")
+    threshold_value: Decimal | None = None
+    level: str | None = Field(None, pattern="^(high|medium|low)$")
+    require_metric: str | None = Field(None, max_length=100)
+    description: str | None = Field(None, max_length=200)
+    enabled: bool | None = None
+
+
+def _clean_text(value: str | None) -> str | None:
+    """空串与纯空白都算「不限定」：页面上把分档维度清空再保存，就是回到全域。"""
+    text = (value or "").strip()
+    return text or None
+
+
+def _metric_or_422(name: str, field: str) -> str:
+    if name not in METRIC_LABELS:
+        raise HTTPException(422, f"{field} 只能是 {'、'.join(METRIC_LABELS)} 之一")
+    return name
+
+
+def _threshold_or_422(value: Decimal) -> Decimal:
+    if abs(value) >= Decimal("10000000000000000"):
+        raise HTTPException(422, "阈值超出可表示范围")
+    return value
+
+
 def _rule_json(rule: AlertRule) -> dict:
     return {
+        "id": rule.id,
         "alert_type": rule.alert_type,
+        "department": rule.department or "",
+        "period": rule.period or "",
+        # 分档规则是「覆盖」：同一 alert_type 一次重算只取最具体的一条，界面要能一眼看出谁赢
+        "scope_label": rule_scope_label(rule),
+        "is_default": not rule.department and not rule.period,
         "metric_name": rule.metric_name,
         "metric_label": METRIC_LABELS.get(rule.metric_name, rule.metric_name),
         "comparator": rule.comparator,
@@ -685,8 +748,23 @@ def _threshold_text(rule) -> str:
 
 def _rule_snapshot(rule) -> dict:
     """规则的可编辑字段快照，供审计记 before/after。"""
-    return {"threshold_value": _threshold_text(rule), "level": rule.level,
+    return {"department": rule.department or "", "period": rule.period or "",
+            "metric_name": rule.metric_name, "comparator": rule.comparator,
+            "threshold_value": _threshold_text(rule), "level": rule.level,
+            "require_metric": rule.require_metric or "",
             "enabled": bool(rule.enabled), "description": rule.description or ""}
+
+
+def _scope_options(db: Session) -> tuple[list[str], list[str]]:
+    """分档可选的部门与期间：都从库里已有数据扫出来，不让用户手打。
+
+    手打的部门名一旦有空格或错字，规则会永远匹配不上，而页面上看不出任何异常。
+    """
+    departments = sorted({(value or "").strip() for value in db.scalars(
+        select(FinancialMetric.department).distinct()).all()} - {""})
+    periods = sorted({value for value in db.scalars(
+        select(FinancialMetric.period).distinct()).all() if value}, reverse=True)
+    return departments, periods[:36]
 
 
 @router.get("/alert-rules")
@@ -694,24 +772,130 @@ def list_alert_rules(db: Session = Depends(get_db), _: User = Depends(admin_user
     """预警规则一览。`ensure_rules` 会顺手补齐默认两条，所以老库第一次访问就能看到内容。"""
     rules = ensure_rules(db)
     db.commit()
+    departments, periods = _scope_options(db)
     return {"data": [_rule_json(rule) for rule in rules],
-            "comparators": COMPARATORS, "metrics": METRIC_LABELS}
+            "comparators": COMPARATORS, "metrics": METRIC_LABELS,
+            "levels": LEVELS, "departments": departments, "periods": periods}
+
+
+@router.post("/alert-rules", status_code=201)
+def create_alert_rule(payload: AlertRuleCreate, request: Request,
+                      db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """新建一条分档规则。重算时同一 `alert_type` 取最具体的一条（部门+期间 > 单维 > 默认）。"""
+    department = _clean_text(payload.department)
+    period = _clean_text(payload.period)
+    if not department and not period:
+        raise HTTPException(422, "分档规则至少要限定部门或期间之一；全公司全期间的阈值请改默认规则")
+    if period and not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+        raise HTTPException(422, "期间要写成 YYYY-MM")
+    metric_name = _metric_or_422(payload.metric_name, "metric_name")
+    require_metric = _clean_text(payload.require_metric)
+    if require_metric:
+        _metric_or_422(require_metric, "require_metric")
+    threshold = _threshold_or_422(payload.threshold_value)
+    ensure_rules(db)
+    duplicate = db.scalars(select(AlertRule).where(
+        AlertRule.alert_type == payload.alert_type,
+        AlertRule.department.is_(None) if department is None else AlertRule.department == department,
+        AlertRule.period.is_(None) if period is None else AlertRule.period == period)).first()
+    if duplicate is not None:
+        raise HTTPException(409, f"已有同样范围的「{payload.alert_type}」规则（{rule_scope_label(duplicate)}），"
+                                 "请直接改那一条")
+    rule = AlertRule(alert_type=payload.alert_type, department=department, period=period,
+                     metric_name=metric_name, comparator=payload.comparator,
+                     threshold_value=threshold, level=payload.level,
+                     require_metric=require_metric, description=payload.description,
+                     enabled=payload.enabled)
+    db.add(rule)
+    db.flush()
+    audit.record(db, me, "alert_rule.create", target_type="alert_rule", target_id=str(rule.id),
+                 detail={"alert_type": rule.alert_type, "scope": rule_scope_label(rule),
+                         "after": _rule_snapshot(rule)}, request=request)
+    db.commit()
+    db.refresh(rule)
+    return _rule_json(rule)
+
+
+@router.put("/alert-rules/id/{rule_id}")
+def update_alert_rule_by_id(rule_id: int, payload: AlertRuleScope, request: Request,
+                            db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """按 id 改一条规则（默认规则也能改，只是不能删）。改完立即对下一次重算生效。"""
+    rule = db.get(AlertRule, rule_id)
+    if rule is None:
+        raise HTTPException(404, "没有这条预警规则")
+    before = _rule_snapshot(rule)
+    department = _clean_text(payload.department) if payload.department is not None else rule.department
+    period = _clean_text(payload.period) if payload.period is not None else rule.period
+    if period:
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+            raise HTTPException(422, "期间要写成 YYYY-MM")
+    if payload.metric_name is not None:
+        rule.metric_name = _metric_or_422(payload.metric_name, "metric_name")
+    if payload.comparator is not None:
+        rule.comparator = payload.comparator
+    if payload.threshold_value is not None:
+        rule.threshold_value = _threshold_or_422(payload.threshold_value)
+    if payload.level is not None:
+        rule.level = payload.level
+    if payload.require_metric is not None:
+        require_metric = _clean_text(payload.require_metric)
+        if require_metric:
+            _metric_or_422(require_metric, "require_metric")
+        rule.require_metric = require_metric
+    if payload.description is not None:
+        rule.description = payload.description
+    if payload.enabled is not None:
+        rule.enabled = payload.enabled
+    if not department and not period:
+        raise HTTPException(422, "分档规则至少要限定部门或期间之一；要回到全公司口径请新建默认规则")
+    clash = db.scalars(select(AlertRule).where(
+        AlertRule.id != rule.id, AlertRule.alert_type == rule.alert_type,
+        AlertRule.department.is_(None) if department is None else AlertRule.department == department,
+        AlertRule.period.is_(None) if period is None else AlertRule.period == period)).first()
+    if clash is not None:
+        raise HTTPException(409, f"已有同样范围的「{rule.alert_type}」规则（{rule_scope_label(clash)}）")
+    rule.department, rule.period = department, period
+    after = _rule_snapshot(rule)
+    audit.record(db, me, "alert_rule.update", target_type="alert_rule", target_id=str(rule.id),
+                 detail={"alert_type": rule.alert_type, "scope": rule_scope_label(rule),
+                         "before": before, "after": after}, request=request)
+    db.commit()
+    db.refresh(rule)
+    return _rule_json(rule)
+
+
+@router.delete("/alert-rules/id/{rule_id}")
+def delete_alert_rule(rule_id: int, request: Request,
+                      db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """删一条分档规则。**默认规则只能停用不能删**：删了那个 alert_type 就彻底不报了，
+    而「不报」和「停用」在页面上看起来一样、后果差很远（前者连恢复的入口都没有）。"""
+    rule = db.get(AlertRule, rule_id)
+    if rule is None:
+        raise HTTPException(404, "没有这条预警规则")
+    if not rule.department and not rule.period:
+        raise HTTPException(400, "全公司口径的默认规则不能删除，请改用停用（enabled=false）")
+    snapshot = _rule_snapshot(rule)
+    scope = rule_scope_label(rule)
+    alert_type = rule.alert_type
+    audit.record(db, me, "alert_rule.delete", target_type="alert_rule", target_id=str(rule_id),
+                 detail={"alert_type": alert_type, "scope": scope, "before": snapshot}, request=request)
+    db.delete(rule)
+    db.commit()
+    return {"id": rule_id, "alert_type": alert_type, "scope": scope, "deleted": True}
 
 
 @router.put("/alert-rules/{alert_type}")
 def update_alert_rule(alert_type: str, payload: AlertRuleUpdate, request: Request,
                       db: Session = Depends(get_db), me: User = Depends(admin_user)):
-    """改阈值/开关。改完**立即对下一次重算生效**（不缓存规则），已有预警不会被追溯改写——
-    历史预警是当时口径下的判断，追改会让报告与当时的结论对不上。"""
-    rules = {rule.alert_type: rule for rule in ensure_rules(db)}
-    rule = rules.get(alert_type)
+    """改**默认规则**（全公司 · 所有期间）的阈值/开关。改完**立即对下一次重算生效**（不缓存规则），
+    已有预警不会被追溯改写——历史预警是当时口径下的判断，追改会让报告与当时的结论对不上。"""
+    rules = [rule for rule in ensure_rules(db) if not rule.department and not rule.period]
+    rule = next((item for item in rules if item.alert_type == alert_type), None)
     if rule is None:
         raise HTTPException(404, "没有这条预警规则")
     before = _rule_snapshot(rule)
     if payload.threshold_value is not None:
-        if abs(payload.threshold_value) >= Decimal("10000000000000000"):
-            raise HTTPException(422, "阈值超出可表示范围")
-        rule.threshold_value = payload.threshold_value
+        rule.threshold_value = _threshold_or_422(payload.threshold_value)
     if payload.level is not None:
         rule.level = payload.level
     if payload.enabled is not None:
@@ -721,7 +905,8 @@ def update_alert_rule(alert_type: str, payload: AlertRuleUpdate, request: Reques
     after = _rule_snapshot(rule)
     # 阈值与开关直接决定「会不会报出来」，改动的旧值/新值都要留痕
     audit.record(db, me, "alert_rule.update", target_type="alert_rule", target_id=alert_type,
-                 detail={"alert_type": alert_type, "before": before, "after": after}, request=request)
+                 detail={"alert_type": alert_type, "scope": rule_scope_label(rule),
+                         "before": before, "after": after}, request=request)
     db.commit()
     db.refresh(rule)
     return _rule_json(rule)

@@ -1577,6 +1577,158 @@ async def test_alert_rules_require_admin(anon_client, api_app, auth_headers):
     assert (await anon_client.get("/api/v1/admin/alert-rules")).status_code == 401
 
 
+TIER_PERIOD = "2097-11"
+
+
+def _seed_department_rows(db, period: str, rows):
+    """按 (部门, 收入, 成本, 费用) 播种子——分档要两个部门各一本账，而 `_seed_transactions`
+    把部门写死成「部门-097」，没法用来验证「部门A 的规则不影响部门B」。"""
+    from backend.models import FinancialTransaction
+
+    for index, (department, revenue, cost, expense) in enumerate(rows):
+        db.add(FinancialTransaction(
+            transaction_date=f"{period}-{index + 1:02d}",
+            account_name="测试科目", account_code="6001", department=department,
+            description="pytest 分档种子", revenue_amount=Decimal(revenue),
+            cost_amount=Decimal(cost), expense_amount=Decimal(expense),
+            cash_in_amount=Decimal("0"), cash_out_amount=Decimal("0"),
+            import_batch="pytest-seed"))
+    db.flush()
+
+
+async def _alerts_in_scope(client, headers, period: str, department: str | None) -> list[dict]:
+    response = await client.get(f"/api/v1/analysis/alerts?period={period}", headers=headers)
+    assert response.status_code == 200, response.text
+    return [item for item in response.json()["data"]
+            if (item["department"] or "") == (department or "")]
+
+
+async def test_scoped_alert_rule_overrides_default_only_in_its_scope(anon_client, api_app, auth_headers, db_session):
+    """分档规则是「覆盖」：部门A + 该期间取最具体的那条，其它部门/期间仍走默认或更宽的规则。
+
+    构造：部门A 成本率 0.9（默认 0.8 会报）、部门B 成本率 0.1（默认不报）、
+    全公司 0.833（部门为空那笔金额够大，把合计率拉过 0.8，默认规则同样会报）。
+
+    部门级结果一律用**受限账号**去读：`scope_alert` 对不受限账号只放行 `department IS NULL`
+    的全公司行（否则每个部门各来一条，看板上同一件事会重复出现），所以管理员账号看不到部门行。
+    """
+    _seed_department_rows(db_session, TIER_PERIOD, [
+        ("部门A", "1000", "900", "0"),
+        ("部门B", "1000", "100", "0"),
+        (None, "10000", "9000", "0"),
+    ])
+    headers_a, client_a = await _scoped_headers(anon_client, api_app, "部门A")
+    headers_b, client_b = await _scoped_headers(anon_client, api_app, "部门B")
+    first = await anon_client.post(f"/api/v1/analysis/calculate?period={TIER_PERIOD}", headers=auth_headers)
+    assert first.status_code == 200, first.text
+    # 默认规则下：部门A（0.9）报、部门B（0.1）不报、全公司（0.833）报
+    assert (await _alerts_in_scope(client_a, headers_a, TIER_PERIOD, "部门A"))[0]["type"] == "成本率异常"
+    assert await _alerts_in_scope(client_b, headers_b, TIER_PERIOD, "部门B") == []
+    assert (await _alerts_in_scope(anon_client, auth_headers, TIER_PERIOD, None))[0]["threshold_value"] == "0.80"
+
+    created = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "成本率异常", "department": "部门A", "period": TIER_PERIOD,
+        "metric_name": "cost_ratio", "comparator": "gt", "threshold_value": "0.95",
+        "level": "medium", "description": "部门A 单独从严"})
+    assert created.status_code == 201, created.text
+    strict = created.json()
+    assert strict["is_default"] is False
+    assert strict["scope_label"] == f"部门A · {TIER_PERIOD}"
+    assert strict["threshold_value"] == "0.9500"
+
+    # 同范围的第二条：前端重复提交会得到明确冲突，而不是库里多出一条谁生效看 id 的规则
+    duplicate = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "成本率异常", "department": "部门A", "period": TIER_PERIOD,
+        "metric_name": "cost_ratio", "threshold_value": "0.99"})
+    assert duplicate.status_code == 409
+    assert "已有同样范围" in duplicate.json()["detail"]
+
+    # scope 全空的分档规则不允许建：它会和默认规则抢同一个类型
+    unscoped = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "毛利率异常", "metric_name": "gross_profit_ratio", "threshold_value": "0.1"})
+    assert unscoped.status_code == 422
+    assert "至少要限定部门或期间" in unscoped.json()["detail"]
+
+    bad_metric = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "成本率异常", "period": TIER_PERIOD,
+        "metric_name": "不存在的指标", "threshold_value": "0.5"})
+    assert bad_metric.status_code == 422
+    bad_period = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "成本率异常", "period": "2097-13",
+        "metric_name": "cost_ratio", "threshold_value": "0.5"})
+    assert bad_period.status_code == 422
+
+    # 再来一条只限定期间的（更宽）：部门B 与全公司会用它，部门A 仍然用更具体的那条
+    wider = await anon_client.post("/api/v1/admin/alert-rules", headers=auth_headers, json={
+        "alert_type": "成本率异常", "period": TIER_PERIOD, "metric_name": "cost_ratio",
+        "threshold_value": "0.05", "level": "low", "description": "本期整体收紧"})
+    assert wider.status_code == 201, wider.text
+
+    second = await anon_client.post(f"/api/v1/analysis/calculate?period={TIER_PERIOD}", headers=auth_headers)
+    assert second.status_code == 200
+    # 部门A 用更具体的 0.95：0.9 不再报；部门B 与全公司用期间级的 0.05，都报
+    assert await _alerts_in_scope(client_a, headers_a, TIER_PERIOD, "部门A") == []
+    department_b = await _alerts_in_scope(client_b, headers_b, TIER_PERIOD, "部门B")
+    assert [item["threshold_value"] for item in department_b] == ["0.05"]
+    assert department_b[0]["level"] == "low"
+    company = await _alerts_in_scope(anon_client, auth_headers, TIER_PERIOD, None)
+    assert [item["threshold_value"] for item in company] == ["0.05"]
+
+    # 按 id 改分档阈值（走的是新端点，默认规则的 PUT 不受影响）
+    relaxed = await anon_client.put(f"/api/v1/admin/alert-rules/id/{strict['id']}",
+                                    headers=auth_headers, json={"threshold_value": "0.85"})
+    assert relaxed.status_code == 200, relaxed.text
+    assert relaxed.json()["threshold_value"] == "0.8500"
+    third = await anon_client.post(f"/api/v1/analysis/calculate?period={TIER_PERIOD}", headers=auth_headers)
+    assert third.status_code == 200
+    assert [item["threshold_value"] for item in
+            await _alerts_in_scope(client_a, headers_a, TIER_PERIOD, "部门A")] == ["0.85"]
+
+    # 不能把分档规则改成全公司口径（那会变成第二条默认规则）
+    globalize = await anon_client.put(f"/api/v1/admin/alert-rules/id/{strict['id']}",
+                                      headers=auth_headers, json={"department": "", "period": ""})
+    assert globalize.status_code == 422
+    assert "至少要限定部门或期间" in globalize.json()["detail"]
+    missing = await anon_client.put("/api/v1/admin/alert-rules/id/999999", headers=auth_headers,
+                                    json={"threshold_value": "0.5"})
+    assert missing.status_code == 404
+
+    # 默认规则只允许停用不允许删；分档规则可以删
+    listed = await anon_client.get("/api/v1/admin/alert-rules", headers=auth_headers)
+    defaults = [rule for rule in listed.json()["data"] if rule["is_default"]]
+    assert defaults and all(rule["scope_label"] == "全公司 · 所有期间" for rule in defaults)
+    kept = await anon_client.delete(f"/api/v1/admin/alert-rules/id/{defaults[0]['id']}", headers=auth_headers)
+    assert kept.status_code == 400
+    assert "不能删除" in kept.json()["detail"]
+
+    removed = await anon_client.delete(f"/api/v1/admin/alert-rules/id/{strict['id']}", headers=auth_headers)
+    assert removed.status_code == 200 and removed.json()["deleted"] is True
+    assert (await anon_client.delete(f"/api/v1/admin/alert-rules/id/{strict['id']}",
+                                     headers=auth_headers)).status_code == 404
+    # 删掉最具体的那条后，部门A 回到「期间规则」（0.05）
+    fourth = await anon_client.post(f"/api/v1/analysis/calculate?period={TIER_PERIOD}", headers=auth_headers)
+    assert fourth.status_code == 200
+    assert [item["threshold_value"] for item in
+            await _alerts_in_scope(client_a, headers_a, TIER_PERIOD, "部门A")] == ["0.05"]
+
+    # 分档规则的建/改/删都要留痕，否则管理页改完没人知道谁改的
+    audit = await anon_client.get("/api/v1/admin/audit?action=alert_rule.create", headers=auth_headers)
+    assert audit.status_code == 200
+    assert len(audit.json()["data"]) >= 2
+    detail = audit.json()["data"][0]["detail"]
+    assert detail["scope"] and "alert_type" in detail and "after" in detail
+    deleted = await anon_client.get("/api/v1/admin/audit?action=alert_rule.delete", headers=auth_headers)
+    assert deleted.json()["data"][0]["detail"]["before"]["threshold_value"] == "0.8500"
+
+    # 列表接口给出分档可选的部门/期间与级别（页面上的下拉不让人手打，打错字规则永远匹配不上）
+    options = listed.json()
+    assert options["levels"] == {"high": "高", "medium": "中", "low": "低"}
+    assert "部门A" in options["departments"] and TIER_PERIOD in options["periods"]
+
+    await client_a.aclose()
+    await client_b.aclose()
+
+
 # ---------------------------------------------------------------- 审计日志
 
 AUDIT_PERIOD = "2097-08"

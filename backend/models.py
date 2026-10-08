@@ -83,14 +83,21 @@ class AlertRule(Base):
 
     只支持「按某个指标名与阈值比较」这一种形态（`comparator` 目前只有 `gt`），
     因为平台里两条规则都是这个形状；写成通用规则引擎反而没法验证。
+
+    规则可以**按部门/期间分档**：`department` / `period` 为空表示「所有部门 / 所有期间」。
+    同一个 `alert_type` 在一次重算里只取最具体的一条（期间+部门 > 单维 > 全公司全期间），
+    所以 `alert_type` 不再唯一——默认那两条就是 scope 全空的规则。
     """
     __tablename__ = "alert_rules"
     id: Mapped[int] = mapped_column(primary_key=True)
-    alert_type: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    alert_type: Mapped[str] = mapped_column(String(100), index=True)
     metric_name: Mapped[str] = mapped_column(String(100))
     comparator: Mapped[str] = mapped_column(String(10), default="gt")
     threshold_value: Mapped[Decimal] = mapped_column(Numeric(20, 4), default=0)
     level: Mapped[str] = mapped_column(String(20), default="high")
+    # 分档维度：空 = 不限定（全公司 / 全期间）
+    department: Mapped[str | None] = mapped_column(String(100))
+    period: Mapped[str | None] = mapped_column(String(7))
     # 该指标为 0（或不存在）时这条规则不适用：收入为 0 时「成本占收入比」没有意义。
     require_metric: Mapped[str | None] = mapped_column(String(100))
     description: Mapped[str] = mapped_column(Text, default="")

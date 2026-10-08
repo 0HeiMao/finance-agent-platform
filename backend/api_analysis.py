@@ -6,7 +6,7 @@ from sqlalchemy import extract, func, select, delete
 from sqlalchemy.orm import Session
 from backend import audit
 from backend.auth import current_user
-from backend.alert_rules import ensure_rules, evaluate, metric_values
+from backend.alert_rules import ensure_rules, evaluate, metric_values, resolve_rules
 from backend.db import get_db
 from backend.models import AlertRule, FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.scope import (Scope, in_scope, metric_totals, resolve_requested_scope, scope_alert,
@@ -128,7 +128,9 @@ def calculate(db: Session, period: str, commit: bool = True):
     alerts: list[FinancialAlert] = []
     for department in [None, *departments]:
         subset = rows if department is None else [r for r in rows if (r.department or "").strip() == department]
-        item, item_alerts = _build(period, department, subset, rules)
+        # 规则按 (期间, 部门) 分档：同一个 alert_type 只取最具体的一条（覆盖，不叠加）
+        active = resolve_rules(rules, period=period, department=department)
+        item, item_alerts = _build(period, department, subset, active)
         db.add(item)
         for alert in item_alerts:
             # 继承处理状态：口径 + 类型 + 指标名三者相同才算同一条预警
