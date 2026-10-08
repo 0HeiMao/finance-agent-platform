@@ -2192,3 +2192,80 @@ async def test_schema_matches_models(require_database):
 
     ensure_schema()
     assert missing_columns() == []
+
+
+# ---------------------------------------------------------------- 出口配额（导出 / 问答）
+
+async def test_export_quota_returns_429_and_does_not_touch_ai(anon_client, auth_headers, stub_retrieval):
+    """导出打满后返回 429 + Retry-After；问答配额是另一本账，不受影响。"""
+    from backend import ratelimit
+    from backend.ratelimit import SlidingWindowLimiter
+
+    ratelimit.install_limiter("export", SlidingWindowLimiter(limit=2, window_seconds=60))
+    ratelimit.install_limiter("ai", SlidingWindowLimiter(limit=5, window_seconds=60))
+    try:
+        for _ in range(2):
+            ok = await anon_client.get("/api/v1/export/metrics", headers=auth_headers)
+            assert ok.status_code == 200, ok.text
+        blocked = await anon_client.get("/api/v1/export/metrics", headers=auth_headers)
+        assert blocked.status_code == 429, blocked.text
+        assert "导出过于频繁" in blocked.json()["detail"]
+        assert int(blocked.headers["Retry-After"]) >= 1
+        # 三个导出接口共用一本账（不能靠换路径绕过）
+        assert (await anon_client.get("/api/v1/export/alerts", headers=auth_headers)).status_code == 429
+        # 问答走另一本账
+        assert (await anon_client.post("/api/v1/rag/search", headers=auth_headers,
+                                       json={"query": "奖金方案", "top_k": 5})).status_code == 200
+        # 计数按账号分桶：本用例只写了当前账号 + 一个配额名，不写审计（429 写审计会被拿来放大）
+        assert ratelimit.get_limiter("export").tracked_keys == 1
+    finally:
+        ratelimit.reset_limiters()
+
+
+async def test_ai_quota_covers_search_answer_and_agent(anon_client, auth_headers, stub_retrieval, monkeypatch):
+    """问答配额：/rag/search、/rag/answer、/ai/* 共用一本账，超限同样是 429 + Retry-After。"""
+    from backend import ratelimit
+    from backend.ratelimit import SlidingWindowLimiter
+
+    monkeypatch.setattr("backend.api_rag.generate_answer", lambda question, results: ("依据证据的回答", []))
+    monkeypatch.setattr("backend.api_ai.rag_answer",
+                        lambda question, **kwargs: {"answer": "依据证据的回答", "sources": []})
+    ratelimit.install_limiter("ai", SlidingWindowLimiter(limit=3, window_seconds=60))
+    try:
+        first = await anon_client.post("/api/v1/rag/search", headers=auth_headers,
+                                       json={"query": "奖金方案", "top_k": 5})
+        assert first.status_code == 200, first.text
+        second = await anon_client.post("/api/v1/rag/answer", headers=auth_headers,
+                                        json={"query": "差旅费标准", "top_k": 5})
+        assert second.status_code == 200, second.text
+        third = await anon_client.post("/api/v1/ai/rag/chat", headers=auth_headers,
+                                       json={"question": "差旅费标准是多少？"})
+        assert third.status_code == 200, third.text
+        blocked = await anon_client.post("/api/v1/rag/search", headers=auth_headers,
+                                         json={"query": "奖金方案", "top_k": 5})
+        assert blocked.status_code == 429, blocked.text
+        assert "问答过于频繁" in blocked.json()["detail"]
+        assert int(blocked.headers["Retry-After"]) >= 1
+        # 导出不受影响
+        assert (await anon_client.get("/api/v1/export/metrics", headers=auth_headers)).status_code == 200
+    finally:
+        ratelimit.reset_limiters()
+
+
+async def test_quota_registry_reports_config_and_rejects_unknown_name():
+    """配额登记表：未登记的名字要显式报错，reset 后回到配置里的默认值。"""
+    from backend import ratelimit
+    from backend.config import get_settings
+
+    ratelimit.reset_limiters()
+    try:
+        with pytest.raises(KeyError):
+            ratelimit.quota("nope")
+        settings = get_settings()
+        assert ratelimit.quota("export") == (settings.export_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
+        assert ratelimit.quota("ai") == (settings.ai_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
+        assert ratelimit.get_limiter("export") is ratelimit.get_limiter("export")
+        assert ratelimit.get_limiter("login") is ratelimit.get_login_limiter()
+    finally:
+        ratelimit.reset_limiters()
+    assert ratelimit.get_limiter("export").limit == get_settings().export_max_per_minute

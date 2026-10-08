@@ -8,6 +8,7 @@ from backend.api_rag import retrieve_for_user, user_department_of
 from backend.db import SessionLocal
 from backend.rag.financial_evidence import collect as collect_financial_evidence
 from backend.llm import get_llm
+from backend.limits import ai_quota
 from backend.models import User
 from backend.scope import resolve_requested_scope, scope_of, scope_payload
 router = APIRouter(prefix="/api/v1/ai", tags=["ai"])
@@ -22,20 +23,23 @@ def _retrieve(question: str, db, user_department: str | None = None) -> list:
 
 @router.post("/rag/chat")
 def chat(payload: Question, user: User = Depends(current_user),
-         x_user_department: str | None = Header(default=None)):
+         x_user_department: str | None = Header(default=None),
+         _quota: None = Depends(ai_quota)):
     return rag_answer(payload.question, user_department=user_department_of(user, x_user_department))
 
 
 @router.post("/agent/ask")
 def agent_ask(payload: Question, user: User = Depends(current_user),
-              x_user_department: str | None = Header(default=None)):
+              x_user_department: str | None = Header(default=None),
+              _quota: None = Depends(ai_quota)):
     return {"tool": "rag_search", **rag_answer(payload.question, user_department=user_department_of(user, x_user_department))}
 
 
 @router.post("/agent/chat/stream")
 def agent_stream(payload: Question, department: str | None = Query(None, max_length=100),
                  user: User = Depends(current_user),
-                 x_user_department: str | None = Header(default=None)):
+                 x_user_department: str | None = Header(default=None),
+                 _quota: None = Depends(ai_quota)):
     """财务 Agent 流式问答：证据 = 已导入财务数据 + 知识库检索，模型只能依据证据作答。"""
     scope = user_department_of(user, x_user_department)
     # 财务数据的范围只认服务端记录的部门（scope_of），不认请求头：知识库那条兼容路径允许

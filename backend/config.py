@@ -144,6 +144,11 @@ if BaseSettings is not None:
         rag_upload_dir: str = "data/uploads/documents"
         # 审计日志的保留天数：超过这个天数才算过期，只有 POST /admin/audit/purge 会删（并留痕）。
         audit_retention_days: int = 180
+        # 出口配额（每分钟、按账号）：导出一次能把整库拉走，问答一次要花模型的钱，
+        # 两个都必须是"脚本打不动、人用不着"的量级——回归脚本一次要连问 28 个问题，
+        # 所以默认给到 60，不是 10 那种会误伤自己的数字。
+        export_max_per_minute: int = 30
+        ai_max_per_minute: int = 60
         database_url: str = "postgresql+psycopg://finance:finance@localhost:5432/finance"
         deepseek_api_key: str = ""
         deepseek_base_url: str = "https://api.deepseek.com"
@@ -210,6 +215,8 @@ else:
         upload_dir = os.getenv("UPLOAD_DIR", "data/uploads")
         rag_upload_dir = os.getenv("RAG_UPLOAD_DIR", "data/uploads/documents")
         audit_retention_days = int(os.getenv("AUDIT_RETENTION_DAYS", "180"))
+        export_max_per_minute = int(os.getenv("EXPORT_MAX_PER_MINUTE", "30"))
+        ai_max_per_minute = int(os.getenv("AI_MAX_PER_MINUTE", "60"))
         database_url = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@localhost:5432/finance")
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

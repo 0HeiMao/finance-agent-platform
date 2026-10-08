@@ -23,6 +23,7 @@ from backend import audit
 from backend.auth import current_user
 from backend.db import get_db
 from backend.files import content_disposition
+from backend.limits import export_quota
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction, User
 from backend.scope import (resolve_requested_scope, scope_alert, scope_metric, scope_label, scope_of,
                            scope_payload, scope_transactions)
@@ -153,7 +154,8 @@ def export_transactions(request: Request, period: str | None = Query(None, patte
                         department: str | None = Query(None, max_length=100),
                         account: str | None = Query(None, max_length=200),
                         export_format: str = Query("csv", alias="format"),
-                        db: Session = Depends(get_db), user: User = Depends(current_user)):
+                        db: Session = Depends(get_db), user: User = Depends(current_user),
+                        _quota: None = Depends(export_quota)):
     """明细导出。period 省略表示导出该账号范围内的全部期间。"""
     export_format = _format(export_format)
     scope = _guard(user, department)
@@ -183,7 +185,8 @@ def export_metrics(request: Request,
                    period_to: str | None = Query(None, pattern=PERIOD_PATTERN),
                    department: str | None = Query(None, max_length=100),
                    export_format: str = Query("csv", alias="format"),
-                   db: Session = Depends(get_db), user: User = Depends(current_user)):
+                   db: Session = Depends(get_db), user: User = Depends(current_user),
+                   _quota: None = Depends(export_quota)):
     """期间指标导出：导出的是该账号口径的那些行（全公司行或该部门行），不会把两套混在一起。"""
     export_format = _format(export_format)
     scope = _guard(user, department)
@@ -209,7 +212,8 @@ def export_alerts(request: Request, period: str | None = Query(None, pattern=PER
                   level: str | None = Query(None, max_length=20),
                   department: str | None = Query(None, max_length=100),
                   export_format: str = Query("csv", alias="format"),
-                  db: Session = Depends(get_db), user: User = Depends(current_user)):
+                  db: Session = Depends(get_db), user: User = Depends(current_user),
+                  _quota: None = Depends(export_quota)):
     """预警导出。`needs_human_review` 一起导出，便于线下复核后回填。
 
     `period` 是单期精确匹配，`period_from`/`period_to` 是区间——看板按「本年」展示时筛的就是区间，

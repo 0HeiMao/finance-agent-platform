@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from backend import audit
 from backend.auth import current_user
 from backend.db import get_db
+from backend.limits import ai_quota
 from backend.models import User
 from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
 from backend.rag.document_parser import extract_text, split_text
@@ -104,7 +105,7 @@ def _existing_hashes(db: Session, embedding_model: str, department: str | None) 
 
 @router.post("/documents")
 def index_document(payload: DocumentInput, request: Request, db: Session = Depends(get_db),
-                   user: User = Depends(current_user)) -> dict:
+                   user: User = Depends(current_user), _quota: None = Depends(ai_quota)) -> dict:
     try:
         model_name = get_embedding_service().model_name
         digest = _content_hash(payload.content)
@@ -127,7 +128,8 @@ def index_document(payload: DocumentInput, request: Request, db: Session = Depen
 
 @router.post("/documents/upload")
 async def upload_document(request: Request, file: UploadFile = File(...),
-                          db: Session = Depends(get_db), user: User = Depends(current_user)) -> dict:
+                          db: Session = Depends(get_db), user: User = Depends(current_user),
+                          _quota: None = Depends(ai_quota)) -> dict:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".txt", ".md", ".csv", ".pdf", ".docx"}:
         raise HTTPException(status_code=400, detail="仅支持 txt、md、csv、pdf、docx 文件")
@@ -167,7 +169,8 @@ async def upload_document(request: Request, file: UploadFile = File(...),
 
 @router.post("/search")
 def search_documents_api(payload: SearchInput, db: Session = Depends(get_db), user: User = Depends(current_user),
-                         x_user_department: str | None = Header(default=None)) -> dict:
+                         x_user_department: str | None = Header(default=None),
+                         _quota: None = Depends(ai_quota)) -> dict:
     if payload.embedding is not None and payload.embedding_model != get_embedding_service().model_name:
         raise HTTPException(status_code=422, detail="查询向量的模型标识与当前模型不一致")
     scope = user_department_of(user, x_user_department)
@@ -197,7 +200,8 @@ def search_documents_api(payload: SearchInput, db: Session = Depends(get_db), us
 
 @router.post("/answer")
 def answer_question(payload: AnswerInput, db: Session = Depends(get_db), user: User = Depends(current_user),
-                    x_user_department: str | None = Header(default=None)) -> dict:
+                    x_user_department: str | None = Header(default=None),
+                    _quota: None = Depends(ai_quota)) -> dict:
     """检索、按部门过滤并生成带来源回答；带 department 标记的资料仅同部门可见。"""
     try:
         results = retrieve_for_user(db, payload.query, user_department_of(user, x_user_department), payload.top_k)

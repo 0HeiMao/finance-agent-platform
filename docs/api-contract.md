@@ -43,6 +43,29 @@ Retry-After: 213
 生成一个并**就地写回 `.env`**（保留其它行、不重复追加键）：占位密钥意味着任何人都能自己签一个合法 JWT。
 副作用是密钥一变，之前签发的 token 全部失效，客户端需要重新登录。
 
+### 出口配额（除了登录，还有两组）
+
+限流不止登录。**一次请求就很贵**的两类出口各自一本账，都按**账号**分桶，超限返回与登录同形的 429：
+
+| 配额 | 覆盖 | 默认 | 配置项 |
+| --- | --- | --- | --- |
+| `export` | `GET /export/transactions`、`/export/metrics`、`/export/alerts` | 30 次 / 60 秒 | `EXPORT_MAX_PER_MINUTE` |
+| `ai` | `POST /rag/search`、`/rag/answer`、`/rag/documents`、`/rag/documents/upload`、`/ai/rag/chat`、`/ai/agent/ask`、`/ai/agent/chat/stream` | 60 次 / 60 秒 | `AI_MAX_PER_MINUTE` |
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 42
+
+{"detail":"导出过于频繁，请在 42 秒后重试"}
+```
+
+- 三组配额（`login` / `export` / `ai`）**互不影响**：登录被限流不影响看数据，导出打满也能继续问答。
+- `/export/scope` 是元数据（给按钮用的口径与上限），不占配额。
+- `EXPORT_LIMIT = 20000` 限制的是**单次**导出行数，与本表无关——它拦不住「脚本每分钟导 100 次」。
+- **429 不写审计**：一条被拒请求写一条审计等于给攻击者一个「用便宜请求写满审计表」的放大器；
+  观测性里按 `429:路径` 计数，`GET /admin/overview` 的 `observability.requests` 能看到。
+- **边界**：与登录限流同一实现（`backend/ratelimit.py`，进程内滑动窗口、无 Redis），重启清零、不跨副本。
+
 > 部门不要走请求头自述：早期实现用 `X-User-Department: finance-admin` 当管理员凭证，属于可伪造提权，
 > 现在只有「用户自己没设部门」时才兼容这个旧头，其他情况一律忽略（见 `backend/api_rag.py: user_department_of`）。
 > 财务数据也认**服务端记录的 `User.department`**，但不认请求头：`backend/api_ai.py` 里知识库片段允许走旧头

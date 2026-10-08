@@ -230,7 +230,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **118** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/按路径耗时采样）、
+`tests/` 下三个文件共 **121** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/按路径耗时采样）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -244,7 +244,10 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 审计里带任务 id、不存在的批次 404 且不留任务记录、未注册的任务类型标记失败、
 重启收尸把 queued/running 标成失败、非管理员 403→**结构漂移**：模型里的列都在真库里
 （漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）→**按路径耗时**：`record_request` 后
-`snapshot()["paths"]` 给出每条的 count/p95/max，且 500 与 200 分开计数）。
+`snapshot()["paths"]` 给出每条的 count/p95/max，且 500 与 200 分开计数→**出口配额**：
+导出打满返回 429 + `Retry-After`、三个导出接口共用一本账（换路径绕不过）、
+问答是另一本账（导出打满仍能问答）、`/rag/search`+`/rag/answer`+`/ai/*` 共用问答配额、
+配额表对未登记名字显式报错且 `reset` 后回到配置默认值）。
 异步用例用 **anyio** 插件（`pytestmark = pytest.mark.anyio`，用例 id 显示 `[asyncio]`），
 不依赖未安装的 pytest-asyncio；数据库不可用时自动 `pytest.skip` 而不是失败。
 测试自身在外层事务里跑，结束整体回滚，不会污染库里数据。
@@ -530,6 +533,14 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   被拒的尝试也计数，登录成功后清零。**边界**：这是 `backend/ratelimit.py` 里的**单进程内存实现**，
   没有 Redis，所以计数不跨进程/副本，进程重启即清零；要横向扩容得换成集中式计数（与后台任务同一个约束，
   见上面的「后台任务」一节）。
+- **出口配额（导出 / 问答）**：限流不止登录，另外两组「一次请求就很贵」的出口各自独立计数：
+  `export`（明细/指标/预警导出，默认 **30 次/分钟**）与 `ai`（RAG 检索与问答、知识库写入，默认 **60 次/分钟**），
+  按**账号**分桶，超限同样是 429 + `Retry-After`。`EXPORT_LIMIT = 20000` 只限制**单次**导出行数，
+  拦不住「脚本每分钟导 100 次」；问答每次都要调模型，是按量计费的东西，必须有配额。
+  三组配额（`login` / `export` / `ai`）互不影响——登录被限流不该影响看数据，导出打满也不该让人问不出问题；
+  配置项 `EXPORT_MAX_PER_MINUTE` / `AI_MAX_PER_MINUTE`（默认 30 / 60，回归脚本一次要连问 28 个问题，
+  所以默认值给得比「防脚本」的理论下限宽松，避免误伤自己）。**429 不写审计**：一次被拒的请求写一条审计，
+  等于给攻击者一个「用便宜请求写满审计表」的放大器；观测性里已按 `429:路径` 计数，管理概览能看到。
 - **`.xls` 友好失败**：没装 `xlrd` 时返回 400 并说明两条出路（装 xlrd 或另存为 .xlsx），
   而不是 500 或者一句「无法解析」。
 - **前端错误信息**：`frontend/src/api/client.js` 新增 `errorMessage()`，把 FastAPI 的 422

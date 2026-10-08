@@ -1,13 +1,18 @@
-"""进程内的登录限流（滑动窗口）。
+"""进程内的接口限流（滑动窗口）。
 
 为什么放内存：这个部署没有可用的 Redis（`redis` 包本身都没装，见 requirements 注释），
-而登录爆破是**最廉价**的攻击面——密码只有长度下限、没有复杂度要求，不限速等于随便试。
+而登录爆破是**最廉价**的攻击面——密码只有长度下限、没有复杂度要求，不限速等于随便试；
+导出与 RAG/Agent 是另两个「一次请求很贵」的出口（一个把整库拖出来，一个调模型算钱）。
 内存实现能挡住脚本化的连续尝试，代价是**每个进程各算一份**（多 worker 或重启后计数清零），
-这条边界写进了 README；真要多副本共享，把 `_limiter` 换成 Redis 计数即可，调用点不用改。
+这条边界写进了 README；真要多副本共享，把 `_limiters` 换成 Redis 计数即可，调用点不用改。
+
+三组配额各自独立计数（`login` / `export` / `ai`）：登录被限流不该影响看数据，
+导出打满也不该让人问不出问题来——限流的目标是挡住脚本，不是惩罚用户。
 """
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -86,3 +91,54 @@ def reset_login_limiter(limiter: SlidingWindowLimiter | None = None) -> SlidingW
     global _limiter
     _limiter = limiter or login_limiter()
     return _limiter
+
+
+# ------------------------------------------------------------------ 通用配额（导出 / RAG·Agent）
+
+LIMIT_WINDOW_SECONDS = 60.0
+_lock = threading.Lock()
+_limiters: dict[str, SlidingWindowLimiter] = {}
+
+
+def quota(name: str) -> tuple[int, float]:
+    """各配额的（次数上限，窗口秒数）。读配置，测试里改环境变量再 reset 就能换。"""
+    from backend.config import get_settings
+
+    settings = get_settings()
+    if name == "export":
+        return max(1, settings.export_max_per_minute), LIMIT_WINDOW_SECONDS
+    if name == "ai":
+        return max(1, settings.ai_max_per_minute), LIMIT_WINDOW_SECONDS
+    raise KeyError(f"没有登记的配额：{name}")
+
+
+def get_limiter(name: str) -> SlidingWindowLimiter:
+    """按名字取进程级限流器；`login` 复用登录那一份，其它按配置惰性创建。"""
+    if name == "login":
+        return get_login_limiter()
+    with _lock:
+        limiter = _limiters.get(name)
+        if limiter is None:
+            limit, window = quota(name)
+            limiter = SlidingWindowLimiter(limit=limit, window_seconds=window)
+            _limiters[name] = limiter
+        return limiter
+
+
+def reset_limiters() -> None:
+    """测试与启动时清空：把配置改动立刻反映到配额上。"""
+    with _lock:
+        _limiters.clear()
+    reset_login_limiter()
+
+
+def install_limiter(name: str, limiter: SlidingWindowLimiter) -> SlidingWindowLimiter:
+    """换掉某个配额的限流器（测试用：把窗口调小，免得用例里真打 30 个请求）。"""
+    with _lock:
+        _limiters[name] = limiter
+    return limiter
+
+
+def consume(name: str, username: str) -> Decision:
+    """记一次请求并返回判定。key 是「配额名 + 账号」：同一账号的导出与问答各算各的。"""
+    return get_limiter(name).check(f"{name}:{username}")
