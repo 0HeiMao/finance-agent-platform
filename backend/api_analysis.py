@@ -4,12 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import extract, func, select, delete
 from sqlalchemy.orm import Session
-from backend import audit
+from backend import audit, rollups
 from backend.auth import current_user
 from backend.alert_rules import ensure_rules, evaluate, metric_values, resolve_rules
 from backend.db import get_db
 from backend.models import AlertRule, FinancialAlert, FinancialMetric, FinancialTransaction, User
-from backend.scope import (Scope, in_scope, metric_totals, resolve_requested_scope, scope_alert,
+from backend.periods import GRAIN_LABELS
+from backend.scope import (Scope, in_scope, resolve_requested_scope, scope_alert,
                            scope_label, scope_metric, scope_of, scope_payload, scope_transactions)
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
@@ -145,6 +146,12 @@ def calculate(db: Session, period: str, commit: bool = True):
         db.add_all(item_alerts)
         if department is None:
             metric, alerts = item, item_alerts
+    # 季/年落库跟着月口径走：这个月的指标刚被删了重建，它所在的季与年必须一起重算，
+    # 否则看板/报告读到的是上一版季度合计（数字对不上，但没有任何报错）。
+    # 必须先 flush：SessionLocal 是 autoflush=False，刚 db.add 的指标行还只在内存里，
+    # 落库那边读库会漏掉这个月（用例 test_calculate_refreshes_quarter_rollup... 抓到的）。
+    db.flush()
+    rollups.refresh_for_months(db, [period])
     if commit: db.commit()
     else: db.flush()
     db.refresh(metric)
@@ -315,11 +322,33 @@ def alert_transactions(alert_id: int, limit: int = Query(200, ge=1, le=2000), ro
 
 @router.get("/summary")
 def summary(period: str, department: str | None = Query(None, max_length=100), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """某一期的合计。
+
+    月口径直接读 `financial_metrics`（那张表本来就是月行）；季/年读 `financial_rollups` 的落库合计，
+    落库还没覆盖这一期时按同一算法现算兜底。`source` 如实说明数字是哪来的
+    （`month`/`stored`/`computed`/`empty`），页面才不会把现算的数当成落库的数；
+    `complete`/`missing_months` 对季/年说明「这几期是不是凑齐了」——演示数据只有 2026-04~10，
+    2026 年度缺 5 个月，年度合计不是全年。
+    """
     scope, payload, violation = _scoped(user, department)
     if violation: raise HTTPException(403, violation)
-    rows = db.scalars(scope_metric(select(FinancialMetric).where(FinancialMetric.period == period), scope)).all()
-    # 多部门账号同期有多行：金额相加、比率按相加后的金额重算（不能把比率加起来）。
-    totals = metric_totals(rows, period_order=[period])
-    if not totals: return {"has_data": False, "revenue_amount": 0, "cost_amount": 0, "net_profit_amount": 0, "net_profit_ratio": 0, "scope": payload}
-    metric = totals[0]
-    return {"has_data": True, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "net_profit_amount": float(metric.net_profit_amount), "net_profit_ratio": float(metric.net_profit_ratio), "department": metric.department or "", "departments": list(metric.departments), "scope": payload}
+    board = rollups.aggregate(db, period, scope)
+    grain = board["grain"]
+    body = {
+        "has_data": bool(board["totals"]),
+        "period": period,
+        "grain": grain,
+        "grain_label": GRAIN_LABELS.get(grain, ""),
+        "period_label": board["period_label"],
+        "source": board["source"],
+        "months": board["months"],
+        "covered_months": board["covered_months"],
+        "missing_months": board["missing_months"],
+        "complete": board["complete"],
+        "scope": payload,
+    }
+    if not board["totals"]:
+        return {**body, "revenue_amount": 0, "cost_amount": 0, "net_profit_amount": 0, "net_profit_ratio": 0,
+                "department": "", "departments": []}
+    metric = board["totals"][0]
+    return {**body, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "net_profit_amount": float(metric.net_profit_amount), "net_profit_ratio": float(metric.net_profit_ratio), "department": metric.department or "", "departments": list(metric.departments)}

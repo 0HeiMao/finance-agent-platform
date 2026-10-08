@@ -39,6 +39,7 @@ ACTIONS: dict[str, str] = {
     "data.import": "导入财务数据",
     "data.export": "导出数据",
     "metrics.calculate": "重算指标",
+    "rollups.rebuild": "重算季/年落库",
     "batch.revert": "撤销导入批次",
     "knowledge.add": "写入知识库",
     "knowledge.delete": "删除知识库来源",

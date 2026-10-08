@@ -7,6 +7,8 @@
 ```text
 智能财务分析平台/
 ├── backend/              # FastAPI 应用：按域拆成 api_*.py（看板在 api_dashboard.py，不再内联在 main.py）
+│   ├── periods.py        # 月/季/年口径的纯函数（构成月份、规范写法、同粒度上一期）
+│   └── rollups.py        # 季度/年度合计的落库与读取（financial_rollups 表）
 ├── frontend/             # Vue 3 + Vite 界面；纯函数在 src/utils/，`npm test` 零依赖单测
 │   ├── Dockerfile        # 前端镜像：node 里构建 → nginx 托管静态包并反代 /api
 │   └── nginx.conf        # SPA 回退、/api 反代、SSE 关缓冲
@@ -82,7 +84,7 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下五个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下六个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -91,6 +93,7 @@
 | `verify_crawled_import.py` | 爬取文件全链路 122 项断言（见上），含看板新字段（环比 reason、KPI 标签集合、图表口径说明）与报告导出（标题/小节/金额格式/401） |
 | `verify_financial_agent.py` | Agent 证据层（财务数据 + 知识库 + 重排）、`/rag/*` 鉴权、上传去重、上传落盘目录、真实 SSE 端到端 28 项断言 |
 | `verify_alert_rule_tiers.py` | 预警规则分档 30 项：建期间档/部门+期间档、409 同范围、422 两维都空与非法指标/期间、400 删默认规则、真库重算里三条口径各得三种结果（期间档盖默认、部门+期间档盖期间档）、对照期间不受影响、删掉后回落默认，跑完复原期间并清掉临时规则 |
+| `verify_rollups.py` | 季度/年度落库 24 项：重算季/年落库、季度 `source=stored` 且等于三个月月指标之和、比率按合计重算、年度缺月如实点名、受限账号只读本部门落库行、管理端 403、三种 422、重算某月后季度幂等、没落库的期间现算兜底且不写库、审计留痕 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -98,7 +101,7 @@
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
-| `check_pages.py` | 16 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/` |
+| `check_pages.py` | 16 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/`。每页先轮询到真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，`--ready-timeout` 默认 20s）再判定：**空白页面天然没有横向溢出，固定 sleep 会把它变成假 PASS**——dev server 冷启动要现编译 chunk，第一次访问 `/admin` 就截到过 5.8KB 的全白图 |
 | `ui_scope_smoke.py` | 在真浏览器里点「查看口径」下拉与导出按钮：下拉选项、切口径后 KPI 与提示条变化、导出文件名/行数。**只有它能发现「控件在但点了没反应」** —— 写它时当场抓到 `ScopeSwitcher` 的 `onMounted` 竞态 |
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
@@ -246,7 +249,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **130** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/按路径耗时采样）、
+`tests/` 下三个文件共 **138** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -360,7 +363,7 @@ docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesk
 | `/reports/pptx` | PPT 报告（先看逐页大纲，再下载 `.pptx`） | `GET /reports/pptx/outline`、`GET /reports/pptx` |
 | `/settings` | System 设置（我的部门 + 运行态与配置体检） | `GET /system/status`、`PATCH /auth/me` |
 | `/agent` | 财务分析 Agent 工作台（示例问题 + 流式问答 + 依据） | `POST /ai/agent/chat/stream`（SSE） |
-| `/admin` | 管理概览（数据规模、完整性体检、最近批次、接口观测） | `GET /admin/overview` |
+| `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild` |
 | `/admin/users` | 用户管理（按用户名/部门/是否受限筛选、分页、改部门、删除） | `GET/PATCH/DELETE /admin/users[/{id}]` |
 | `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs` |
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
@@ -777,6 +780,46 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
 # 后端需先启动：.\.venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
 .\.venv\Scripts\python.exe scripts\import_via_api.py --username demo_analyst --password demo_password_2026
 ```
+
+## 季度/年度落库
+
+季/年合计不现算，而是落进独立表 `financial_rollups`（`backend/rollups.py`）。为什么不给
+`financial_metrics` 加一列「粒度」：那张表被十几个读点按「一行 = 一个月」使用（预测趋势线按
+`period` 排序读全部行、导出把 `period` 当月份、期间下拉来自 `distinct(period)`），混入季/年行以后
+「这一行是不是月行」就成了每个读点都要记得判断的隐式约定，漏一处就出假数（把 `2026` 当成第 13 个月
+画进趋势线）。单独一张表把语义固定下来，读的人不需要猜。
+
+- **期间口径**在 `backend/periods.py`（纯函数）：`grain_of / quarter_of / year_of / months_of /
+  containing_periods / previous_period / sort_key / period_label`。`previous_period` 只给**同粒度**的
+  上一期（服务环比），跨年回退到上一年的 12 月/Q4。
+- **写**：`rollup(db, grains=("quarter", "year"), periods=None)` 对每个目标期间**先删后建**，按
+  `department` 分组（全公司行 `NULL` 与各部门行各写各的，全公司行不把部门金额重复计入），
+  金额相加、比率用相加后的金额重算。`refresh_for_months(db, months)` 刷新这些月所在的季与年。
+- **自动刷新**：`POST /analysis/calculate?period=YYYY-MM` 重算某个月时顺手刷新它所在的季/年；
+  `DELETE /admin/batches/{id}` 撤销批次后同样刷新（否则看板上会挂着一个凭空的季度合计）。
+  这里有个**真实的坑**：`SessionLocal` 是 `autoflush=False`，新算出的 `FinancialMetric` 行在
+  `db.add()` 之后还只在内存里，落库那边读库会漏掉刚算的这一个月（季度只有 2 个月、金额少一截，
+  而且不报错）。所以 `calculate()` 在调 `refresh_for_months` 之前显式 `db.flush()`。
+- **读**：`GET /analysis/summary?period=` 月口径读 `financial_metrics`，季/年读落库行，
+  落库没覆盖时按同一算法现算兜底。响应新增 `grain / grain_label / period_label / source /
+  months / covered_months / missing_months / complete`，`source ∈ {month, stored, computed, empty}`
+  如实说明数字是哪来的——页面才不会把现算的数当成落库的数。
+- **缺月要说出来**：`complete=false` 且 `missing_months` 点名缺哪几个月，`months` 是**真的被求和的月份**。
+  演示数据只有 2026-04~10，所以 2026 年度缺 5 个月、`complete=false`；假装它是全年才是真正的错。
+- **季/年不产生预警**：预警按月算。同一件事按季、按年再报一次只会让预警列表变成噪音。
+- **看板不动**：`/dashboard` 仍然按明细算（KPI 对所选月份的明细求和、逐月收入曲线、部门 Top5）——
+  图表本来就需要逐月数据，改成读季/年行反而拿不到曲线。落库只喂 `summary` 与管理页。
+- **管理端**：`GET /admin/rollups?grain=quarter|year` 列出落库行 + 覆盖清单；`POST /admin/rollups/rebuild`
+  （body `{"grains": [...], "periods": [...]}`）用于老库回填与修数，写审计 `rollups.rebuild`。
+  `grains` 只能是 `quarter`/`year`，把月口径塞进 `periods` 会 **422** 而不是静默什么都不算。
+  `/admin/overview` 返回 `rollups` 覆盖块，「季度/年度落库」卡片把它渲染成计数 + 缺月清单 + 重算按钮。
+- **缺月清单必须说清是哪一行缺月**：同一个季度里全公司行齐全、某个部门只落了其中一个月是常事。
+  清单项带 `department` / `department_label`，全公司行排在同期的部门行前面，页面上显示
+  「2026 年度」或「2026 年度 · 部门 097」。这是真机冒烟抓到的：早先只按 `(粒度, 期间)` 去重，
+  页面上出现过「2026 年度缺 11 个月」，而全公司那一行其实只缺 5 个月。
+- 真机验证 `scripts/verify_rollups.py`（24 项）：重算后季度 `source=stored` 且金额等于三个月的月指标
+  之和、比率按合计重算、年度 `complete=false` 且点名 5 个月、受限账号只读到本部门落库行、读管理端 403、
+  三个 422、重算某个月后季度数字幂等不变、没落库的期间现算兜底且读路径不写库、审计留痕。
 
 ## 检索与 Agent 口径
 

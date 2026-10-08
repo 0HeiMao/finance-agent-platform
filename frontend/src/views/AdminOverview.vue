@@ -43,6 +43,26 @@ const slowPaths = computed(() => {
     .slice(0, SLOW_PATH_LIMIT)
 })
 
+// 季/年落库：正常路径由重算指标自动刷新，这里给「老库回填」和「怀疑数字不对时手工重算」兜底。
+const rebuilding = ref(false)
+const rebuildNotice = ref('')
+const coverage = computed(() => data.value?.rollups || { rows: 0, company_rows: 0, department_rows: 0, quarters: [], years: [], incomplete: [] })
+
+async function rebuildRollups() {
+  rebuilding.value = true
+  rebuildNotice.value = ''
+  try {
+    const response = await apiFetch('/admin/rollups/rebuild', { method: 'POST', body: JSON.stringify({}) })
+    const payload = await response.json()
+    rebuildNotice.value = `已重算 ${payload.rows} 行季/年合计`
+    await load()
+  } catch (e) {
+    rebuildNotice.value = `重算失败：${e.message}`
+  } finally {
+    rebuilding.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -112,6 +132,43 @@ onMounted(load)
               <small class="quality-hint" :class="{ bad: check.level !== 'ok' }">{{ check.hint }}</small>
             </li>
           </ul>
+        </section>
+
+        <section class="page-card">
+          <div class="card-head">
+            <h2>季度/年度落库</h2>
+            <span>季/年合计是算好存下来的，不是每次请求现算</span>
+          </div>
+          <div class="settings-grid">
+            <div>
+              <span>落库合计行</span>
+              <strong>{{ coverage.rows }} 行</strong>
+              <small>全公司 {{ coverage.company_rows }} 行 · 部门口径 {{ coverage.department_rows }} 行</small>
+            </div>
+            <div>
+              <span>已落季度 / 年度</span>
+              <strong>{{ coverage.quarters.length }} / {{ coverage.years.length }} 期</strong>
+              <small>{{ coverage.quarters.join('、') || '暂无' }}</small>
+            </div>
+          </div>
+          <h3 class="sub-head">缺月的期间（合计不是整期）</h3>
+          <p v-if="!coverage.incomplete.length" class="muted">所有季/年都凑齐了完整月份。</p>
+          <ul v-else class="dir-list">
+            <li v-for="row in coverage.incomplete" :key="`${row.grain}-${row.period}-${row.department}`">
+              <div class="dir-head">
+                <strong>{{ row.period_label }}<span v-if="row.department"> · {{ row.department_label }}</span></strong>
+                <span class="level high">缺 {{ row.missing_months.length }} 个月</span>
+              </div>
+              <small class="quality-hint bad">缺 {{ row.missing_months.join('、') }}；这些月份没有导入数据，合计只覆盖已有的月份</small>
+            </li>
+          </ul>
+          <div class="card-actions">
+            <button class="btn" :disabled="rebuilding" @click="rebuildRollups">
+              {{ rebuilding ? '重算中…' : '重算季/年落库' }}
+            </button>
+            <small v-if="rebuildNotice" class="quality-hint">{{ rebuildNotice }}</small>
+            <small v-else class="quality-hint">重算指标、导入、撤销批次都会自动刷新对应的季与年；这里用于老库回填。</small>
+          </div>
         </section>
 
         <section class="page-card">

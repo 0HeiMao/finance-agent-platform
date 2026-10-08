@@ -8,6 +8,10 @@
 → 用 Edge 无头模式 + CDP 逐页逐档设置视口、读 `scrollWidth/clientWidth` 并列出超宽元素、整页截图。
 临时登录页用完即删。
 
+每个页面都会先轮询等真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，见 `--ready-timeout`）：
+dev server 冷启动要现编译 chunk，早先用固定 sleep 会截到空白图，而**空白页面天然没有横向溢出**，
+于是「无横向溢出」变成假 PASS；现在等不到内容直接判失败。
+
 用法：
     .\\.venv\\Scripts\\python.exe scripts\\check_pages.py
     .\\.venv\\Scripts\\python.exe scripts\\check_pages.py --sizes 375x812 --pages /reports
@@ -54,6 +58,20 @@ OVERFLOW_JS = """
   return {scrollWidth: de.scrollWidth, clientWidth: de.clientWidth, offenders: offenders.slice(0, 12)};
 })()
 """ % (json.dumps(IGNORED_OFFENDER_CLASS), IGNORED_OFFENDER_CLASS)
+
+# 页面「渲染出来了没有」的探针：早先用固定 sleep(1.2s) 等图表与接口回填，结果 dev server
+# 冷启动（第一次请求某个路由要现编译 chunk）时会截到**整张空白图**——而空白页面天然没有
+# 横向溢出，于是「无横向溢出」是假 PASS。这里改成轮询真实内容，等不到就判失败。
+READY_JS = """
+(() => {
+  const app = document.getElementById('app');
+  return {
+    appChildren: app ? app.children.length : 0,
+    textLen: (document.body.innerText || '').trim().length,
+  };
+})()
+"""
+MIN_TEXT_LEN = 200
 
 
 def _console() -> None:
@@ -148,8 +166,24 @@ class CdpSession:
                 self._loaded = True
 
 
+async def _wait_ready(cdp: "CdpSession", session: str, timeout: float) -> tuple[bool, dict]:
+    """轮询到页面真的渲染出内容为止（空白页必须判失败，否则溢出检查是假 PASS）。"""
+    deadline = time.time() + timeout
+    info: dict = {}
+    while True:
+        evaluated = await cdp.send("Runtime.evaluate",
+                                   {"expression": READY_JS, "returnByValue": True},
+                                   session_id=session)
+        info = evaluated["result"].get("value") or {}
+        if (info.get("appChildren") or 0) > 0 and (info.get("textLen") or 0) >= MIN_TEXT_LEN:
+            return True, info
+        if time.time() >= deadline:
+            return False, info
+        await asyncio.sleep(0.4)
+
+
 async def _drive(ws_url: str, args, pages, sizes, out_dir: Path, base_url: str,
-                 viewport_only: bool = False, token: str = "") -> int:
+                 viewport_only: bool = False, token: str = "", ready_timeout: float = 20.0) -> int:
     import websockets
 
     failures = 0
@@ -181,7 +215,13 @@ async def _drive(ws_url: str, args, pages, sizes, out_dir: Path, base_url: str,
                                 "deviceScaleFactor": 1, "mobile": int(width) < 768},
                                session_id=session)
                 await cdp.navigate(f"{base_url}{route}", session)
-                await asyncio.sleep(1.2)  # 等图表与接口回填
+                ready, info = await _wait_ready(cdp, session, ready_timeout)
+                if not ready:
+                    failures += 1
+                    print(f"{route} @{size}: 页面没有渲染出内容（innerText {info.get('textLen')} 字、"
+                          f"#app 子节点 {info.get('appChildren')} 个，等了 {ready_timeout:.0f}s）"
+                          f"——空白页的「无横向溢出」不算通过")
+                await asyncio.sleep(0.6)  # 内容出来后再等图表与接口回填
 
                 evaluated = await cdp.send("Runtime.evaluate",
                                            {"expression": OVERFLOW_JS, "returnByValue": True},
@@ -223,6 +263,8 @@ def main() -> int:
                         help="只截视口（长页面整页截图会超过 8192px，图片工具打不开）")
     parser.add_argument("--inject-token", action="store_true",
                         help="不开临时登录页，直接用 CDP 往同源 localStorage 写 token（容器里验构建产物时用）")
+    parser.add_argument("--ready-timeout", type=float, default=20.0,
+                        help="每个页面最多等多久出现内容；等不到就判失败（dev server 冷启动编译 chunk 会慢）")
     args = parser.parse_args()
 
     browser = args.browser or _browser()
@@ -249,7 +291,8 @@ def main() -> int:
     try:
         ws_url = _debugger_url(args.port)
         return asyncio.run(_drive(ws_url, args, args.pages, args.sizes, out_dir, args.base_url,
-                                  args.viewport_only, token if args.inject_token else ""))
+                                  args.viewport_only, token if args.inject_token else "",
+                                  args.ready_timeout))
     finally:
         process.terminate()
         try:

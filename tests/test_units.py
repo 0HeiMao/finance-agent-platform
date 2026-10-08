@@ -289,3 +289,100 @@ def test_observability_reports_duration_per_path():
     # 状态码也分桶：500 那次不该混进 200 的计数
     assert snapshot()["requests"]["200:/api/v1/unit-slow"] == 3
     assert snapshot()["requests"]["500:/api/v1/unit-slow"] == 1
+
+
+# ---------------------------------------------------------------- 期间口径与落库
+
+
+def test_period_grain_conversions_and_labels():
+    """月/季/年的规范写法与换算：落库、接口、报告都靠这几个纯函数，错一处就全线错。"""
+    from backend import periods
+
+    assert periods.grain_of("2026-10") == "month"
+    assert periods.grain_of("2026-Q3") == "quarter"
+    assert periods.grain_of("2026") == "year"
+    # 认不出来的必须返回 None，让调用方 422，而不是猜一个口径
+    assert periods.grain_of("2026-13") is None
+    assert periods.grain_of("2026-Q5") is None
+    assert periods.grain_of("2026-1") is None
+    assert periods.grain_of("") is None
+
+    assert periods.quarter_of("2026-01") == "2026-Q1"
+    assert periods.quarter_of("2026-03") == "2026-Q1"
+    assert periods.quarter_of("2026-10") == "2026-Q4"
+    assert periods.year_of("2026-10") == "2026"
+    assert periods.containing_periods("2026-10") == ("2026-Q4", "2026")
+
+    assert periods.months_of("2026-10") == ("2026-10",)
+    assert periods.months_of("2026-Q3") == ("2026-07", "2026-08", "2026-09")
+    assert periods.months_of("2026") == tuple(f"2026-{month:02d}" for month in range(1, 13))
+    assert periods.months_of("随便写的") == ()
+    assert periods.months_count("2026-Q3") == 3 and periods.months_count("2026") == 12
+
+    assert periods.period_label("2026-10") == "2026 年 10 月"
+    assert periods.period_label("2026-Q3") == "2026 年第 3 季度"
+    assert periods.period_label("2026") == "2026 年度"
+    assert periods.granularity_label("2026-Q3") == "季"
+
+
+def test_previous_period_is_same_grain_and_crosses_year():
+    """环比要的是同粒度上一期：季度比上季度，跨年要回退到上一年的 12 月 / Q4。
+
+    拿季度跟去年同季比是**同比**，不是这里要的东西，所以不能把 `previous_period` 写成减一年。
+    """
+    from backend import periods
+
+    assert periods.previous_period("2026-10") == "2026-09"
+    assert periods.previous_period("2026-01") == "2025-12"
+    assert periods.previous_period("2026-Q3") == "2026-Q2"
+    assert periods.previous_period("2026-Q1") == "2025-Q4"
+    assert periods.previous_period("2026") == "2025"
+    assert periods.previous_period("0001") is None
+    assert periods.previous_period("啥也不是") is None
+
+
+def test_sort_key_keeps_same_grain_in_time_order():
+    """同一粒度内必须按时间排：报告的分期与落库的「上一期」都依赖它。"""
+    from backend import periods
+
+    months = ["2026-10", "2026-07", "2026-01"]
+    assert sorted(months, key=periods.sort_key) == ["2026-01", "2026-07", "2026-10"]
+    quarters = ["2026-Q4", "2025-Q1", "2026-Q1"]
+    assert sorted(quarters, key=periods.sort_key) == ["2025-Q1", "2026-Q1", "2026-Q4"]
+    # 认不出来的期间被排到最早的位置（年份 0），不会混进正常序列中间
+    assert periods.sort_key("坏数据")[0] == 0
+    assert periods.sort_key("坏数据") < periods.sort_key("2026-01")
+
+
+def test_combine_sums_amounts_and_recomputes_ratios():
+    """季度/年度合计：金额相加、比率用相加后的金额重算。
+
+    比率不能相加也不能平均——部门口径下收入极小、费用很大时比率能冲到 10^6，
+    平均一下就是编数字。
+    """
+    from backend.rollups import _combine, department_single
+    from backend.scope import MetricTotals
+
+    def totals(period, revenue, expense, department=None):
+        return MetricTotals(
+            period=period, departments=(department,) if department else (),
+            department=department, revenue_amount=Decimal(revenue),
+            cost_amount=Decimal("0"), expense_amount=Decimal(expense),
+            gross_profit_amount=Decimal(revenue),
+            net_profit_amount=Decimal(revenue) - Decimal(expense),
+            gross_profit_ratio=Decimal("100.00"), net_profit_ratio=Decimal("100.00"))
+
+    monthly = [totals("2026-07", "1000.00", "200.00"), totals("2026-08", "1000.00", "800.00")]
+    combined = _combine(monthly, "2026-Q3")[0]
+    assert combined.period == "2026-Q3"
+    assert combined.revenue_amount == Decimal("2000.00")
+    assert combined.expense_amount == Decimal("1000.00")
+    assert combined.net_profit_amount == Decimal("1000.00")
+    # 比率按 1000 / 2000 重算，不是 100 和 100 相加或平均
+    assert combined.net_profit_ratio == Decimal("0.5000")
+    assert combined.departments == ()
+
+    # 参与合计的只有一个部门时口径仍是那个部门；混了多个部门就变成「不属于任何一个部门」
+    assert department_single([totals("2026-07", "1", "1", "018")]) is True
+    assert department_single([totals("2026-07", "1", "1", "018"), totals("2026-08", "1", "1", "018")]) is True
+    assert department_single([totals("2026-07", "1", "1", "018"), totals("2026-08", "1", "1", "097")]) is False

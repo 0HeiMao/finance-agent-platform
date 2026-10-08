@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit
+from backend import audit, rollups
 from backend.api_analysis import calculate
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
 
@@ -65,6 +65,9 @@ def revert_batch(
         else:
             db.execute(delete(FinancialMetric).where(FinancialMetric.period == period))
             db.execute(delete(FinancialAlert).where(FinancialAlert.period == period))
+            # 这一期已经没有任何明细/指标了，季/年落库行也必须跟着消失：
+            # 否则看板上那个季度还挂着一个凭空的合计（数字来自已经被撤销的数据）。
+            rollups.refresh_for_months(db, [period])
             cleared.append(period)
 
     audit.record(db, actor, "batch.revert", target_type="batch", target_id=batch,

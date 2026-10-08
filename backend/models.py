@@ -56,6 +56,42 @@ class FinancialMetric(Base):
     net_profit_ratio: Mapped[Decimal] = mapped_column(Numeric(20, 4), default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class FinancialRollup(Base):
+    """季度 / 年度的落库合计行：把若干个月的月口径指标加总后**存起来**。
+
+    为什么单开一张表，而不是给 `financial_metrics` 加一个 `grain` 列：
+    那张表的每一行都被预警重算、环比、预测趋势、报告、导出、完整性体检等十几处按「月口径」读，
+    塞进季/年行以后「这一行到底是不是月行」就变成每个读点都得记得判断的隐式约定——
+    漏一处就出假数（预测会把 "2026" 当成第 13 个月画进趋势线，导出会把季度合计当成一个月）。
+    单开一张表 + 明写 `months`/`complete`，既有月口径读点一行不用改，落的是什么也一眼可查。
+
+    `months` 记的是**真的被加进去的月份**（按这个口径有指标行的月份），`complete` 表示这几期
+    是否凑齐了整个季度/年度：演示数据是 2026-04~10，2026 年度只有 7 个月，缺 5 个月就要说出来，
+    否则「年度合计」看起来像全年的。
+    """
+
+    __tablename__ = "financial_rollups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # month 不会出现在这张表里（月口径在 financial_metrics），只接受 quarter | year
+    grain: Mapped[str] = mapped_column(String(7), index=True)
+    # "2026-Q3" / "2026"，与 periods.py 的规范写法一致
+    period: Mapped[str] = mapped_column(String(20), index=True)
+    # 与指标表同一套口径语义：NULL = 全公司汇总行，有值 = 该部门口径行
+    department: Mapped[str | None] = mapped_column(String(100), index=True)
+    revenue_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    cost_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    expense_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    gross_profit_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    net_profit_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    # 比率列与指标表同样用 Numeric(20, 4)：部门口径下收入极小、费用很大时比率能冲到 10^6 以上
+    gross_profit_ratio: Mapped[Decimal] = mapped_column(Numeric(20, 4), default=0)
+    net_profit_ratio: Mapped[Decimal] = mapped_column(Numeric(20, 4), default=0)
+    # 真的被求和的月份列表，如 ["2026-07","2026-08","2026-09"]
+    months: Mapped[list | None] = mapped_column(JSONB)
+    month_count: Mapped[int] = mapped_column(default=0)
+    complete: Mapped[bool] = mapped_column(default=False, index=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 class FinancialAlert(Base):
     __tablename__ = "financial_alerts"
     id: Mapped[int] = mapped_column(primary_key=True)

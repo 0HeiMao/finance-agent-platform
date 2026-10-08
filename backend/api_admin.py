@@ -25,14 +25,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit, batch_ops, jobs
+from backend import audit, batch_ops, jobs, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.api_analysis import calculate
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
-from backend.models import AlertRule, BackgroundJob, FinancialAlert, FinancialMetric, FinancialTransaction, User
+from backend.models import (AlertRule, BackgroundJob, FinancialAlert, FinancialMetric, FinancialRollup,
+                            FinancialTransaction, User)
 from backend.observability import snapshot
+from backend.periods import GRAIN_LABELS, grain_of
 from backend.rag.pgvector_store import DocumentChunk
 from backend.scope import departments_of
 
@@ -220,9 +222,63 @@ def overview(db: Session = Depends(get_db), me: User = Depends(admin_user)):
         "periods": {"latest": periods[0] if periods else None, "all": periods},
         "recent_batches": batches,
         "quality": _quality_checks(db),
+        # 季/年落库的覆盖面：管理页要能一眼看出「落了几期、哪几期缺月」，
+        # 否则「年度合计」只有一个数字，看不出它是不是全年。
+        "rollups": rollups.coverage(db),
         "observability": snapshot(),
         "me": {"id": me.id, "username": me.username, "department": me.department or ""},
     }
+
+
+class RollupRebuildInput(BaseModel):
+    """重算季/年落库的入参。两个字段都留空 = 按库里现有的月指标覆盖所有季与年。"""
+    grains: list[str] | None = Field(default=None, max_length=2, description="quarter / year，默认两者都算")
+    periods: list[str] | None = Field(default=None, max_length=200, description="只重算这几期，如 2026-Q3、2026")
+
+
+@router.get("/rollups")
+def list_rollups(grain: str | None = Query(None, pattern=r"^(quarter|year)$"),
+                 db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """季度/年度落库明细 + 覆盖面（哪些期落了、哪几期缺月）。
+
+    管理页拿它说明「年度合计是不是全年」：演示数据 2026-04~10，2026 年度缺 5 个月，
+    `complete=false` 且 `missing_months` 点名，而不是把 7 个月假装成 12 个月。
+    """
+    statement = select(FinancialRollup).order_by(FinancialRollup.period, FinancialRollup.id)
+    if grain:
+        statement = statement.where(FinancialRollup.grain == grain)
+    rows = db.scalars(statement).all()
+    return {
+        "data": [rollups.serialize(row) for row in rows],
+        "coverage": rollups.coverage(db),
+        "grains": [{"value": item, "label": GRAIN_LABELS[item]} for item in rollups.DEFAULT_GRAINS],
+    }
+
+
+@router.post("/rollups/rebuild")
+def rebuild_rollups(payload: RollupRebuildInput, request: Request,
+                    db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """重算季/年落库。
+
+    两个用处：导入或重算某个月之后补齐它所在的季/年（正常路径由 `calculate()` 自动刷新，
+    这里给「老库回填」和「落库数字被怀疑不对时的手工重算」兜底）。
+    """
+    grains = tuple(item for item in (payload.grains or list(rollups.DEFAULT_GRAINS))
+                   if item in rollups.DEFAULT_GRAINS)
+    if not grains:
+        raise HTTPException(422, "grains 只能是 quarter、year")
+    periods = list(payload.periods or []) or None
+    if periods:
+        bad = [item for item in periods if grain_of(item) not in grains]
+        if bad:
+            raise HTTPException(422, f"这些期间不是季/年口径，或与 grains 对不上：{'、'.join(bad)}")
+    written = rollups.rollup(db, grains=grains, periods=periods)
+    audit.record(db, me, "rollups.rebuild", target_type="rollups", target_id=",".join(periods or ()),
+                 detail={"grains": list(grains), "rows": len(written),
+                         "periods": periods or "全部季/年"}, request=request)
+    db.commit()
+    return {"rows": len(written), "grains": list(grains),
+            "data": written, "coverage": rollups.coverage(db)}
 
 
 @router.get("/users")

@@ -112,6 +112,26 @@ Retry-After: 42
 
 受限账号拿别人的预警 id 调 `/analysis/alerts/{id}/transactions` 会得到 HTTP 200 + `{"data":[],"message":"该预警不在当前账号的数据范围内"}`（不泄漏"这条预警存在"以外的信息）。
 
+### 季度/年度落库（`financial_rollups`）
+
+季/年合计不现算，落在独立表里；`/analysis/summary` 接受 `YYYY-MM`、`YYYY-QN`、`YYYY` 三种写法：
+
+- **`source` 如实说明数字哪来的**：`month`（月口径读 `financial_metrics`）/ `stored`（读落库行）/
+  `computed`（这一期还没落库，按同一算法现算兜底）/ `empty`（该期没有任何数据）。
+  **读路径不会顺手写库**：现算的季/年不会留下落库行（真机冒烟断言过 `coverage.rows` 前后不变）。
+- **`complete` / `missing_months` / `months`**：`months` 是**真的被求和的月份**，`covered_months` 是
+  这个粒度应有的月份（季 3 / 年 12），`complete = 有月份 and 没有缺月`。演示数据只有 2026-04~10，
+  所以 `period=2026` 返回 `complete=false`、`missing_months=['2026-01','2026-02','2026-03','2026-11','2026-12']`。
+- **比率按相加后的金额重算**（不做比率平均），金额口径与看板一致（字符串→此处为 float，单位元）。
+- **季/年不产生预警**：预警始终按月算，季/年只是合计。
+- `GET /admin/rollups` 的 `coverage` 块：`{rows, company_rows, department_rows, quarters, years,
+  incomplete:[{grain, period, period_label, department, department_label, missing_months}], grains, grain_labels}`。
+  缺月清单带 `department`/`department_label` 且**全公司行排在同期的部门行前面**——同一个季度里全公司行
+  齐全、某个部门只落了其中一个月是常事，早先只按 `(粒度, 期间)` 去重时页面上会出现「2026 年度缺 11 个月」。
+- 自动刷新点：`POST /analysis/calculate?period=YYYY-MM`（重算某月→刷新它所在的季与年；
+  注意 `SessionLocal` 是 `autoflush=False`，实现里先 `db.flush()` 再刷新，否则会漏掉刚算的这一个月）、
+  `DELETE /admin/batches/{batch}`（撤销后刷新或清掉空掉的季/年）。`POST /admin/rollups/rebuild` 用于回填与修数。
+
 ## 财务数据
 
 | 方法 | 路径 | 说明 |
@@ -130,8 +150,8 @@ Retry-After: 42
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/analysis/calculate?period=YYYY-MM` | 重算某期指标与预警（写全公司 + 各部门两套行） |
-| GET | `/analysis/summary?period=YYYY-MM` | `{has_data,revenue_amount,cost_amount,net_profit_amount,net_profit_ratio,scope}` |
+| POST | `/analysis/calculate?period=YYYY-MM` | 重算某期指标与预警（写全公司 + 各部门两套行）；顺手刷新该月所在的季/年落库 |
+| GET | `/analysis/summary?period=YYYY-MM\|YYYY-QN\|YYYY` | 合计 + 口径说明：`{has_data,revenue_amount,cost_amount,net_profit_amount,net_profit_ratio,scope,period,grain,grain_label,period_label,source,months,covered_months,missing_months,complete}` |
 | GET | `/analysis/alerts?period=YYYY-MM` | 该期预警列表；每项含 `{id,period,department,type,description,level,metric}` + 处理状态字段（见下） |
 | GET | `/analysis/alerts/all?limit=N&offset=M&status=&period=&department=` | 全部期间的预警 + `periods` + `scope` + `{total,offset,limit}`（`total` 是**筛选后**的总数，不是本页条数）；`status` 在服务端过滤，取值同下，非法值 422「状态只能是 …」 |
 | GET | `/analysis/alerts/stats?period=YYYY-MM` | 按处理状态计数：`{counts:{pending,confirmed,false_positive,resolved,total}, labels, statuses, scope}`；`period` 省略则统计全部期间 |
@@ -371,7 +391,9 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/admin/overview` | 管理概览：计数、完整性体检、最近批次、接口观测 |
+| GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测 |
+| GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
+| POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
 | GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
 | PATCH | `/admin/users/{id}` | `{"department":"财务部"}`；空字符串＝清空（升级为管理员） |
 | DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据） |

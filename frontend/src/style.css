@@ -81,6 +81,9 @@ code{font:12px/1.5 Consolas,monospace;background:#eef3f9;border-radius:4px;paddi
 .path-text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;font-weight:500;overflow-wrap:anywhere;word-break:break-all}
 .row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .row-actions .btn{padding:5px 10px;font-size:12px}
+/* 卡片底部的动作行（如管理概览的「重算季/年落库」）：按钮 + 一句结果说明 */
+.card-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.card-actions small{color:var(--muted)}
 .btn.danger{color:#c53030;border-color:#ffccc7;background:#fff1f0}
 .btn.danger:hover:not(:disabled){color:#a8071a;border-color:#ffa39e;background:#ffe7e5}
 .admin-inline-input{width:100%;max-width:260px}

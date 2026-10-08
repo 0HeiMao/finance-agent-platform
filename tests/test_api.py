@@ -2507,3 +2507,200 @@ async def test_quota_registry_reports_config_and_rejects_unknown_name():
     finally:
         ratelimit.reset_limiters()
     assert ratelimit.get_limiter("export").limit == get_settings().export_max_per_minute
+
+
+# ---------------------------------------------------- 季度/年度落库（financial_rollups）
+
+ROLLUP_QUARTER = "2098-Q2"
+ROLLUP_MONTHS = ("2098-04", "2098-05", "2098-06")
+
+
+def _seed_company_rows(db, period: str, rows) -> None:
+    """按明细播种、部门留空（全公司口径）。
+
+    不能用手写指标的方式播种：`calculate()` 是「先删后建」，它按明细重算，
+    手写进去的指标行会被删掉，落库合计就变成 0 了（第一版用例就栽在这里）。
+    """
+    from backend.models import FinancialTransaction
+
+    for index, (revenue, cost, expense) in enumerate(rows):
+        db.add(FinancialTransaction(
+            transaction_date=f"{period}-{index + 1:02d}",
+            account_name="测试科目", account_code="6001", department=None,
+            description="rollup 种子", revenue_amount=Decimal(revenue),
+            cost_amount=Decimal(cost), expense_amount=Decimal(expense),
+            cash_in_amount=Decimal("0"), cash_out_amount=Decimal("0"),
+            import_batch="pytest-seed",
+        ))
+    db.flush()
+
+
+def _rollup_rows(db, period: str):
+    from backend.models import FinancialRollup
+
+    return list(db.scalars(
+        select(FinancialRollup).where(FinancialRollup.period == period)
+        .order_by(FinancialRollup.id)).all())
+
+
+def _drop_rollups(db) -> None:
+    """清掉本用例涉及的落库行。
+
+    2098/2099 两个年份不属于别的用例（演示数据是 2026），但落库行是派生数据、
+    会跨用例累积，所以每个用例自己清一遍。
+    """
+    from sqlalchemy import delete
+
+    from backend.models import FinancialRollup
+
+    for prefix in ("2098", "2099"):
+        db.execute(delete(FinancialRollup).where(FinancialRollup.period.like(f"{prefix}%")))
+    db.commit()
+
+
+async def test_calculate_refreshes_quarter_rollup_and_year_reports_missing_months(anon_client, auth_headers, db_session):
+    """重算某个月必须顺手刷新它所在的季与年，年度合计要如实点名缺了哪几个月。"""
+    _drop_rollups(db_session)
+    for month in ROLLUP_MONTHS:
+        _seed_company_rows(db_session, month, [("1000.00", "0.00", "200.00")])
+
+    for month in ROLLUP_MONTHS:
+        response = await anon_client.post(f"/api/v1/analysis/calculate?period={month}", headers=auth_headers)
+        assert response.status_code == 200, response.text
+
+    # 落库行是 calculate 自己刷出来的（不需要手工点重算）
+    rows = _rollup_rows(db_session, ROLLUP_QUARTER)
+    assert [row.period for row in rows] == [ROLLUP_QUARTER]
+    assert rows[0].grain == "quarter"
+    assert rows[0].department is None              # 全公司行
+    assert rows[0].months == list(ROLLUP_MONTHS)
+    assert Decimal(rows[0].revenue_amount) == Decimal("3000.00")
+    assert rows[0].complete is True                # 二季度的三个月都在
+
+    # 年度行也一起刷了：2098 只有这三个月，必须标成不完整并点名缺月
+    years = _rollup_rows(db_session, "2098")
+    assert [row.grain for row in years] == ["year"]
+    assert years[0].complete is False
+    assert years[0].month_count == 3
+
+
+async def test_quarter_summary_reads_stored_rollup_and_year_is_incomplete(anon_client, auth_headers, db_session):
+    """`/analysis/summary` 对季/年读落库行，并把「这一期是不是凑齐」说清楚。"""
+    _drop_rollups(db_session)
+    for month in ROLLUP_MONTHS:
+        _seed_company_rows(db_session, month, [("1000.00", "0.00", "200.00")])
+        await anon_client.post(f"/api/v1/analysis/calculate?period={month}", headers=auth_headers)
+
+    quarter = await anon_client.get(f"/api/v1/analysis/summary?period={ROLLUP_QUARTER}", headers=auth_headers)
+    assert quarter.status_code == 200, quarter.text
+    body = quarter.json()
+    assert body["source"] == "stored", body
+    assert body["grain"] == "quarter"
+    assert body["grain_label"] == "季"
+    assert body["period_label"] == "2098 年第 2 季度"
+    assert Decimal(str(body["revenue_amount"])) == Decimal("3000.00")
+    assert Decimal(str(body["net_profit_amount"])) == Decimal("2400.00")   # 3 × (1000 - 200)
+    assert body["months"] == list(ROLLUP_MONTHS)
+    assert body["complete"] is True                 # 二季度的三个月都在
+    assert body["missing_months"] == []
+
+    year = await anon_client.get("/api/v1/analysis/summary?period=2098", headers=auth_headers)
+    assert year.status_code == 200, year.text
+    payload = year.json()
+    assert payload["source"] == "stored"
+    assert payload["grain"] == "year"
+    assert payload["complete"] is False
+    assert payload["months"] == list(ROLLUP_MONTHS)
+    assert payload["covered_months"] == [f"2098-{month:02d}" for month in range(1, 13)]
+    assert set(payload["missing_months"]) == {f"2098-{month:02d}" for month in (1, 2, 3, 7, 8, 9, 10, 11, 12)}
+
+    # 月口径不受落库影响，仍读指标表
+    month = await anon_client.get("/api/v1/analysis/summary?period=2098-05", headers=auth_headers)
+    month_body = month.json()
+    assert month_body["source"] == "month", month_body
+    assert Decimal(str(month_body["revenue_amount"])) == Decimal("1000.00")
+    assert month_body["missing_months"] == []
+
+
+async def test_rollup_without_monthly_metrics_is_computed_not_invented(anon_client, auth_headers, db_session):
+    """落库还没覆盖这一期时按同一算法现算并标 computed，绝不凭空造一个合计。"""
+    _drop_rollups(db_session)
+    # 只写月指标、不调 calculate：模拟「老库刚升级，季/年还没落库」
+    _seed_metric(db_session, "2099-03", revenue="500.00", expense="0.00")
+
+    response = await anon_client.get("/api/v1/analysis/summary?period=2099-Q1", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source"] == "computed", body
+    assert Decimal(str(body["revenue_amount"])) == Decimal("500.00")
+    assert body["months"] == ["2099-03"]
+    assert body["missing_months"] == ["2099-01", "2099-02"]
+    assert body["complete"] is False
+    assert _rollup_rows(db_session, "2099-Q1") == []      # 读路径不写库
+
+    empty = await anon_client.get("/api/v1/analysis/summary?period=2099-Q4", headers=auth_headers)
+    assert empty.json()["source"] == "empty"
+    assert empty.json()["has_data"] is False
+
+
+async def test_admin_rollup_rebuild_is_audited_and_admin_only(anon_client, api_app, auth_headers, db_session):
+    """管理端重算落库：回填/修数用，写审计；受限账号 403。"""
+    from sqlalchemy import delete
+
+    from backend.models import FinancialMetric, FinancialRollup
+
+    _drop_rollups(db_session)
+    for month in ROLLUP_MONTHS:
+        _seed_metric(db_session, month, revenue="1000.00", expense="200.00")
+
+    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    try:
+        forbidden = await scoped.post("/api/v1/admin/rollups/rebuild", headers=headers, json={})
+        assert forbidden.status_code == 403
+    finally:
+        await scoped.aclose()
+
+    listing = await anon_client.get("/api/v1/admin/rollups", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    assert [item["value"] for item in listing.json()["grains"]] == ["quarter", "year"]
+
+    rebuilt = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                     json={"periods": [ROLLUP_QUARTER]})
+    assert rebuilt.status_code == 200, rebuilt.text
+    payload = rebuilt.json()
+    assert payload["rows"] == 1
+    assert payload["data"][0]["period"] == ROLLUP_QUARTER
+    assert payload["data"][0]["revenue_amount"] == 3000.0
+    assert payload["data"][0]["complete"] is True
+    assert payload["data"][0]["note"] == "已覆盖全部 3 个月"
+    assert ROLLUP_QUARTER in payload["coverage"]["quarters"]
+
+    # 缺月清单要说清「是哪一行缺月」：全公司行与部门行都可能缺月，页面上不能只给期间标签
+    incomplete = payload["coverage"]["incomplete"]
+    assert incomplete, payload["coverage"]
+    assert all({"department", "department_label"} <= set(item) for item in incomplete)
+    for key in {(item["grain"], item["period"]) for item in incomplete}:
+        group = [item["department"] for item in incomplete if (item["grain"], item["period"]) == key]
+        assert group == sorted(group, key=lambda name: name != ""), group
+
+    # 期间与 grains 对不上、grains 本身不合法都要 422，而不是静默什么都不算
+    bad = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                 json={"periods": ["2098-04"]})
+    assert bad.status_code == 422, bad.text
+    assert (await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                   json={"grains": ["month"]})).status_code == 422
+
+    # 撤销/缺数以后重算要把落库行删掉，不能留一个凭空的季度合计
+    db_session.execute(delete(FinancialMetric).where(FinancialMetric.period.in_(ROLLUP_MONTHS)))
+    db_session.commit()
+    again = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                   json={"periods": [ROLLUP_QUARTER]})
+    assert again.json()["rows"] == 0
+    assert db_session.scalars(select(FinancialRollup).where(
+        FinancialRollup.period == ROLLUP_QUARTER)).all() == []
+
+    rows = await _audit(anon_client, auth_headers, action="rollups.rebuild", limit=10)
+    entry = _find(rows["data"], "rollups.rebuild")
+    assert entry is not None, rows
+    assert ROLLUP_QUARTER in entry["detail"]["periods"]
+    assert entry["detail"]["grains"] == ["quarter", "year"]
