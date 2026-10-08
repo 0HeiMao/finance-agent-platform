@@ -1102,3 +1102,126 @@ def test_backup_serial_columns_drops_unsafe_identifiers():
     assert backup.serial_columns(rows) == [("users", "id")]
 
 
+# ------------------------------------------------- ⑫ 安全响应头 / GZip / X-Request-ID
+
+
+def test_http_headers_request_id_keeps_sane_ids_and_regenerates_the_rest():
+    """请求 id 只收 1–128 位的 `[A-Za-z0-9._-]`：换行会把日志切成两行，超长会把字段撑爆。"""
+    from backend import http_headers as headers
+
+    mine = "trace-abc.123_XYZ"
+    assert headers.request_id_from(mine) == mine
+    assert headers.request_id_from("a" * headers.REQUEST_ID_MAX_LENGTH) == "a" * 128
+
+    for bad in (None, "", "a" * 129, "带空格的 id", "id;with;semicolon", "id/with/slash", "id\ninjected"):
+        generated = headers.request_id_from(bad)
+        assert generated != bad
+        assert headers.REQUEST_ID_PATTERN.match(generated), bad
+        assert len(generated) == 32, bad  # uuid4().hex
+
+
+def test_http_headers_csp_switches_by_path_and_hsts_by_scheme():
+    """API 给最严的一版 CSP，文档页只留 `frame-ancestors`；HSTS 只在 https 下发。"""
+    from backend import http_headers as headers
+
+    api = headers.security_headers("/api/v1/health", https=False)
+    assert api["Content-Security-Policy"] == headers.API_CONTENT_SECURITY_POLICY
+    assert "default-src 'none'" in api["Content-Security-Policy"]
+    assert "Strict-Transport-Security" not in api
+    for name, value in headers.STATIC_SECURITY_HEADERS:
+        assert api[name] == value
+
+    docs = headers.security_headers("/docs", https=True)
+    assert docs["Content-Security-Policy"] == headers.DOCS_CONTENT_SECURITY_POLICY
+    assert "default-src 'none'" not in docs["Content-Security-Policy"]
+    assert docs["Strict-Transport-Security"] == headers.HSTS_VALUE
+
+    # 两套口径的差别只该在 CSP 与 HSTS 上，静态头必须一模一样
+    assert set(api) - {"Content-Security-Policy"} == set(docs) - {
+        "Content-Security-Policy", "Strict-Transport-Security"}
+
+
+def test_http_headers_request_is_https_reads_first_forwarded_proto():
+    """反代后面 `request.url.scheme` 是 http，只有 `X-Forwarded-Proto` 说得清。"""
+    from backend import http_headers as headers
+
+    assert headers.request_is_https("https", None) is True
+    assert headers.request_is_https("http", None) is False  # 本机 http 下发 HSTS 会锁死浏览器
+    assert headers.request_is_https("http", "https") is True
+    assert headers.request_is_https("http", "HTTPS") is True
+    assert headers.request_is_https("http", " https ") is True
+    assert headers.request_is_https("http", "https, http") is True  # 多段链路取第一段
+    assert headers.request_is_https("http", "http") is False
+    assert headers.request_is_https("http", "") is False
+
+
+def test_http_headers_is_docs_path_covers_documentation_routes():
+    from backend import http_headers as headers
+
+    for path in ("/docs", "/docs/", "/docs/oauth2-redirect", "/redoc", "/redoc/", "/openapi.json"):
+        assert headers.is_docs_path(path) is True, path
+    for path in ("/", "/api/v1/health", "/api/v1/docs", "/documentation", "/openapi.json.bak"):
+        assert headers.is_docs_path(path) is False, path
+
+
+def test_http_headers_gzip_excludes_streams_and_compressed_downloads():
+    """SSE 压了就攒块、Office/PDF 压了白烧 CPU、图片压了更大 —— 都不该进压缩分支。"""
+    from backend import http_headers as headers
+
+    excluded = headers.GZIP_EXCLUDED_CONTENT_TYPES
+    assert "text/event-stream" in excluded
+    assert "image/png" in excluded  # Starlette 默认表里带的
+    for media_type in headers.ALREADY_COMPRESSED_TYPES:
+        assert media_type in excluded
+    assert "application/json" not in excluded
+    assert "text/html" not in excluded
+    assert "text/csv" not in excluded  # 报表导出就是 CSV，压它最划算
+
+    # 太小的响应压了只多一堆字节；级别 9 在小响应上纯属浪费 CPU
+    assert headers.GZIP_MINIMUM_SIZE >= 1024
+    assert 1 <= headers.GZIP_COMPRESS_LEVEL <= 9
+
+
+def test_http_headers_apply_does_not_clobber_existing_values():
+    """中间件与 500 处理器共用同一口径：已有的头不覆盖，但请求 id 一律换成我们认定的那个。"""
+    from backend import http_headers as headers
+
+    response = SimpleNamespace(headers={"X-Frame-Options": "SAMEORIGIN", headers.REQUEST_ID_HEADER: "伪造的"})
+    headers.apply_security_headers(response, "/api/v1/health", https=False, request_id="trace-1")
+
+    assert response.headers["X-Frame-Options"] == "SAMEORIGIN"  # setdefault：下层的决定优先
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["Content-Security-Policy"] == headers.API_CONTENT_SECURITY_POLICY
+    assert response.headers[headers.REQUEST_ID_HEADER] == "trace-1"
+    assert "Strict-Transport-Security" not in response.headers
+
+
+def test_security_headers_log_reader_survives_utf16_logs(tmp_path):
+    """真机踩过的坑：`| Tee-Object` 在 Windows PowerShell 5.1 上写出 UTF-16 日志。
+
+    只按 utf-8 读会得到「每个字符后面跟一个 \\x00」的乱码，于是 `request_id=` 一个都匹配不上，
+    却看着像「后端根本没写日志」。所以 `decode_log()` 先认 BOM、再按 NUL 密度判断，
+    `log_tail()` 也改成读字节而不是 `read_text()`。
+    """
+    import verify_security_headers as gate
+
+    line = "2026-10-08 22:55:13,523 INFO request request_id=abc123 path=/api/v1/health\n"
+    utf8 = line.encode("utf-8")
+    utf16 = line.encode("utf-16")  # 带 BOM，Tee-Object 产出的就是这种
+    utf16_le = line.encode("utf-16-le")  # 没 BOM 时靠 NUL 密度认出来
+
+    assert utf16.startswith(b"\xff\xfe")
+    assert "request_id=abc123" in gate.decode_log(utf8)
+    assert "request_id=abc123" in gate.decode_log(utf16)
+    assert "request_id=abc123" in gate.decode_log(utf16_le)
+    # 这正是当初的误判来源：同一份字节按 utf-8 解，关键词一个都找不到
+    assert "request_id=abc123" not in utf16.decode("utf-8", errors="replace")
+
+    log = tmp_path / "_backend.log"
+    log.write_bytes(utf16 + line.encode("utf-16"))
+    assert gate.log_tail(log).count("request_id=abc123") == 2
+    assert gate.last_request_line(log).endswith("path=/api/v1/health")
+    assert gate.last_request_line(tmp_path / "missing.log") == "(日志里一条 request_id= 都没有)"
+
+
+

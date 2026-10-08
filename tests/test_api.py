@@ -3751,3 +3751,133 @@ async def test_unlock_guards_self_non_admin_and_unknown(anon_client, auth_header
     denied = await anon_client.post(f"/api/v1/admin/users/{me['id']}/unlock", headers=_bearer(token))
     assert denied.status_code == 403, denied.text
 
+
+# ---------------------------------------------------------------- ⑫ 安全响应头 / GZip / 请求 id
+
+async def test_security_headers_and_request_id_are_on_every_response(anon_client):
+    """每条响应都带安全头与请求 id；404 这类由内层直接返回的响应也不例外。"""
+    from backend.http_headers import API_CONTENT_SECURITY_POLICY, REQUEST_ID_HEADER
+
+    for path, code in (("/api/v1/health", 200), ("/api/v1/definitely-not-here", 404)):
+        response = await anon_client.get(path)
+        assert response.status_code == code, path
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert "geolocation=()" in response.headers["Permissions-Policy"]
+        assert response.headers["Content-Security-Policy"] == API_CONTENT_SECURITY_POLICY
+        # 没带就自己生成：32 位十六进制，正好能在日志里 grep
+        request_id = response.headers[REQUEST_ID_HEADER]
+        assert len(request_id) == 32 and all(c in "0123456789abcdef" for c in request_id)
+        # 本机是 http://127.0.0.1，下发 HSTS 会把浏览器锁死成「必须 https」
+        assert "Strict-Transport-Security" not in response.headers
+
+
+async def test_request_id_is_echoed_when_sane_and_regenerated_when_not(anon_client):
+    """请求 id 只接受 1–128 位的 `[A-Za-z0-9._-]`：带空格或超长就当没带，重新生成。"""
+    from backend.http_headers import REQUEST_ID_HEADER
+
+    mine = "trace-abc.123_XYZ"
+    echoed = await anon_client.get("/api/v1/health", headers={REQUEST_ID_HEADER: mine})
+    assert echoed.headers[REQUEST_ID_HEADER] == mine
+
+    assert len("a" * 128) == 128
+    boundary = await anon_client.get("/api/v1/health", headers={REQUEST_ID_HEADER: "a" * 128})
+    assert boundary.headers[REQUEST_ID_HEADER] == "a" * 128
+
+    # httpx 连非 ASCII 的请求头都不让发（UnicodeEncodeError），所以这里只测能发出去的几种；
+    # 中文/换行那类由 test_units.py 的 request_id_from 单测覆盖
+    for bad in ("a" * 129, "id with space", "id;with;semicolon", "id/with/slash"):
+        response = await anon_client.get("/api/v1/health", headers={REQUEST_ID_HEADER: bad})
+        assert response.headers[REQUEST_ID_HEADER] != bad, bad
+        assert len(response.headers[REQUEST_ID_HEADER]) == 32, bad
+
+
+async def test_csp_is_strict_for_api_and_loose_for_docs(anon_client):
+    """API 响应不需要加载任何资源，给最严的；文档页要从 CDN 取资源，只留 frame-ancestors。"""
+    from backend.http_headers import API_CONTENT_SECURITY_POLICY, DOCS_CONTENT_SECURITY_POLICY
+
+    api = await anon_client.get("/api/v1/health")
+    assert api.headers["Content-Security-Policy"] == API_CONTENT_SECURITY_POLICY
+    assert "default-src 'none'" in api.headers["Content-Security-Policy"]
+
+    for path in ("/openapi.json", "/docs", "/redoc"):
+        response = await anon_client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["Content-Security-Policy"] == DOCS_CONTENT_SECURITY_POLICY, path
+        assert "default-src 'none'" not in response.headers["Content-Security-Policy"], path
+
+
+async def test_hsts_only_when_the_request_came_over_https(anon_client):
+    """反代后面 `request.url.scheme` 是 http，只有 `X-Forwarded-Proto` 能说明是不是 https。"""
+    from backend.http_headers import HSTS_VALUE
+
+    assert "Strict-Transport-Security" not in (await anon_client.get("/api/v1/health")).headers
+
+    forward = {"X-Forwarded-Proto": "https"}
+    assert (await anon_client.get("/api/v1/health",
+                                 headers=forward)).headers["Strict-Transport-Security"] == HSTS_VALUE
+    # nginx 可能写成 "https, http"（链路多段），取第一段
+    chain = {"X-Forwarded-Proto": "https, http"}
+    assert (await anon_client.get("/api/v1/health",
+                                 headers=chain)).headers["Strict-Transport-Security"] == HSTS_VALUE
+    # 明说 http 就不能下发
+    plain = {"X-Forwarded-Proto": "http"}
+    assert "Strict-Transport-Security" not in (await anon_client.get("/api/v1/health",
+                                                                     headers=plain)).headers
+
+
+async def test_large_json_is_gzipped_and_small_response_is_not(anon_client):
+    """`/openapi.json` 有几十 KB，压完明显更小；`/health` 只有 39 字节，压它只白烧 CPU。"""
+    gzip_accept = {"Accept-Encoding": "gzip"}
+
+    big = await anon_client.get("/openapi.json", headers=gzip_accept)
+    assert big.headers["Content-Encoding"] == "gzip"
+    assert big.headers["Vary"] == "Accept-Encoding"
+    # httpx 会把 gzip 解回来，所以 content 是解压后的长度，跟压缩后的 Content-Length 一比就知道真压了
+    assert int(big.headers["Content-Length"]) < len(big.content)
+    plain = await anon_client.get("/openapi.json", headers={"Accept-Encoding": "identity"})
+    assert big.json() == plain.json()
+
+    small = await anon_client.get("/api/v1/health", headers=gzip_accept)
+    assert "Content-Encoding" not in small.headers
+
+
+async def test_sse_is_never_gzipped(anon_client):
+    """压了就得攒够一块才吐，SSE 的「流式」就没了 —— 所以 text/event-stream 在排除表里。"""
+    response = await anon_client.post("/api/v1/chat/stream", json={"message": "gzip 检查"},
+                                      headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200, response.text
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert "Content-Encoding" not in response.headers
+    assert response.text.count("data: ") >= 2
+
+
+async def test_unhandled_error_carries_request_id_and_security_headers(api_app):
+    """500 走的是最外层的 `ServerErrorMiddleware`（不在用户中间件里），所以得自己补头。
+
+    这条同时是「用户报错时怎么对上日志」的证据：响应里的 `request_id` 与日志那一行是同一个。
+    """
+    from backend.http_headers import REQUEST_ID_HEADER
+
+    async def _boom():
+        raise RuntimeError("pytest 故意炸")
+
+    api_app.add_api_route("/api/v1/__pytest_boom", _boom)
+    route = api_app.router.routes[-1]
+    try:
+        transport = httpx.ASGITransport(app=api_app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver",
+                                     trust_env=False) as client:
+            response = await client.get("/api/v1/__pytest_boom",
+                                        headers={REQUEST_ID_HEADER: "trace-from-user"})
+    finally:
+        api_app.router.routes.remove(route)
+
+    assert response.status_code == 500, response.text
+    assert response.json()["request_id"] == "trace-from-user"
+    assert response.headers[REQUEST_ID_HEADER] == "trace-from-user"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+
+

@@ -4,12 +4,13 @@ import logging
 import time
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from backend import observability
 from backend.api_admin import router as admin_router
@@ -25,6 +26,15 @@ from backend.api_system import router as system_router
 from backend.auth import router as auth_router
 from backend.config import get_settings
 from backend.db import engine
+from backend.http_headers import (
+    GZIP_COMPRESS_LEVEL,
+    GZIP_EXCLUDED_CONTENT_TYPES,
+    GZIP_MINIMUM_SIZE,
+    RequestContextMiddleware,
+    apply_security_headers,
+    request_id_of,
+    request_is_https,
+)
 from backend.jobs import resume_interrupted_jobs
 from backend.migrations import ensure_schema, missing_columns, missing_indexes
 from backend.observability import record_request, snapshot
@@ -54,13 +64,24 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
         started = time.perf_counter()
         response = await call_next(request)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        logger.info("request path=%s method=%s status=%s duration_ms=%s",
-                    request.url.path, request.method, response.status_code, elapsed_ms)
+        # 请求 id 由最外层的 RequestContextMiddleware 定好：日志里有它，
+        # 用户报「我这次操作有问题」时才能把那一行捞出来，而不是按时间去猜。
+        logger.info("request request_id=%s path=%s method=%s status=%s duration_ms=%s",
+                    request_id_of(request), request.url.path, request.method,
+                    response.status_code, elapsed_ms)
         record_request(request.url.path, response.status_code, elapsed_ms)
         response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
         return response
 
 app = FastAPI(title="智能财务分析平台 API", version="1.0.0")
+# 中间件是「后 add 的在外层」，所以这里的顺序从里到外是 GZip → 观测 → CORS → 请求 id + 安全头。
+# GZip 贴着应用：它只管应用真正吐出来的字节，流式响应（SSE）与已经是 zip 的格式都在排除表里。
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=GZIP_MINIMUM_SIZE,
+    compresslevel=GZIP_COMPRESS_LEVEL,
+    exclude_content_types=GZIP_EXCLUDED_CONTENT_TYPES,
+)
 app.add_middleware(ObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +91,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestContextMiddleware)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """未处理异常也要带请求 id：用户看到 500 时，唯一能对上日志的线索就是它。
+
+    Starlette 把注册在 `Exception` 上的处理器交给最外层的 `ServerErrorMiddleware`，
+    它在所有用户中间件之外 —— 所以这条响应不会经过 `RequestContextMiddleware`，
+    安全头与请求 id 得在这里自己补一遍（`apply_security_headers` 是同一份口径）。
+    """
+    request_id = request_id_of(request)
+    logger.error("未处理异常 request_id=%s path=%s", request_id, request.url.path, exc_info=exc)
+    response = JSONResponse(status_code=500,
+                            content={"detail": "服务器内部错误", "request_id": request_id})
+    https = request_is_https(request.url.scheme, request.headers.get("X-Forwarded-Proto"))
+    apply_security_headers(response, request.url.path, https=https, request_id=request_id)
+    return response
+
+
 app.include_router(rag_router)
 app.include_router(auth_router)
 app.include_router(financial_router)
