@@ -53,6 +53,7 @@ HANDLERS: dict[str, Handler] = {}
 # 前端展示用：kind → 中文名
 KIND_LABELS = {
     "batch.revert": "撤销导入批次",
+    "alert.dispatch": "外发预警通知",
 }
 
 # 重试预算与退避：第 1 次重试等 2 秒、第 2 次 4 秒……封顶 60 秒。
@@ -80,7 +81,7 @@ def handler(kind: str) -> Callable[[Handler], Handler]:
 
 @handler("batch.revert")
 def _revert_batch(db: Session, payload: dict, context: dict) -> dict:
-    return batch_ops.revert_batch(
+    result = batch_ops.revert_batch(
         db,
         payload["batch"],
         actor=context.get("actor"),
@@ -90,6 +91,28 @@ def _revert_batch(db: Session, payload: dict, context: dict) -> dict:
         # 空批次说明调用方点错了（或者有人抢先撤销了），必须报错。
         allow_missing=bool(context.get("is_retry")),
     )
+    # 撤销会重算受影响期间 → 期间里的预警是**新行**，该发的通知要在这里补排一次。
+    # 函数内导入：`alerts_outbound` 反过来要用本模块的 submit/SCHEDULER，
+    # 而本模块的 `batch_ops` → `transactions` 也在链条上，模块级导入会成环。
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    # 这里不 commit：投递单本来就该和「撤销+重算」是同一个事务，而 jobs.submit() 内部会提交
+    # （即投递单与任务记录一起落盘），随后 run_job 还会再提交一次任务状态，没有副作用。
+    alerts_outbound.schedule(db, periods=result.get("recalculated"), actor=context.get("actor"))
+    return result
+
+
+@handler("alert.dispatch")
+def _dispatch_alerts(db: Session, payload: dict, context: dict) -> dict:
+    """预警外发（⑭）：把一批投递单发到成功或判失败为止（实现在 backend/alerts_outbound.py）。
+
+    注册放在本模块、实现放在那边，是因为 `HANDLERS` 是这里的全局表（`submit` / `run_job` 都读它），
+    而 alerts_outbound 反过来要用 `submit` / `SCHEDULER`——模块级互相导入会成环，
+    于是这里只做注册与转交，导入推迟到调用时。
+    """
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    return alerts_outbound.dispatch(db, payload, context)
 
 
 def serialize(job: BackgroundJob) -> dict:

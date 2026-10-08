@@ -184,6 +184,19 @@ if BaseSettings is not None:
         # ——爬取侧通常没法走 JWT 登录，所以默认不鉴权，生产环境应在反代/内网层面限制来源。
         metrics_enabled: bool = True
         metrics_token: str = ""
+        # 预警外发（⑭，见 backend/alerts_outbound.py 与 backend/models.py 的 AlertChannel）：
+        # 单次 webhook 请求的超时——告警外发绝不能把重算请求拖住，超时就按这次失败处理，
+        # 交给后台任务退避重试；一条投递单最多试几次也在这里。
+        alert_webhook_timeout_seconds: float = 5.0
+        alert_max_attempts: int = 3
+        # 邮件通道的 SMTP 配置。留空 = 没配邮件（邮件投递**直接判失败**而不是重试用尽预算：
+        # 配置错误重试多少次都一样，让它把重试次数烧完只会让人等更久）。
+        alert_smtp_host: str = ""
+        alert_smtp_port: int = 587
+        alert_smtp_user: str = ""
+        alert_smtp_password: str = ""
+        alert_smtp_starttls: bool = True
+        alert_mail_from: str = ""
         # 出口配额（每分钟、按账号）：导出一次能把整库拉走，问答一次要花模型的钱，
         # 两个都必须是"脚本打不动、人用不着"的量级——回归脚本一次要连问 28 个问题，
         # 所以默认给到 60，不是 10 那种会误伤自己的数字。
@@ -274,6 +287,14 @@ else:
         slow_path_log_seconds = int(os.getenv("SLOW_PATH_LOG_SECONDS", "60"))
         metrics_enabled = os.getenv("METRICS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
         metrics_token = os.getenv("METRICS_TOKEN", "")
+        alert_webhook_timeout_seconds = float(os.getenv("ALERT_WEBHOOK_TIMEOUT_SECONDS", "5"))
+        alert_max_attempts = int(os.getenv("ALERT_MAX_ATTEMPTS", "3"))
+        alert_smtp_host = os.getenv("ALERT_SMTP_HOST", "")
+        alert_smtp_port = int(os.getenv("ALERT_SMTP_PORT", "587"))
+        alert_smtp_user = os.getenv("ALERT_SMTP_USER", "")
+        alert_smtp_password = os.getenv("ALERT_SMTP_PASSWORD", "")
+        alert_smtp_starttls = os.getenv("ALERT_SMTP_STARTTLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+        alert_mail_from = os.getenv("ALERT_MAIL_FROM", "")
         export_max_per_minute = int(os.getenv("EXPORT_MAX_PER_MINUTE", "30"))
         ai_max_per_minute = int(os.getenv("AI_MAX_PER_MINUTE", "60"))
         database_url = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@localhost:5432/finance")

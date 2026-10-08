@@ -25,12 +25,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from backend import audit, batch_ops, jobs, lockout, rollups
+from backend import alerts_outbound, audit, batch_ops, jobs, lockout, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import (
+    AlertChannel,
+    AlertDelivery,
     AlertRule,
     BackgroundJob,
     FinancialAlert,
@@ -850,6 +852,100 @@ class AlertRuleScope(BaseModel):
     enabled: bool | None = None
 
 
+# ------------------------------------------------------------------ 预警外发通道
+
+class AlertChannelCreate(BaseModel):
+    """新建一条外发通道。
+
+    `secret` 是 webhook 的 HMAC-SHA256 密钥：**只写不读**，任何响应都不会把它回显出来，
+    只告诉调用方「配了没有」——密钥一旦能被读回来，界面上别人截一张图就等于泄露了。
+    """
+    name: str = Field(..., min_length=1, max_length=100)
+    kind: str = Field("webhook", pattern="^(webhook|email)$")
+    target: str = Field(..., min_length=1, max_length=500,
+                        description="webhook=接收地址 URL；email=逗号分隔的收件人")
+    min_level: str = Field("low", pattern="^(high|medium|low)$",
+                           description="只外发该级别及以上的预警")
+    department: str = Field("", max_length=100, description="空 = 不限部门（含全公司口径）")
+    enabled: bool = True
+    secret: str = Field("", max_length=200)
+
+
+class AlertChannelUpdate(BaseModel):
+    """改一条通道：`None` = 不改该项；`department` / `secret` 给空串 = 清空。
+
+    这里不用「空串即不改」：密钥本来就是可有可无的，管理员需要一条明确的「把密钥删掉」的路径。
+    """
+    name: str | None = Field(None, min_length=1, max_length=100)
+    kind: str | None = Field(None, pattern="^(webhook|email)$")
+    target: str | None = Field(None, min_length=1, max_length=500)
+    min_level: str | None = Field(None, pattern="^(high|medium|low)$")
+    department: str | None = Field(None, max_length=100)
+    enabled: bool | None = None
+    secret: str | None = Field(None, max_length=200)
+
+
+class AlertNotifyRequest(BaseModel):
+    """补发：把「待处理」的预警按当前通道配置补成投递单。period 留空 = 所有期间。"""
+    period: str = Field("", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _channel_or_404(db: Session, channel_id: int) -> AlertChannel:
+    channel = db.get(AlertChannel, channel_id)
+    if channel is None:
+        raise HTTPException(404, "没有这条外发通道")
+    return channel
+
+
+def _clean_kind(value: str) -> str:
+    if value not in alerts_outbound.KINDS:
+        raise HTTPException(422, f"通道类型只能是 {'、'.join(alerts_outbound.KINDS)}")
+    return value
+
+
+def _clean_channel_level(value: str) -> str:
+    if value not in alerts_outbound.LEVEL_ORDER:
+        raise HTTPException(422, "最低级别只能是 high、medium 或 low")
+    return value
+
+
+def _clean_target(kind: str, target: str) -> str:
+    """按通道类型校验目标。webhook 在这里就把「地址不能用」挡下来，别等到发的时候才报错。"""
+    text = (target or "").strip()
+    if kind == "webhook":
+        try:
+            return alerts_outbound.check_webhook_target(text)
+        except alerts_outbound.ConfigurationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    if not text:
+        raise HTTPException(422, "邮件通道至少要有一个收件人")
+    addresses = [item.strip() for item in text.split(",") if item.strip()]
+    # 只做「像不像一个邮箱」的形状检查：真的能不能收，只有发一次才知道（见 test 端点）。
+    bad = [item for item in addresses
+           if item.count("@") != 1 or item.startswith("@") or item.endswith("@")
+           or any(char.isspace() for char in item)]
+    if bad:
+        raise HTTPException(422, f"这些收件人看着不像邮箱地址：{'、'.join(bad[:3])}")
+    return ", ".join(addresses)
+
+
+def _clean_channel_department(db: Session, value: str | None) -> str | None:
+    text = _clean_text(value)
+    if text is None:
+        return None
+    known, _periods = _scope_options(db)
+    if text not in known:
+        raise HTTPException(422, f"没有「{text}」这个部门（按部门限定要写数据里存在的部门名）")
+    return text
+
+
+def _channel_snapshot(channel: AlertChannel) -> dict:
+    """审计快照。**不含 secret**，只记「配没配」——密钥不该落进审计表。"""
+    return {"name": channel.name, "kind": channel.kind, "target": channel.target,
+            "min_level": channel.min_level, "department": channel.department,
+            "enabled": channel.enabled, "has_secret": bool(channel.secret)}
+
+
 def _clean_text(value: str | None) -> str | None:
     """空串与纯空白都算「不限定」：页面上把分档维度清空再保存，就是回到全域。"""
     text = (value or "").strip()
@@ -1063,6 +1159,184 @@ def update_alert_rule(alert_type: str, payload: AlertRuleUpdate, request: Reques
     db.commit()
     db.refresh(rule)
     return _rule_json(rule)
+
+
+# ------------------------------------------------------------------ 预警外发通道
+
+@router.get("/alert-channels")
+def list_alert_channels(db: Session = Depends(get_db), _: User = Depends(admin_user)):
+    """外发通道一览 + 每条通道的投递台账计数（待发送/已送达/已失败）。"""
+    channels = db.scalars(select(AlertChannel).order_by(AlertChannel.id)).all()
+    counts = alerts_outbound.delivery_counts(db)
+    return {"data": [alerts_outbound.channel_json(channel, counts.get(channel.id))
+                     for channel in channels],
+            "kinds": alerts_outbound.KINDS, "min_levels": alerts_outbound.MIN_LEVELS,
+            "levels": LEVELS, "departments": _scope_options(db)[0],
+            "stats": alerts_outbound.stats(db)}
+
+
+@router.post("/alert-channels", status_code=201)
+def create_alert_channel(payload: AlertChannelCreate, request: Request,
+                         db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """新建一条外发通道。**新建不会自动补发旧预警**——补发要显式点 `POST /admin/alerts/notify`，
+    否则「加了个通道」这一个动作会静默地把历史预警一股脑轰出去。"""
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(422, "通道名不能为空")
+    duplicate = db.scalars(select(AlertChannel).where(AlertChannel.name == name)).first()
+    if duplicate is not None:
+        raise HTTPException(409, f"已经有一条叫「{name}」的通道了")
+    kind = _clean_kind(payload.kind)
+    channel = AlertChannel(name=name, kind=kind, target=_clean_target(kind, payload.target),
+                           min_level=_clean_channel_level(payload.min_level),
+                           department=_clean_channel_department(db, payload.department),
+                           enabled=payload.enabled, secret=_clean_text(payload.secret))
+    db.add(channel)
+    db.flush()
+    audit.record(db, me, "alert_channel.create", target_type="alert_channel",
+                 target_id=str(channel.id), detail=_channel_snapshot(channel), request=request)
+    db.commit()
+    db.refresh(channel)
+    return alerts_outbound.channel_json(channel,
+                                        alerts_outbound.delivery_counts(db).get(channel.id))
+
+
+@router.put("/alert-channels/{channel_id}")
+def update_alert_channel(channel_id: int, payload: AlertChannelUpdate, request: Request,
+                         db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """改一条通道。改完**立即对下一次外发生效**（发送时现读通道，不缓存）。
+
+    改了 `kind` 会按新类型重校 `target`：webhook 的地址和邮件地址不是一回事，
+    留着旧值只会在第一次投递时才炸。
+    """
+    channel = _channel_or_404(db, channel_id)
+    before = _channel_snapshot(channel)
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(422, "通道名不能为空")
+        clash = db.scalars(select(AlertChannel).where(
+            AlertChannel.id != channel.id, AlertChannel.name == name)).first()
+        if clash is not None:
+            raise HTTPException(409, f"已经有一条叫「{name}」的通道了")
+        channel.name = name
+    kind = _clean_kind(payload.kind) if payload.kind is not None else channel.kind
+    target = payload.target if payload.target is not None else channel.target
+    channel.target = _clean_target(kind, target)
+    channel.kind = kind
+    if payload.min_level is not None:
+        channel.min_level = _clean_channel_level(payload.min_level)
+    if payload.department is not None:
+        channel.department = _clean_channel_department(db, payload.department)
+    if payload.enabled is not None:
+        channel.enabled = payload.enabled
+    if payload.secret is not None:
+        # 空串 = 把密钥删掉（webhook 退回不带签名的裸 POST）。
+        channel.secret = _clean_text(payload.secret)
+    after = _channel_snapshot(channel)
+    audit.record(db, me, "alert_channel.update", target_type="alert_channel",
+                 target_id=str(channel.id), detail={"before": before, "after": after},
+                 request=request)
+    db.commit()
+    db.refresh(channel)
+    return alerts_outbound.channel_json(channel,
+                                        alerts_outbound.delivery_counts(db).get(channel.id))
+
+
+@router.delete("/alert-channels/{channel_id}")
+def delete_alert_channel(channel_id: int, request: Request,
+                         db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """删一条通道。**已有的投递台账不删**（历史记录留痕），只是 `channel_id` 变成空——
+    所以台账里另外存了通道名快照，删完之后那些记录仍然能看出「当年发给了谁」。"""
+    channel = _channel_or_404(db, channel_id)
+    snapshot = _channel_snapshot(channel)
+    audit.record(db, me, "alert_channel.delete", target_type="alert_channel",
+                 target_id=str(channel_id), detail=snapshot, request=request)
+    db.delete(channel)
+    db.commit()
+    return {"id": channel_id, "name": snapshot["name"], "deleted": True}
+
+
+@router.post("/alert-channels/{channel_id}/test")
+def test_alert_channel(channel_id: int, request: Request,
+                       db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """同步发一条**测试通知**（不进投递台账：它不是某条预警的投递，混进台账会让
+    「待发送 N 条」永远对不上真实预警数）。配置错在这里就能看见原因。"""
+    channel = _channel_or_404(db, channel_id)
+    result = alerts_outbound.test_channel(db, channel)
+    audit.record(db, me, "alert_channel.test", target_type="alert_channel",
+                 target_id=str(channel.id),
+                 detail={"name": channel.name, "kind": channel.kind, "ok": result["ok"],
+                         "status": result["status"], "detail": result["detail"][:200]},
+                 request=request)
+    db.commit()
+    db.refresh(channel)
+    return {**result, "channel": alerts_outbound.channel_json(
+        channel, alerts_outbound.delivery_counts(db).get(channel.id))}
+
+
+@router.get("/alert-deliveries")
+def list_alert_deliveries(status: str | None = Query(None), channel_id: int | None = Query(None),
+                          period: str | None = Query(None), level: str | None = Query(None),
+                          limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+                          db: Session = Depends(get_db), _: User = Depends(admin_user)):
+    """投递台账：每一条「某条预警 × 某个通道」的发送记录与它的失败原因。"""
+    if status is not None and status not in alerts_outbound.STATUSES:
+        raise HTTPException(422, f"状态只能是 {'、'.join(alerts_outbound.STATUSES)}")
+    if level is not None and level not in alerts_outbound.LEVEL_ORDER:
+        raise HTTPException(422, "级别只能是 high、medium 或 low")
+    rows, total = alerts_outbound.query(db, status=status, channel_id=channel_id, period=period,
+                                        level=level, limit=limit, offset=offset)
+    return {"data": [alerts_outbound.serialize(row) for row in rows], "total": total,
+            "limit": limit, "offset": offset, "status_labels": alerts_outbound.STATUS_LABELS,
+            "levels": LEVELS, "stats": alerts_outbound.stats(db)}
+
+
+@router.post("/alert-deliveries/{delivery_id}/retry")
+def retry_alert_delivery(delivery_id: int, request: Request,
+                         db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """人工重试一条失败的投递。会把 `attempts` 归零再排队：
+    投递单的重试次数只用来决定「这一轮还要不要再试」，管理员判断通道已经修好了，
+    就不该被上一次失败留下的次数挡住（与任务表保留尝试编号的口径不同）。"""
+    delivery = db.get(AlertDelivery, delivery_id)
+    if delivery is None:
+        raise HTTPException(404, "没有这条投递记录")
+    alerts_outbound.retry_delivery(db, delivery)
+    outbound = alerts_outbound.schedule(db, actor=me.username)
+    audit.record(db, me, "alert_delivery.retry", target_type="alert_delivery",
+                 target_id=str(delivery.id),
+                 detail={"channel": delivery.channel_name, "period": delivery.period,
+                         "alert_type": delivery.alert_type, "level": delivery.level,
+                         "job": (outbound["job"] or {}).get("id")},
+                 request=request)
+    db.commit()
+    db.refresh(delivery)
+    return {"data": alerts_outbound.serialize(delivery), "job": outbound["job"],
+            "queued": outbound["deliveries"], "deduplicated": outbound["deduplicated"]}
+
+
+@router.post("/alerts/notify")
+def notify_alerts(payload: AlertNotifyRequest, request: Request,
+                  db: Session = Depends(get_db), me: User = Depends(admin_user)):
+    """补发：把**待处理**的预警按当前通道配置补成投递单，并把所有待发送的投递排进队列。
+
+    新建/修好通道之后点这一下。可以反复点：已存在的「预警 × 通道」组合不会再建一条
+    （去重键是内容而不是行 id，见 alerts_outbound.alert_key），排队中的也不会重复排
+    （`jobs` 按 payload 去重）。
+    """
+    period = _clean_text(payload.period)
+    created = alerts_outbound.plan(db, period=period)
+    # 先把投递单落库再排任务：后台任务读的是数据库，而不是这个还没提交的事务。
+    db.commit()
+    outbound = alerts_outbound.schedule(db, actor=me.username)
+    audit.record(db, me, "alert.notify", target_type="alert", target_id=period or "all",
+                 detail={"period": period or "all", "created": created,
+                         "queued": outbound["deliveries"],
+                         "job": (outbound["job"] or {}).get("id")},
+                 request=request)
+    db.commit()
+    return {"period": period, "created": created, "queued": outbound["deliveries"],
+            "job": outbound["job"], "deduplicated": outbound["deduplicated"]}
 
 
 # ------------------------------------------------------------------ 审计日志

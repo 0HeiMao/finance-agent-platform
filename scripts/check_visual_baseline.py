@@ -69,6 +69,7 @@ DEFAULT_BASELINES = (
     ("/financial/transactions", "1440x900"),
     ("/agent", "1440x900"),
     ("/admin/users", "1440x900"),
+    ("/admin/alert-channels", "1440x900"),
     ("/settings", "375x812"),
 )
 

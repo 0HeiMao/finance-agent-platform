@@ -55,6 +55,12 @@ ACTIONS: dict[str, str] = {
     "alert_rule.update": "修改预警规则",
     "alert_rule.create": "新增分档规则",
     "alert_rule.delete": "删除分档规则",
+    "alert_channel.create": "新增预警外发通道",
+    "alert_channel.update": "修改预警外发通道",
+    "alert_channel.delete": "删除预警外发通道",
+    "alert_channel.test": "测试预警外发通道",
+    "alert_delivery.retry": "重试预警投递",
+    "alert.notify": "补发预警通知",
     "audit.export": "导出审计日志",
     "audit.purge": "清理过期审计",
 }

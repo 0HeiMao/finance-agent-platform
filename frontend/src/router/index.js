@@ -15,6 +15,7 @@ import AdminOverview from '../views/AdminOverview.vue'
 import AdminUsers from '../views/AdminUsers.vue'
 import AdminDepartments from '../views/AdminDepartments.vue'
 import AdminAlertRules from '../views/AdminAlertRules.vue'
+import AdminAlertChannels from '../views/AdminAlertChannels.vue'
 import AdminAudit from '../views/AdminAudit.vue'
 import AdminBatches from '../views/AdminBatches.vue'
 import AdminKnowledge from '../views/AdminKnowledge.vue'
@@ -47,6 +48,11 @@ const router = createRouter({
     { path: '/admin/users', component: AdminUsers, meta: { requiresAuth: true, admin: true } },
     { path: '/admin/departments', component: AdminDepartments, meta: { requiresAuth: true, admin: true } },
     { path: '/admin/alert-rules', component: AdminAlertRules, meta: { requiresAuth: true, admin: true } },
+    {
+      path: '/admin/alert-channels',
+      component: AdminAlertChannels,
+      meta: { requiresAuth: true, admin: true }
+    },
     { path: '/admin/audit', component: AdminAudit, meta: { requiresAuth: true, admin: true } },
     { path: '/admin/batches', component: AdminBatches, meta: { requiresAuth: true, admin: true } },
     { path: '/admin/knowledge', component: AdminKnowledge, meta: { requiresAuth: true, admin: true } },

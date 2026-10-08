@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十六个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十七个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下十七个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十八个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -112,20 +112,22 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_security_headers.py` | 安全响应头 + GZip + 请求 id 29 项：正常响应与 404 都带四个静态头与严格 CSP、请求 id 合规则原样回传（128 位边界）而超长/带空格/带分号一律换成 32 位、**响应里那个 id 能在后端日志里 grep 到**（每次跑换新 id，否则上一轮那条会让这项假绿）、`/docs`/`/redoc`/`/openapi.json` 换成文档 CSP、HSTS 只在 `X-Forwarded-Proto: https`（或 `https, http`）时出现、`/openapi.json` 与 CSV 导出**真被压**且解压后与 `Accept-Encoding: identity` 那份 JSON 相等（用 `iter_raw()` 数网线上真实字节，`content` 是解压后的）、同样 8909 行的 xlsx 导出**不压**、SSE 没被压且仍按 chunked 传（带不带 gzip 收到的字节一致）、500 也带请求 id 与安全头（它绕过所有中间件，是处理器自己补的）。静态头期望值**写死在脚本里**、不从 `backend.http_headers` import —— 否则常量被改错时脚本跟着一起错。跑一次消耗 3 次导出配额 |
 | `verify_metrics_logs.py` | Prometheus 指标与结构化日志 31 项：`/metrics` 匿名 200 且是 Prometheus 文本（桶单调不减、`le="+Inf"` 恒等于 `_count`、指标名全带 `finance_` 前缀）、**与活库对账**（`finance_background_jobs` 总数 == `/admin/jobs` 的 `total`、`finance_alerts` == `/admin/overview` 的 `counts.alert_rows`、`finance_db_up` = 1）、计数真跟流量走（连点三次 `/health` 正好 +3；两个不同 id 只长一条 `{row_id}` 序列且 body 里没有 `/123` 这种字面量；404 归 `unmatched`）、**`/metrics` 不在 `/openapi.json` 的 paths 里**（`include_in_schema=False`，否则加一个指标契约就飘）、gzip 网线字节 11360 → 1228 且**摘掉 `/metrics` 自己那条自增序列**之后与 `identity` 逐字节相等、`X-Request-ID` 回显且后端文本日志里那一次请求同时带 path/method/status/duration_ms；另起两个短命 uvicorn 验配置面：`LOG_FORMAT=json` + `METRICS_TOKEN` + `SLOW_PATH_MS=1`（无 token 401、带 token 200、每条日志都是合法单行 JSON、慢接口告警也是 JSON 且字段真在 JSON 里）与 `METRICS_ENABLED=false`（`/metrics` 404 而 `/api/v1/health` 仍 200）。两个只在这台机器上才有的坑写进了脚本注释：日志编码要**按 BOM 判**（`\| Tee-Object` 写 UTF-16、脚本自己 `Popen` 写 UTF-8，而任意偶数长度的 UTF-8 用 `utf-16` 解码不报错只出乱码），而 `\| Tee-Object` 会按控制台 120 列把长行**硬折**（`duration_ms=` 可能正好被折点切开），所以比对前要把空白整体去掉 |
 
+| `verify_alerts_outbound.py` | 预警外发通道 41 项：真库建 Webhook 通道（201 且响应与列表都只有 `has_secret`、重名 409、`ftp://` 与带用户名口令的 URL 422、非法 `min_level`/`kind` 422、邮件收件人里的多余空格被规范化）、`POST …/test` 成功与失败**都回 200** 且**不写投递台账**、真导入一个探针期间后 4 条投递全部 `sent`（`attempts=1`、`response_status=200`）且本地 sink 收到的正文与 `sha256=<timestamp>.<body>` 签名 **4/4 对得上**、把 sink 切成一直失败后同一批按 2/4/8 秒退避真的重发（sink 三轮共收到 12 次）而 `attempts` 停在 `ALERT_MAX_ATTEMPTS`=3、同一期间再点补发 `created=0`（内容寻址去重的目的正在于此：重算不会把同一件事再通知一遍）、人工重发一次即 `sent`/`attempts=1`/`status=200`、通道计数 `{pending,sent,failed}` 与 `last_result`/`last_error` 如实、六个动作的审计逐条留痕，跑完撤销探针批次、删临时通道并断言该期 0 条 pending |
+
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
 还有七个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
-| `check_pages.py` | 17 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/`。每页先轮询到真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，`--ready-timeout` 默认 20s）再判定：**空白页面天然没有横向溢出，固定 sleep 会把它变成假 PASS**——dev server 冷启动要现编译 chunk，第一次访问 `/admin` 就截到过 5.8KB 的全白图 |
+| `check_pages.py` | 18 个页面 × 1440/768/375 三档，注入登录态后逐页断言 `scrollWidth == clientWidth`（无横向溢出）并整页截图到 `output/charts/`。每页先轮询到真的渲染出内容（`#app` 有子节点且 innerText ≥ 200 字，`--ready-timeout` 默认 20s）再判定：**空白页面天然没有横向溢出，固定 sleep 会把它变成假 PASS**——dev server 冷启动要现编译 chunk，第一次访问 `/admin` 就截到过 5.8KB 的全白图 |
 | `ui_scope_smoke.py` | 在真浏览器里点「查看口径」下拉与导出按钮：下拉选项、切口径后 KPI 与提示条变化、导出文件名/行数。**只有它能发现「控件在但点了没反应」** —— 写它时当场抓到 `ScopeSwitcher` 的 `onMounted` 竞态 |
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
 | `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
 | `ui_components_smoke.py` | 在真浏览器里点四个自研组件 40 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）、管理概览的慢接口告警区块（标题在、区块不是空白、告警行点名路径与次数，并把这张卡片截到 `output/charts/ui_slow_alerts.png`）、会话版本的两处界面（设置页有「登录与令牌」卡片且会话版本是真数字、有「退出登录」按钮；用户管理表头有「会话」列、每行有会话状态与「强制下线」按钮、自己那行禁用——**刻意不点退出登录**，点了会把 demo 账号的会话版本推进一版）、账号锁定的界面面（用户管理表头有「登录」列、每行登录状态是「正常 / 失败 N 次 / 已锁定」、每行有「解锁」按钮且**演示库没人被锁所以全部禁用**；再清掉本地令牌打开 `guestOnly` 的注册页，核对口令规则提示与 placeholder 都写到「至少 10 位」、填 6 位口令点注册被**前端当场拦下不发请求**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
 
-| `check_visual_baseline.py` | 把 8 张首屏截图冻结进仓库（`docs/visual-baseline/`），之后每次跑都逐像素比对：`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、`/financial/transactions`、`/agent`、`/admin/users` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812。单通道差 ≤ 8 不算变、不一样像素占比 > 0.2% 判失败、**基线尺寸变了直接判失败**，并把差异图（变了的地方涂红）写到 `output/charts/`。为什么要有它：`check_pages.py` 只查「无横向溢出 + 渲染出内容」，把 KPI 数字改成白色、把图表容器高度写成 0、把表头文字删掉，它全都照样绿 |
+| `check_visual_baseline.py` | 把 9 张首屏截图冻结进仓库（`docs/visual-baseline/`），之后每次跑都逐像素比对：`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、`/financial/transactions`、`/agent`、`/admin/users`、`/admin/alert-channels` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812。单通道差 ≤ 8 不算变、不一样像素占比 > 0.2% 判失败、**基线尺寸变了直接判失败**，并把差异图（变了的地方涂红）写到 `output/charts/`。为什么要有它：`check_pages.py` 只查「无横向溢出 + 渲染出内容」，把 KPI 数字改成白色、把图表容器高度写成 0、把表头文字删掉，它全都照样绿 |
 
 七个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
@@ -141,7 +143,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 .\.venv\Scripts\python.exe scripts\check_all.py
 # 只做编码/语法体检 + 后端 ruff + 接口契约快照（几秒钟、不碰数据库，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
-# 再加 17 页 × 3 档的真机页面扫描与首屏截图基线比对（要求前后端已启动）
+# 再加 18 页 × 3 档的真机页面扫描与首屏截图基线比对（要求前后端已启动）
 .\.venv\Scripts\python.exe scripts\check_all.py --with-pages
 ```
 
@@ -168,7 +170,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 226 项、前端 41 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 241 项、前端 44 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -266,7 +268,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 属于环境限制，改用 dev server 转译 + 无头浏览器核对：
 
 ```powershell
-# 17 个页面 × 1440/768/375 三档：打印 scrollWidth/clientWidth 并列出超宽元素，同时整页截图
+# 18 个页面 × 1440/768/375 三档：打印 scrollWidth/clientWidth 并列出超宽元素，同时整页截图
 .\.venv\Scripts\python.exe scripts\check_pages.py
 # 只核对某一页某一档
 .\.venv\Scripts\python.exe scripts\check_pages.py --sizes 375x812 --pages /reports/pptx
@@ -290,7 +292,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
     --api-base http://127.0.0.1:8080 --inject-token
 ```
 
-已核对结果：17 页 × 3 档共 51 组全部 `scrollWidth == clientWidth`，无横向溢出（`.table-wrap` 内表格
+已核对结果：18 页 × 3 档共 54 组全部 `scrollWidth == clientWidth`，无横向溢出（`.table-wrap` 内表格
 属预期横向滚动，脚本已排除）；截图见 `output/charts/check_*.png`。**容器里的构建产物也跑过同一脚本
 （`--base-url http://127.0.0.1:8080 --inject-token`，exit 0）**，所以打包后界面与 dev server 一致。首轮扫描抓到的唯一一处真实溢出是
 `/financial/import @375`（`scrollWidth=429`，`.upload-box` 里的「确认导入」按钮被挤出视口），
@@ -313,9 +315,9 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 .\.venv\Scripts\python.exe scripts\check_visual_baseline.py --pages /settings --sizes 375x812
 ```
 
-基线是 `docs/visual-baseline/` 下 8 张首屏图（`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、
-`/financial/transactions`、`/agent`、`/admin/users` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812；
-合计约 1 MB，`manifest.json` 记下每张的页面、视口、宽高与 sha256）。**只截首屏**：整页图动辄 1.7 MB × 17 页，
+基线是 `docs/visual-baseline/` 下 9 张首屏图（`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、
+`/financial/transactions`、`/agent`、`/admin/users`、`/admin/alert-channels` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812；
+合计约 1 MB，`manifest.json` 记下每张的页面、视口、宽高与 sha256）。**只截首屏**：整页图动辄 1.7 MB × 18 页，
 进版本库不值当，`--full-page` 留着手动看。
 
 判定口径（都能单测）：单个通道差值 ≤ `--tolerance`（默认 8）不算变 —— 抗锯齿与字体微调本来就让几个像素差 1~3，
@@ -327,8 +329,9 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 **页面上会自己变的内容由前端标注 `data-visual-mask`**，截图时注入的样式把它的字变透明（占位还在，
 所以版面变了仍然会红）。这是**在源头消掉噪声**，而不是把阈值抬高到噪声之上：抬高阈值会把真正的视觉改动
 一起放过。现在只有 `/dashboard` 的「数据更新于 2026/10/8 21:3x:xx」用了它 —— 加它之前实测同一份代码跑两次，
-8 张里有 6 张逐像素完全一致，`/dashboard` 两张差 193 / 196 个像素（0.015% / 0.064%，差异图里红点全落在那句时间戳的秒数上），
-加完 `data-visual-mask` 后 8 张**全部 0 像素差异**。
+当时那 8 张里有 6 张逐像素完全一致，`/dashboard` 两张差 193 / 196 个像素（0.015% / 0.064%，差异图里红点全落在那句时间戳的秒数上），
+加完 `data-visual-mask` 后 8 张**全部 0 像素差异**。⑭ 新增的第 9 张（`/admin/alert-channels`）连同刷新后的
+其余 8 张（侧边栏多了一行，所以宽屏那几张都变了）重刷完之后，整套 9 张复跑同样是 0 像素差异。
 
 **它不进 CI**：像素依赖本机字体与抗锯齿，换台机器、换个 Edge 版本就会整片差一点，这类基线只在
 「同一台机器上前后的两次运行」之间有比较意义（理由与其它本地门禁一起写在「有意不进 CI 的门禁」一节）。
@@ -341,7 +344,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **226** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**）、
+`tests/` 下三个文件共 **241** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -390,7 +393,13 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 被锁账号**口令填对也是 429** 且与限流那条 429 文案一字不差、锁着时不回显「该账号是否存在」、
 静默期过后重新从零数、管理员解锁清掉计数但**不动会话版本**（解锁 ≠ 踢下线）、
 弱口令注册 400 且一个账号都不建（`problems` 给出中文原因）、
-口令强度规则不挂 Pydantic 模型上（登录与注册共用一个请求体，挂上去会把老用户的登录也一起判死）。
+口令强度规则不挂 Pydantic 模型上（登录与注册共用一个请求体，挂上去会把老用户的登录也一起判死）→
+**预警外发通道**：通道增删改查（201 建、重名 409、`ftp://` 与带用户名口令的 URL、非法级别/类型都 422、
+响应与列表只回 `has_secret`、邮件收件人被规范化成「逗号+空格」）、
+`POST …/{channel_id}/test` 成功与失败**都回 200** 且**不写投递台账**、台账按状态/级别/期间/通道筛选、
+**按内容寻址去重**（同一期间再点补发 `created=0` 且不重复排队）、失败退避时人工重发把 `attempts` 归零
+之后立刻重排、`/analysis/calculate` 与 CSV 导入都会顺手排好投递单（响应里带 `deliveries`）、
+四个端点都要求管理员（匿名 401 / 部门账号 403）。
 异步用例用 **anyio** 插件（`pytestmark = pytest.mark.anyio`，用例 id 显示 `[asyncio]`），
 不依赖未安装的 pytest-asyncio；数据库不可用时自动 `pytest.skip` 而不是失败。
 测试自身在外层事务里跑，结束整体回滚，不会污染库里数据。
@@ -405,7 +414,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
-41 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
+44 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
@@ -416,7 +425,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
-- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（14 项）：
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（17 项）：
   `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
   `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
   `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
@@ -428,9 +437,16 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
   下载落到 `downloads` 数组里），`mount()` 返回 `text()/button()/click()/fire()/setSelectValue()/input()`。
   两个垫片细节是必须的：`v-model` 在原生 `input` 上要 `addEventListener` 与 `getRootNode()`
   （并让根节点 `instanceof globalThis.Document`），`v-html` 的内容要单独记进 `el.rawHtml` 才算可见文本。
+  还有两条是这套垫片**撑不住**、于是反过来约束了产品代码的：Element Plus 的 `ElMessage` 在假元素上会崩
+  （`el.addEventListener is not a function`，`@vueuse/core` 里那句），所以被测页面一律用行内提示条而不是浮层消息；
+  原生 `<select v-model>` 也挂不上（`vModelSelect` 挂载时读 `el.options` 并自己绑 `change`），
+  所以下拉框一律写成 `:value` + `@change` —— 这是把「测试跑不起来」变成「少一个组件库依赖」的取舍。
   覆盖的是**行为而不是快照**：分页守卫（末页再点不发事件）、口径切换器写进请求参数、
   导出提示取自响应头、侧边栏高亮、Agent 的 SSE 流与错误重试、后台任务失败行点「重试」打的是
-  `POST /admin/jobs/{id}/retry`、被后端去重时提示的是「没有重复提交」而不是「已提交」。
+  `POST /admin/jobs/{id}/retry`、被后端去重时提示的是「没有重复提交」而不是「已提交」、
+  预警外发页点「测试」打的是 `POST /admin/alert-channels/{id}/test` 并把失败原因写回「最近结果」、
+  「补发通知」用 `{"period": ""}` 触发台账重读、台账筛选带 `status=` 且行内「重发」打到
+  `POST /admin/alert-deliveries/{id}/retry`。
   这套测试当场抓到一个真 bug：`AgentChat.vue` 的「重试」按钮读的是发送后已被清空的输入框，
   等于点了没点——修法是记住 `lastQuestion`。
 
@@ -454,7 +470,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 88.80%、分支 88.16% | **87.0% / 86.0%** | 全量 226 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 88.56%、分支 87.79% | **87.0% / 86.0%** | 全量 241 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.85% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -546,8 +562,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 226 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 41 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 241 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 44 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -571,7 +587,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 浏览器与真机验收留在本地，`PRECOMMIT_FULL=1 git commit …` 是它们的入口：
 
-- `scripts/check_pages.py`（17 页 × 1440/768/375）与 `scripts/ui_components_smoke.py`：要演示数据、
+- `scripts/check_pages.py`（18 页 × 1440/768/375）与 `scripts/ui_components_smoke.py`：要演示数据、
   要真浏览器，后者还会**真的调一次大模型**（要 API Key）。
 - `scripts/check_visual_baseline.py`：像素依赖本机字体与抗锯齿，换台机器、换个 Edge 版本整片都不一样，
   基线只在「同一台机器上前后两次运行」之间有比较意义（口径与约定见「截图基线视觉回归」一节）。
@@ -866,6 +882,7 @@ Prometheus 的基数撑爆，而被撑死的是监控不是接口。真机验证
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
 | `/admin/departments` | 部门权限（账号绑部门、各部门数据规模） | `GET /admin/departments`、`PATCH /admin/users/{id}` |
 | `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述；按部门、按期间分档） | `GET /admin/alert-rules`、`POST /admin/alert-rules`、`PUT /admin/alert-rules/id/{id}`、`DELETE /admin/alert-rules/id/{id}`、`PUT /admin/alert-rules/{alert_type}`（只改默认规则） |
+| `/admin/alert-channels` | 预警外发（Webhook / 邮件通道的增删改与**测试发送**，投递台账按状态/级别/期间/通道筛选、人工**重发**、按当前配置**补发**已有待处理预警） | `GET/POST /admin/alert-channels`、`PUT/DELETE /admin/alert-channels/{channel_id}`、`POST /admin/alert-channels/{channel_id}/test`、`GET /admin/alert-deliveries`、`POST /admin/alert-deliveries/{delivery_id}/retry`、`POST /admin/alerts/notify` |
 | `/admin/audit` | 审计日志（按动作/操作人/IP/日期范围筛选、翻页、导出 CSV、按保留期清理） | `GET /admin/audit`、`GET /admin/audit/export`、`POST /admin/audit/purge` |
 
 所有业务页面共用 `frontend/src/components/AppSidebar.vue` 侧边栏；页面统一有三态：加载（骨架屏或
@@ -1029,6 +1046,41 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   `CREATE INDEX`，否则第二次插入同样类型的分档规则会 `UniqueViolation`（`migrations.py` 的 `PLAIN_INDEXES`）。
 - 预警监控页顶部有各状态计数（`GET /api/v1/analysis/alerts/stats`）与状态筛选；统计**不跟着筛选项走**，
   否则一筛「待处理」就再也看不到自己在处理什么。
+
+### 预警外发通道（Webhook / 邮件）
+
+预警以前只能在页面上看，没人打开页面就等于没发生。现在管理员可以配外发通道（`backend/alerts_outbound.py`），
+重算/导入/更正/冲销产生的预警会自己发出去：
+
+- 两张表：`alert_channels`（名称、`kind` = `webhook`/`email`、目标 URL 或收件人、**级别门槛**
+  `min_level`、可选的**部门限定**、开关、HMAC 密钥 `secret`）与 `alert_deliveries`（投递台账）。
+  `secret` **只写不读**：接口与页面永远只回 `has_secret`，改通道时留空表示「不动密钥」、填空串才清空。
+- **去重键是内容寻址的**：`alert_key = f"{period}|{department or ''}|{alert_type}|{metric_name}"`，
+  与 `channel_id` 一起做唯一约束。因为 `calculate()` 是「先删再建」，预警行 id 每重算一次就换一批，
+  按行 id 去重等于**每重算一次就把同一件事再通知一遍**；内容寻址之后，同一条预警对同一条通道只有一张投递单。
+  台账里另存一份 payload 快照——重算会把预警行删掉，重试时不能依赖它还在。
+- 级别门槛按 `low < medium < high` 比，通道限定部门时只发该部门的预警（空 = 不限，含全公司口径那条）。
+- **失败退避重试复用后台任务**：`plan()` 建 `pending` 投递单，`schedule()` 提交一个 `alert.dispatch` 任务，
+  `jobs.py` 的 2/4/8…/60 秒封顶退避照旧，尝试上限取 `ALERT_MAX_ATTEMPTS`（默认 3）。
+  处理函数**只处理还没成功的投递单**（幂等），并且**先 `db.commit()` 落盘再抛异常**让任务退避——
+  `run_job()` 在异常时会 `rollback()`，不先提交已经发成功的那些，下一轮就会把它们重发一遍。
+- 人工「重发」的口径与 `jobs` 的不同：投递单的 `attempts` 只用来决定「还要不要再试」，
+  管理员判定通道已经修好，就应该能立刻重试，所以重发把 `attempts` 归零（`jobs.prepare_retry` 则是追加预算、保留编号）。
+- **出口安全取舍**（写在模块 docstring 里）：只允许 `http`/`https`；拒绝 URL 里带用户名口令
+  （凭据会顺手写进日志与台账）；**不跟随 3xx**（否则带签名的正文会被转发到任意主机）；超时 5 秒、
+  响应体最多读 2 KB。**刻意不封禁内网地址**——告警网关/机器人本来就住在内网，封了等于这个功能不能用于真实环境。
+  Webhook 正文是 JSON，带 `X-Finance-Event`/`X-Finance-Timestamp`/`X-Finance-Delivery`/
+  `X-Finance-Signature`（`sha256=<hmac>`，签名串是 `"{timestamp}.{body}"`，收端可据此验真）。
+- 邮件通道走 SMTP（`ALERT_SMTP_*`，587 + STARTTLS；465 隐式加密不支持）。**没配 SMTP 是配置错，
+  直接判失败、不烧重试预算**——重试三次也变不出一个 SMTP 主机，只会把退避时间浪费掉。
+- 接口：`GET/POST /api/v1/admin/alert-channels`、`PUT/DELETE /api/v1/admin/alert-channels/{channel_id}`、
+  `POST …/{channel_id}/test`（同步发一条测试，**发送失败也回 200**，看 `ok` 字段；不写台账）、
+  `GET /api/v1/admin/alert-deliveries`（台账，可按状态/级别/期间/通道筛）、
+  `POST …/{delivery_id}/retry`、`POST /api/v1/admin/alerts/notify`（把已有「待处理」预警按当前配置补发，
+  新建通道后的主入口）。页面在 `/admin/alert-channels`，含通道表与投递台账。
+- 真机验证是 `scripts/verify_alerts_outbound.py`（41 项）：起一个本地 sink（支持「一直失败」与「先失败后成功」），
+  真的建通道、真导入一个探针期间、验 4 条投递全部送达且签名 4/4 对得上、把 sink 切到失败后验退避真的重发
+  12 次（3 轮 × 4 条）且 `attempts` 停在 3、人工重发一次就成功、通道计数与审计留痕，跑完撤销探针批次并删掉临时通道。
 
 ### 审计日志
 
@@ -1314,6 +1366,13 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
   互相覆盖。`ensure_rules()` 会在首次访问时补齐默认两条（成本率 > 0.8、净利润 < 0），所以老库打开就有内容；
   阈值绝对值 ≥ 1e16 会被拒（422「阈值超出可表示范围」），级别只接受 `high|medium|low`。
   旧的 `PUT /api/v1/admin/alert-rules/{alert_type}` 仍然可用，但只匹配**默认规则**。
+- **预警外发**（`/admin/alert-channels`）：上半页是通道表（类型、目标、级别门槛、部门、启用、最近结果与
+  投递计数），行内可改、可点「测试」真发一条（`POST /admin/alert-channels/{id}/test`，**失败也回 200**，
+  页面按 `ok` 字段把原因写回「最近结果」列）；下半页是投递台账，可按状态/级别/期间/通道筛，
+  失败行有「重发」（`POST /admin/alert-deliveries/{id}/retry`，**人工重发把 `attempts` 归零**），
+  顶部「补发通知」按钮对已有待处理预警重跑一遍投递计划（`POST /admin/alerts/notify`，可选期间）。
+  密钥只在新增/修改时单向下发，列表与详情永远只回 `has_secret`；行内草稿里的密钥框**永远从空串开始**
+  = 「这次不动它」，否则每次改个部门都会把密钥覆盖成界面上那几个星号。
 - **知识库管理**：按来源聚合片段数、类型、向量模型与首段预览。删除按整份来源生效（管理员操作，
   不受部门限制）**并顺手清掉孤儿的落盘文档**（还有别的来源引用就保留，越界路径不碰，见「上传件的去留」）；
   `embedding_model` 为空或与当前模型不一致的片段本来就不参与检索，删除后可用

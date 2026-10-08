@@ -525,6 +525,14 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | PUT | `/admin/alert-rules/id/{rule_id}` | 按 id 改一条规则（默认与分档同一端点）：`{department?, period?, metric_name?, comparator?, threshold_value?, level?, require_metric?, description?, enabled?}` |
 | DELETE | `/admin/alert-rules/id/{rule_id}` | 删一条**分档**规则；默认规则 → 400 |
 | PUT | `/admin/alert-rules/{alert_type}` | 兼容入口：只改**默认规则**（全公司 · 所有期间）：`{threshold_value, level, enabled, description}` |
+| GET | `/admin/alert-channels` | 外发通道一览（含 `kinds`/`min_levels`/`levels`/`departments` 与按通道分组的投递计数 `stats`）。**任何响应都不含 `secret`**，只给 `has_secret` |
+| POST | `/admin/alert-channels` | 新建通道：`{name, kind:"webhook"\|"email", target, min_level?, department?, enabled?, secret?}`，成功 **201**；重名 **409**；webhook 地址非法（非 http/https、带用户名口令、没主机名）或收件人不像邮箱 → **422** |
+| PUT | `/admin/alert-channels/{channel_id}` | 改通道：字段都可省略（`None` = 不改，**`secret:""` = 清空密钥**）；`kind` 变了就按新类型重校 `target`；重名 **409**，不存在 **404** |
+| DELETE | `/admin/alert-channels/{channel_id}` | 删通道，**投递台账保留**（`channel_id` 置空 + 台账里存了通道名快照）；不存在 **404** |
+| POST | `/admin/alert-channels/{channel_id}/test` | 同步发一条测试通知（`event="alert.channel_test"`），**不写投递台账**：`{"ok","status","detail","duration_ms","channel"}`；**发不出去也是 200**（`ok:false` + `detail` 里是真实原因），因为「通道不通」是配置问题不是请求问题 |
+| GET | `/admin/alert-deliveries?status=&channel_id=&period=&level=&limit=&offset=` | 投递台账（倒序，返回 `data/total/limit/offset/status_labels/levels/stats`，`limit` 上限 200）；`status`/`level` 不在枚举内 → **422** |
+| POST | `/admin/alert-deliveries/{delivery_id}/retry` | 人工重发一条：放回 `pending` 并把 `attempts` 归零，随即提交 `alert.dispatch` 任务（`{"data","job","queued","deduplicated"}`）；不存在 **404** |
+| POST | `/admin/alerts/notify` | 补发：把库里**还没处理**（`review_status="pending"`）的预警按启用通道补建投递单（`{"period"?}` 可只补某一期），返回 `{"period","created","queued","job","deduplicated"}`；先落库再排队 |
 | GET | `/admin/audit?action=&actor=&target_type=&ip=&since=&until=&limit=&offset=` | 审计日志（倒序，返回 `data/total/limit/offset/actions/actors/ips/retention_days/export_limit`） |
 | GET | `/admin/audit/export?action=&actor=&target_type=&ip=&since=&until=` | 导出审计 CSV（带 BOM，Excel 可直接打开） |
 | POST | `/admin/audit/purge` | 按保留期清理审计（默认 `dry_run` 只报数，真删留痕） |
@@ -715,6 +723,26 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 - **不能改自己/删自己**（`400`）：清空或填写自己的部门会立刻把自己锁在管理入口之外，属自伤操作，
   需要自行调整时走 `PATCH /auth/me`（System 设置页的「我的部门」）。
 - **撤销批次必须重算期间**：只删明细不重算会在库里留下与明细对不上的历史指标（幽灵报表）。
+
+### 预警外发通道（Webhook / 邮件）
+
+预警先生成在库里，再由**通道**推出去。三条容易踩的设计取舍：
+
+- **去重键是内容，不是行号**：`alert_deliveries.alert_key = "期间|部门|预警类型|指标名"`，
+  与 `channel_id` 一起唯一。重算会**先删后建**预警行（行 id 每轮都变），按行 id 去重等于每重算一次
+  就把同样的通知再轰一遍。台账里还存了当时的 **payload 快照**：重试时预警行可能已经被删掉了。
+- **发不出去交给后台任务退避重试**：每次尝试 `attempts += 1`，按 `2^(n-1)` 秒退避（上限 60 秒，
+  默认 3 次预算，`ALERT_MAX_ATTEMPTS` 可调）。处理函数只发「还没成功」的单子，成功与否都先提交，
+  再抛异常让任务自己重排——所以「部分失败」不会把已经送达的重发一遍。
+- **人工重试归零 `attempts`**：与后台任务 `prepare_retry` 的「追加预算、保留编号」口径不同——
+  管理员点重发是因为「通道已经修好了」，这时候还卡着历史次数没有意义。
+
+出口侧的安全取舍（刻意为之）：只允许 `http`/`https`、**地址里不许带用户名口令**（会进日志与台账）、
+**不跟随 3xx 跳转**（否则签名正文会被转发到任意主机）、5 秒超时、最多读 2 KB 响应；
+**不封禁内网地址**——企业告警网关本来就在内网。配了 `secret` 的 webhook 会带
+`X-Finance-Signature: sha256=…`（对 `"{unix 秒}.{正文}"` 做 HMAC-SHA256，`X-Finance-Timestamp` 是同源时间戳）。
+邮件通道需要 `ALERT_SMTP_HOST` / `ALERT_MAIL_FROM`（可选 `ALERT_SMTP_STARTTLS`、`ALERT_SMTP_USER`/`_PASSWORD`），
+没配就是 `ConfigurationError`：直接判失败、**不烧重试预算**。
 
 ### 审计日志
 

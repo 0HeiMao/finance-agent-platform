@@ -66,6 +66,11 @@ const NAV_GROUPS = [
       { name: '用户管理', path: '/admin/users' },
       { name: '部门权限', path: '/admin/departments', note: '部门决定财务数据与知识库的可见范围' },
       { name: '预警规则', path: '/admin/alert-rules', note: '阈值与开关改完对下一次重算生效' },
+      {
+        name: '预警外发',
+        path: '/admin/alert-channels',
+        note: 'Webhook / 邮件通道与投递台账，发失败会退避重试'
+      },
       { name: '审计日志', path: '/admin/audit', note: '谁在什么时候改了什么，只读不可清' },
       { name: '导入批次', path: '/admin/batches' },
       { name: '知识库管理', path: '/admin/knowledge' }

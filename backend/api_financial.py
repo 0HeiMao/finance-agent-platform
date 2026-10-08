@@ -118,7 +118,13 @@ async def import_excel(request: Request, file: UploadFile = File(...),
                      detail={"filename": file.filename, "rows": len(rows), "periods": periods},
                      request=request)
         db.commit()
-        return {"success": True, "batch": batch, "imported": len(rows), "errors": errors, "calculated": calculated}
+        # 预警外发（⑭）：导入是最常见的「产生预警」路径，重算时排好的投递单在这里交给后台任务。
+        # 排在 commit 之后（任务必须读得到投递单），且排程失败不影响导入结果。
+        from backend import alerts_outbound  # noqa: PLC0415
+
+        outbound = alerts_outbound.schedule_safely(db, periods=periods, actor=user.username)
+        return {"success": True, "batch": batch, "imported": len(rows), "errors": errors,
+                "calculated": calculated, "deliveries": outbound["deliveries"]}
     except LegacyExcelError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc

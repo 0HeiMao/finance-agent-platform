@@ -3934,3 +3934,328 @@ async def test_metrics_token_and_kill_switch(anon_client, monkeypatch):
     assert (await anon_client.get("/metrics")).status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# 预警外发通道（⑭）
+# ---------------------------------------------------------------------------
+
+# 专用期间：`plan()` 扫的是全库的「待处理预警 × 启用通道」，而接口用例连的就是演示库。
+# 挑两个演示数据里没有的期间，再按自己的 channel_id 过滤，断言才不会被既有预警带跑偏。
+CHANNEL_PERIOD = "2099-12"
+HOOK_PERIOD = "2099-10"
+
+
+def _outbound_channel_payload(name: str, **overrides) -> dict:
+    payload = {"name": name, "kind": "webhook", "target": "http://127.0.0.1:9/hook",
+               "min_level": "low", "department": "", "enabled": True, "secret": ""}
+    payload.update(overrides)
+    return payload
+
+
+def _outbound_settings(**overrides) -> SimpleNamespace:
+    """假 settings：只带 `alerts_outbound` 读到的字段——少一个就是 AttributeError。"""
+    values = {"alert_webhook_timeout_seconds": 2.0, "alert_max_attempts": 3,
+              "alert_smtp_host": "", "alert_smtp_port": 587, "alert_smtp_user": "",
+              "alert_smtp_password": "", "alert_smtp_starttls": True, "alert_mail_from": ""}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _stub_webhook(monkeypatch, *, ok=True, status=200, detail=""):
+    """接口用例只验链路（建单 → 排队 → 投递 → 台账），真发 HTTP 由单测的本地 sink 负责。"""
+    from backend import alerts_outbound
+
+    calls: list[dict] = []
+
+    def fake(channel, payload, *, delivery_id=None, settings=None,
+             event=alerts_outbound.WEBHOOK_EVENT):
+        calls.append({"channel": channel.name, "metric": payload.get("metric_name"),
+                      "delivery_id": delivery_id, "event": event})
+        return ok, status, detail
+
+    monkeypatch.setattr(alerts_outbound, "send_webhook", fake)
+    return calls
+
+
+def _run_jobs_inline(db, monkeypatch):
+    """把 `jobs.SCHEDULER`（0 秒后的进程内定时器）换成「当场同步跑一遍」。
+
+    用例要断言的正是「排出去的任务跑完之后台账长什么样」；等真定时器就变成
+    「睡一会儿再看」，既慢又不稳（而且断言跑在任务前面就会随机红）。
+    """
+    from backend import jobs
+
+    timers: list[tuple[float, int]] = []
+
+    def inline(delay, job_id):
+        timers.append((delay, job_id))
+        jobs.run_job(job_id, db=db)
+
+    monkeypatch.setattr(jobs, "SCHEDULER", inline)
+    return timers
+
+
+async def _deliveries_for(client, headers, channel_id: int) -> list[dict]:
+    response = await client.get(f"/api/v1/admin/alert-deliveries?channel_id={channel_id}&limit=200",
+                                headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()["data"]
+
+
+async def test_alert_channels_crud_and_secret_is_write_only(anon_client, auth_headers, db_session):
+    """通道能建能改能删；`secret` 只写不读——响应里连字段都不给，只说「配没配」。"""
+    assert db_session is not None  # 用真库的会话夹具，接口的 commit 才落在同一事务里
+    name = f"pytest 通道 {uuid.uuid4().hex[:8]}"
+    created = await anon_client.post("/api/v1/admin/alert-channels",
+                                     json=_outbound_channel_payload(name, secret="topsecret-9f3c",
+                                                                    min_level="medium"),
+                                     headers=auth_headers)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["name"] == name and body["kind"] == "webhook"
+    assert body["kind_label"] == "Webhook（HTTP POST）"
+    assert body["min_level"] == "medium" and body["min_level_label"] == "中及以上"
+    assert body["enabled"] is True and body["has_secret"] is True
+    assert "secret" not in body and "topsecret-9f3c" not in created.text
+    channel_id = body["id"]
+
+    # 重名 409：两条同名通道在页面上根本分不清
+    duplicate = await anon_client.post("/api/v1/admin/alert-channels",
+                                       json=_outbound_channel_payload(name), headers=auth_headers)
+    assert duplicate.status_code == 409 and "已经有一条叫" in duplicate.json()["detail"]
+
+    # 坏地址/坏级别/坏类型当场挡下：留着它们只会等到第一次真发的时候才炸
+    for index, bad in enumerate(({"target": "ftp://example.com/hook"},
+                                 {"target": "http://robot:pw@example.com/hook"},
+                                 {"min_level": "urgent"}, {"kind": "sms"})):
+        response = await anon_client.post("/api/v1/admin/alert-channels",
+                                          json=_outbound_channel_payload(f"{name}-坏{index}", **bad),
+                                          headers=auth_headers)
+        assert response.status_code == 422, (bad, response.text)
+
+    # 邮件通道只做形状校验，并且顺手规范化（多一个空格就会让 SMTP 报 501）
+    email_channel = await anon_client.post(
+        "/api/v1/admin/alert-channels",
+        json=_outbound_channel_payload(f"{name}-邮件", kind="email",
+                                       target=" fin@example.com , ops@example.com "),
+        headers=auth_headers)
+    assert email_channel.status_code == 201, email_channel.text
+    assert email_channel.json()["target"] == "fin@example.com, ops@example.com"
+
+    listing = await anon_client.get("/api/v1/admin/alert-channels", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    payload = listing.json()
+    item = next(row for row in payload["data"] if row["id"] == channel_id)
+    # 新建时台账是空的（新建**不**自动补发旧预警）
+    assert item["counts"] == {"pending": 0, "sent": 0, "failed": 0}
+    assert set(payload["kinds"]) == {"webhook", "email"} and "medium" in payload["min_levels"]
+    assert "high" in payload["levels"]
+
+    # 只传要改的字段：secret 不动（None = 不改），空串 = 清掉密钥
+    updated = await anon_client.put(f"/api/v1/admin/alert-channels/{channel_id}",
+                                    json={"min_level": "high", "enabled": False}, headers=auth_headers)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["min_level"] == "high" and updated.json()["enabled"] is False
+    assert updated.json()["has_secret"] is True
+    cleared = await anon_client.put(f"/api/v1/admin/alert-channels/{channel_id}",
+                                    json={"secret": ""}, headers=auth_headers)
+    assert cleared.json()["has_secret"] is False
+    assert (await anon_client.put("/api/v1/admin/alert-channels/99999999",
+                                  json={"enabled": False}, headers=auth_headers)).status_code == 404
+
+    rows = (await _audit(anon_client, auth_headers, action="alert_channel.create"))["data"]
+    entry = _find(rows, "alert_channel.create", channel_id)
+    assert entry is not None and entry["detail"]["name"] == name
+    assert "topsecret-9f3c" not in json.dumps(entry["detail"], ensure_ascii=False)
+
+    deleted = await anon_client.delete(f"/api/v1/admin/alert-channels/{channel_id}",
+                                       headers=auth_headers)
+    assert deleted.status_code == 200 and deleted.json()["deleted"] is True
+    assert (await anon_client.delete(f"/api/v1/admin/alert-channels/{channel_id}",
+                                     headers=auth_headers)).status_code == 404
+
+
+async def test_alert_channel_test_endpoint_reports_failure_and_skips_the_ledger(
+        anon_client, auth_headers, db_session, monkeypatch):
+    """测试发送的成功/失败原样回给页面；它**不进投递台账**——它不是某条预警的投递。"""
+    from sqlalchemy import func, select
+
+    from backend.models import AlertDelivery
+
+    name = f"pytest 通道测试 {uuid.uuid4().hex[:8]}"
+    created = await anon_client.post("/api/v1/admin/alert-channels",
+                                     json=_outbound_channel_payload(name), headers=auth_headers)
+    channel_id = created.json()["id"]
+
+    calls = _stub_webhook(monkeypatch, ok=False, status=500, detail="HTTP 500：boom")
+    failed = await anon_client.post(f"/api/v1/admin/alert-channels/{channel_id}/test",
+                                    headers=auth_headers)
+    assert failed.status_code == 200, failed.text
+    body = failed.json()
+    assert body["ok"] is False and body["status"] == 500 and "boom" in body["detail"]
+    assert body["channel"]["last_result"] == "failed"
+    assert body["channel"]["last_error"] == "HTTP 500：boom"
+    assert calls and calls[0]["event"] == "alert.channel_test" and calls[0]["channel"] == name
+    # 测试通知不落台账：混进去的话「待发送 N 条」里会多出一条并不存在的预警
+    assert db_session.scalar(select(func.count()).select_from(AlertDelivery)
+                             .where(AlertDelivery.channel_id == channel_id)) == 0
+
+    _stub_webhook(monkeypatch, ok=True, status=200, detail="")
+    ok = await anon_client.post(f"/api/v1/admin/alert-channels/{channel_id}/test",
+                                headers=auth_headers)
+    assert ok.json()["ok"] is True
+    assert ok.json()["channel"]["last_result"] == "ok"
+    assert ok.json()["channel"]["last_sent_at"] is not None
+
+    entry = _find((await _audit(anon_client, auth_headers, action="alert_channel.test"))["data"],
+                  "alert_channel.test", channel_id)
+    assert entry is not None and entry["detail"]["kind"] == "webhook"
+    assert "ok" in entry["detail"]
+
+
+async def test_notify_dedups_by_content_and_manual_retry_resets_attempts(
+        anon_client, auth_headers, db_session, monkeypatch):
+    """⑭ 主链路：补发建单 → 按内容去重 → 失败留台账（不自动重轰）→ 人工重试归零后当场成功。"""
+    from backend import alerts_outbound
+    from backend.models import FinancialAlert
+
+    timers = _run_jobs_inline(db_session, monkeypatch)
+    # 预算 1：第一次就判失败，任务整体算成功，链路才好接着往下走（见下面的注释）
+    monkeypatch.setattr(alerts_outbound, "get_settings",
+                        lambda: _outbound_settings(alert_max_attempts=1))
+
+    name = f"pytest 通道台账 {uuid.uuid4().hex[:8]}"
+    created = await anon_client.post("/api/v1/admin/alert-channels",
+                                     json=_outbound_channel_payload(name), headers=auth_headers)
+    channel_id = created.json()["id"]
+
+    db_session.add_all([
+        FinancialAlert(period=CHANNEL_PERIOD, department=None, alert_type="成本率异常",
+                       description="pytest 外发种子", level="high", metric_name="cost_ratio",
+                       current_value=Decimal("0.900000"), threshold_value=Decimal("0.800000"),
+                       review_status="pending"),
+        # 已处理的不补发：否则新建通道点一下就把人工已经判过的预警又轰一遍
+        FinancialAlert(period=CHANNEL_PERIOD, department=None, alert_type="已处理的历史预警",
+                       description="pytest 不该外发", level="high", metric_name="settled_ratio",
+                       current_value=Decimal("0.900000"), threshold_value=Decimal("0.800000"),
+                       review_status="resolved"),
+    ])
+    db_session.flush()
+
+    failing = _stub_webhook(monkeypatch, ok=False, status=503, detail="HTTP 503：网关维护")
+    first = await anon_client.post("/api/v1/admin/alerts/notify", json={"period": CHANNEL_PERIOD},
+                                   headers=auth_headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] == 1 and first.json()["queued"] == 1
+    assert first.json()["job"] and timers and timers[-1][0] == 0.0  # 0 秒后立刻发，不阻塞响应
+
+    rows = await _deliveries_for(anon_client, auth_headers, channel_id)
+    assert len(rows) == 1
+    delivery = rows[0]
+    assert delivery["alert_type"] == "成本率异常" and delivery["level_label"] == "高"
+    assert delivery["status"] == "failed" and delivery["status_label"] == "已失败"
+    assert delivery["attempts"] == 1 and "503" in delivery["last_error"]
+    assert delivery["channel_name"] == name and delivery["alert_id"] is not None
+    assert len(failing) == 1
+
+    # 再点一次补发：内容级去重不再建单；已判失败的也不会被自动重排（失败就该让人看一眼）
+    second = await anon_client.post("/api/v1/admin/alerts/notify", json={"period": CHANNEL_PERIOD},
+                                    headers=auth_headers)
+    assert second.json()["created"] == 0 and second.json()["queued"] == 0
+    assert len(await _deliveries_for(anon_client, auth_headers, channel_id)) == 1
+
+    # 台账筛选与取值
+    listed = await anon_client.get(
+        f"/api/v1/admin/alert-deliveries?channel_id={channel_id}&period={CHANNEL_PERIOD}"
+        f"&status=failed&level=high", headers=auth_headers)
+    assert listed.status_code == 200 and listed.json()["total"] == 1
+    assert listed.json()["status_labels"]["failed"] == "已失败"
+    assert listed.json()["stats"]["failed"] >= 1
+    for bad_query in ("status=nonsense", "level=urgent"):
+        assert (await anon_client.get(f"/api/v1/admin/alert-deliveries?{bad_query}",
+                                      headers=auth_headers)).status_code == 422
+
+    # 通道修好 → 人工重试：attempts 归零，当场发成功
+    _stub_webhook(monkeypatch, ok=True, status=200, detail="")
+    retried = await anon_client.post(f"/api/v1/admin/alert-deliveries/{delivery['id']}/retry",
+                                     headers=auth_headers)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["queued"] == 1 and retried.json()["deduplicated"] is False
+    assert retried.json()["data"]["status"] == "sent" and retried.json()["data"]["status_label"] == "已送达"
+    assert retried.json()["data"]["attempts"] == 1
+    assert retried.json()["data"]["response_status"] == 200
+    assert (await anon_client.post("/api/v1/admin/alert-deliveries/99999999/retry",
+                                   headers=auth_headers)).status_code == 404
+
+    # 留痕：补发点了两次，两次都要有记录（第一次建了 1 条，第二次一条都没建）
+    notify_log = (await _audit(anon_client, auth_headers, action="alert.notify"))["data"]
+    notify_entries = [row for row in notify_log if row["target_id"] == CHANNEL_PERIOD]
+    assert {row["detail"]["created"] for row in notify_entries} == {1, 0}
+    retry_entry = _find((await _audit(anon_client, auth_headers, action="alert_delivery.retry"))["data"],
+                        "alert_delivery.retry", delivery["id"])
+    assert retry_entry is not None and retry_entry["detail"]["channel"] == name
+
+    # 通道上的计数跟着台账走，管理页一眼能看出「这条通道发出去过几条」
+    listing = await anon_client.get("/api/v1/admin/alert-channels", headers=auth_headers)
+    item = next(row for row in listing.json()["data"] if row["id"] == channel_id)
+    assert item["counts"] == {"pending": 0, "sent": 1, "failed": 0}
+
+
+async def test_calculate_and_import_queue_outbound_deliveries(anon_client, auth_headers, db_session,
+                                                             tmp_path, monkeypatch):
+    """⑭ 钩子：重算与导入之后要把新预警排进外发队列，并把排出去的条数回给调用方。"""
+    from backend import jobs
+
+    timers: list[tuple[float, int]] = []
+    monkeypatch.setattr(jobs, "SCHEDULER", lambda delay, job_id: timers.append((delay, job_id)))
+
+    name = f"pytest 通道钩子 {uuid.uuid4().hex[:8]}"
+    created = await anon_client.post("/api/v1/admin/alert-channels",
+                                     json=_outbound_channel_payload(name), headers=auth_headers)
+    channel_id = created.json()["id"]
+
+    # 重算：净利润为负 → 生成预警 → 与重算同事务建投递单，提交之后立刻排队
+    _seed_transactions(db_session, HOOK_PERIOD, [("100", "0", "150")])
+    calculated = await anon_client.post(f"/api/v1/analysis/calculate?period={HOOK_PERIOD}",
+                                        headers=auth_headers)
+    assert calculated.status_code == 200, calculated.text
+    assert calculated.json()["alerts"] >= 1
+    assert calculated.json()["deliveries"] >= 1 and calculated.json()["dispatch_job"]
+    assert timers and timers[-1][0] == 0.0
+
+    rows = await _deliveries_for(anon_client, auth_headers, channel_id)
+    assert rows and {row["period"] for row in rows} == {HOOK_PERIOD}
+    assert {row["status"] for row in rows} == {"pending"}
+
+    # 导入：也是提交之后排程，返回体里同样给出「排了多少条」
+    monkeypatch.setattr("backend.api_financial.get_settings",
+                        lambda: SimpleNamespace(upload_dir=str(tmp_path)))
+    csv = _csv_bytes("2099-10-01,6001,导入行,部门-097,ok,100.005,90,20,0,0")
+    imported = await anon_client.post("/api/v1/financial/import", headers=auth_headers,
+                                      files={"file": ("import.csv", io.BytesIO(csv), "text/csv")})
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["deliveries"] >= 1
+    assert timers[-1][0] == 0.0
+    assert [row for row in await _deliveries_for(anon_client, auth_headers, channel_id)
+            if row["period"] == HOOK_PERIOD]
+
+
+async def test_alert_channel_endpoints_require_admin(anon_client, api_app):
+    """通道能往任意地址 POST（含内网）、台账里有业务信息：只给管理员。"""
+    for method, path in (("get", "/api/v1/admin/alert-channels"),
+                         ("post", "/api/v1/admin/alert-channels"),
+                         ("get", "/api/v1/admin/alert-deliveries"),
+                         ("post", "/api/v1/admin/alerts/notify")):
+        call = getattr(anon_client, method)
+        response = await (call(path, json={}) if method == "post" else call(path))
+        assert response.status_code == 401, (method, path, response.status_code)
+
+    headers, client = await _scoped_headers(anon_client, api_app, "部门A")
+    try:
+        denied = await client.get("/api/v1/admin/alert-channels", headers=headers)
+        assert denied.status_code == 403 and "需要管理员权限" in denied.json()["detail"]
+        assert (await client.post("/api/v1/admin/alerts/notify", json={},
+                                  headers=headers)).status_code == 403
+    finally:
+        await client.aclose()
+
+

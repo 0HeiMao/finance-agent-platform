@@ -1,6 +1,166 @@
 {
   "components": {
     "schemas": {
+      "AlertChannelCreate": {
+        "description": "新建一条外发通道。\n\n`secret` 是 webhook 的 HMAC-SHA256 密钥：**只写不读**，任何响应都不会把它回显出来，\n只告诉调用方「配了没有」——密钥一旦能被读回来，界面上别人截一张图就等于泄露了。",
+        "properties": {
+          "department": {
+            "default": "",
+            "description": "空 = 不限部门（含全公司口径）",
+            "maxLength": 100,
+            "title": "Department",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "kind": {
+            "default": "webhook",
+            "pattern": "^(webhook|email)$",
+            "title": "Kind",
+            "type": "string"
+          },
+          "min_level": {
+            "default": "low",
+            "description": "只外发该级别及以上的预警",
+            "pattern": "^(high|medium|low)$",
+            "title": "Min Level",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "secret": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Secret",
+            "type": "string"
+          },
+          "target": {
+            "description": "webhook=接收地址 URL；email=逗号分隔的收件人",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "target"
+        ],
+        "title": "AlertChannelCreate",
+        "type": "object"
+      },
+      "AlertChannelUpdate": {
+        "description": "改一条通道：`None` = 不改该项；`department` / `secret` 给空串 = 清空。\n\n这里不用「空串即不改」：密钥本来就是可有可无的，管理员需要一条明确的「把密钥删掉」的路径。",
+        "properties": {
+          "department": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Department"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "pattern": "^(webhook|email)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "min_level": {
+            "anyOf": [
+              {
+                "pattern": "^(high|medium|low)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Level"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          }
+        },
+        "title": "AlertChannelUpdate",
+        "type": "object"
+      },
+      "AlertNotifyRequest": {
+        "description": "补发：把「待处理」的预警按当前通道配置补成投递单。period 留空 = 所有期间。",
+        "properties": {
+          "period": {
+            "default": "",
+            "pattern": "^$|^\\d{4}-(0[1-9]|1[0-2])$",
+            "title": "Period",
+            "type": "string"
+          }
+        },
+        "title": "AlertNotifyRequest",
+        "type": "object"
+      },
       "AlertRuleCreate": {
         "description": "新建一条**分档**规则：按部门、按期间，或两者同时限定。\n\n必须至少限定一个维度。全公司全期间的那条每个 `alert_type` 只该有一条（默认规则），\n再建一条 scope 全空的规则会和它抢同一个类型，谁生效只看 id 大小，用户没法解释。",
         "properties": {
@@ -1084,6 +1244,390 @@
         "summary": "Health"
       }
     },
+    "/api/v1/admin/alert-channels": {
+      "get": {
+        "description": "外发通道一览 + 每条通道的投递台账计数（待发送/已送达/已失败）。",
+        "operationId": "list_alert_channels_api_v1_admin_alert_channels_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "List Alert Channels",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "新建一条外发通道。**新建不会自动补发旧预警**——补发要显式点 `POST /admin/alerts/notify`，\n否则「加了个通道」这一个动作会静默地把历史预警一股脑轰出去。",
+        "operationId": "create_alert_channel_api_v1_admin_alert_channels_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertChannelCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Create Alert Channel",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/alert-channels/{channel_id}": {
+      "delete": {
+        "description": "删一条通道。**已有的投递台账不删**（历史记录留痕），只是 `channel_id` 变成空——\n所以台账里另外存了通道名快照，删完之后那些记录仍然能看出「当年发给了谁」。",
+        "operationId": "delete_alert_channel_api_v1_admin_alert_channels__channel_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Delete Alert Channel",
+        "tags": [
+          "admin"
+        ]
+      },
+      "put": {
+        "description": "改一条通道。改完**立即对下一次外发生效**（发送时现读通道，不缓存）。\n\n改了 `kind` 会按新类型重校 `target`：webhook 的地址和邮件地址不是一回事，\n留着旧值只会在第一次投递时才炸。",
+        "operationId": "update_alert_channel_api_v1_admin_alert_channels__channel_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertChannelUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Update Alert Channel",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/alert-channels/{channel_id}/test": {
+      "post": {
+        "description": "同步发一条**测试通知**（不进投递台账：它不是某条预警的投递，混进台账会让\n「待发送 N 条」永远对不上真实预警数）。配置错在这里就能看见原因。",
+        "operationId": "test_alert_channel_api_v1_admin_alert_channels__channel_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Test Alert Channel",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/alert-deliveries": {
+      "get": {
+        "description": "投递台账：每一条「某条预警 × 某个通道」的发送记录与它的失败原因。",
+        "operationId": "list_alert_deliveries_api_v1_admin_alert_deliveries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Period"
+            }
+          },
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Level"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "List Alert Deliveries",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/alert-deliveries/{delivery_id}/retry": {
+      "post": {
+        "description": "人工重试一条失败的投递。会把 `attempts` 归零再排队：\n投递单的重试次数只用来决定「这一轮还要不要再试」，管理员判断通道已经修好了，\n就不该被上一次失败留下的次数挡住（与任务表保留尝试编号的口径不同）。",
+        "operationId": "retry_alert_delivery_api_v1_admin_alert_deliveries__delivery_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "delivery_id",
+            "required": true,
+            "schema": {
+              "title": "Delivery Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Retry Alert Delivery",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/v1/admin/alert-rules": {
       "get": {
         "description": "预警规则一览。`ensure_rules` 会顺手补齐默认两条，所以老库第一次访问就能看到内容。",
@@ -1303,6 +1847,51 @@
           }
         ],
         "summary": "Update Alert Rule",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/alerts/notify": {
+      "post": {
+        "description": "补发：把**待处理**的预警按当前通道配置补成投递单，并把所有待发送的投递排进队列。\n\n新建/修好通道之后点这一下。可以反复点：已存在的「预警 × 通道」组合不会再建一条\n（去重键是内容而不是行 id，见 alerts_outbound.alert_key），排队中的也不会重复排\n（`jobs` 按 payload 去重）。",
+        "operationId": "notify_alerts_api_v1_admin_alerts_notify_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertNotifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Notify Alerts",
         "tags": [
           "admin"
         ]

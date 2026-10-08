@@ -39,7 +39,7 @@ EDGE_CANDIDATES = (
 DEFAULT_PAGES = ("/dashboard", "/analysis/revenue", "/analysis/cost", "/analysis/alerts", "/reports",
                  "/reports/pptx", "/settings", "/financial/import", "/financial/transactions", "/agent",
                  "/admin", "/admin/users", "/admin/batches", "/admin/knowledge", "/admin/departments",
-                 "/admin/alert-rules", "/admin/audit")
+                 "/admin/alert-rules", "/admin/alert-channels", "/admin/audit")
 # 表格在窄屏本来就要横向滚动，它自己带 .table-wrap 容器，不算页面溢出。
 IGNORED_OFFENDER_CLASS = "table-wrap"
 

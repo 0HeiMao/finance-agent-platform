@@ -167,6 +167,12 @@ def calculate(db: Session, period: str, commit: bool = True):
     # 必须先 flush：SessionLocal 是 autoflush=False，刚 db.add 的指标行还只在内存里，
     # 落库那边读库会漏掉这个月（用例 test_calculate_refreshes_quarter_rollup... 抓到的）。
     db.flush()
+    # 预警外发（⑭）：把这一期待处理的预警排成投递单，跟着重算事务一起落盘（**不提交**）——
+    # 重算失败回滚时不该留下"等着要发的通知"。真正发送在端点 commit 之后（见 alerts_outbound.schedule）。
+    # 函数内导入：alerts_outbound → jobs → batch_ops → transactions → api_analysis 是环。
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    alerts_outbound.plan(db, period=period)
     rollups.refresh_for_months(db, [period])
     if commit: db.commit()
     else: db.flush()
@@ -181,7 +187,12 @@ def calculate_metrics(request: Request, period: str = Query(..., pattern=r"^\d{4
     audit.record(db, user, "metrics.calculate", target_type="period", target_id=period,
                  detail={"period": period, "alerts": len(alerts)}, request=request)
     db.commit()
-    return {"period": period, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "expense_amount": float(metric.expense_amount), "gross_profit_amount": float(metric.gross_profit_amount), "net_profit_amount": float(metric.net_profit_amount), "gross_profit_ratio": float(metric.gross_profit_ratio), "net_profit_ratio": float(metric.net_profit_ratio), "alerts": len(alerts)}
+    # 外发排在 commit 之后：投递单必须先真的落库，后台任务才读得到（否则先发后提交，
+    # 任务跑在一个「还看不见投递单」的快照上，什么都不会发）。
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    outbound = alerts_outbound.schedule(db, periods=[period], actor=user.username)
+    return {"period": period, "revenue_amount": float(metric.revenue_amount), "cost_amount": float(metric.cost_amount), "expense_amount": float(metric.expense_amount), "gross_profit_amount": float(metric.gross_profit_amount), "net_profit_amount": float(metric.net_profit_amount), "gross_profit_ratio": float(metric.gross_profit_ratio), "net_profit_ratio": float(metric.net_profit_ratio), "alerts": len(alerts), "deliveries": outbound["deliveries"], "dispatch_job": (outbound["job"] or {}).get("id")}
 
 @router.get("/alerts")
 def alerts(period: str, department: str | None = Query(None, max_length=100), db: Session = Depends(get_db), user: User = Depends(current_user)):

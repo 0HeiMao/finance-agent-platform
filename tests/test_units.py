@@ -1400,4 +1400,380 @@ def test_configure_logging_keeps_foreign_handlers():
         root.setLevel(level_before)
 
 
+# ---------------------------------------------------------- 预警外发通道（⑭）
+# 专用期间：`plan()` 会扫全库的待处理预警 × 启用通道，而单测连的就是演示库。
+# 用 2099-11（只有本节的用例会造）再加「按自己的 channel_id 过滤」，
+# 断言就不会被演示库里的既有预警、也不会被别的用例建的通道带跑偏。
+
+
+def _outbound_alert(**overrides):
+    """造一条待发预警：只填 `alerts_outbound` 真正读到的字段。"""
+    from backend.models import FinancialAlert
+
+    values = {
+        "period": "2099-11",
+        "department": None,
+        "alert_type": "成本率异常",
+        "description": "成本占收入比超过阈值",
+        "level": "high",
+        "metric_name": "cost_ratio",
+        "current_value": Decimal("0.912300"),
+        "threshold_value": Decimal("0.800000"),
+        "review_status": "pending",
+    }
+    values.update(overrides)
+    return FinancialAlert(**values)
+
+
+def _outbound_channel(**overrides):
+    from backend.models import AlertChannel
+
+    values = {
+        "name": "单测通道",
+        "kind": "webhook",
+        # 9 号端口按惯例没人监听：连不上是立刻的，用例不用等超时
+        "target": "http://127.0.0.1:9/hook",
+        "min_level": "low",
+        "department": None,
+        "enabled": True,
+        "secret": None,
+    }
+    values.update(overrides)
+    return AlertChannel(**values)
+
+
+def _outbound_settings(**overrides):
+    """假 settings：只带 `alerts_outbound` 读到的字段——少一个就是 AttributeError。"""
+    values = {
+        "alert_webhook_timeout_seconds": 2.0,
+        "alert_max_attempts": 3,
+        "alert_smtp_host": "",
+        "alert_smtp_port": 587,
+        "alert_smtp_user": "",
+        "alert_smtp_password": "",
+        "alert_smtp_starttls": True,
+        "alert_mail_from": "",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class _WebhookSink:
+    """极简 webhook 接收端：记下收到的请求，按 `mode` 决定回什么。
+
+    用真 socket 而不是给 urllib 打桩：签名头、正文编码、「3xx 不跟随」这三件事
+    只有真发一次才验得到，打桩会把 `_NoRedirect` 一起绕过去。
+    """
+
+    received: list[dict] = []
+    mode = "ok"
+
+    @classmethod
+    def reset(cls, mode="ok"):
+        cls.received = []
+        cls.mode = mode
+
+
+def _start_sink():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802 —— http.server 的命名约定
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length)
+            _WebhookSink.received.append(
+                {"path": self.path, "headers": dict(self.headers), "body": body})
+            status, payload = {"ok": (200, b'{"received":true}'),
+                               "redirect": (302, b""),
+                               "error": (500, b"boom")}[_WebhookSink.mode]
+            self.send_response(status)
+            if status == 302:
+                self.send_header("Location", "http://127.0.0.1:9/elsewhere")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):  # 别把 sink 的访问日志混进 pytest 输出
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_alert_key_is_content_based_so_recalculate_does_not_resend():
+    """重算是先删后建、行 id 每轮都换：去重键只能用内容，用 id 等于每重算一次再轰一遍。"""
+    from backend import alerts_outbound
+
+    same = alerts_outbound.alert_key("2099-11", None, "成本率异常", "cost_ratio")
+    assert same == alerts_outbound.alert_key("2099-11", "", "成本率异常", "cost_ratio")
+    assert same == alerts_outbound.alert_key("2099-11", "   ", "成本率异常", "cost_ratio")
+    assert same != alerts_outbound.alert_key("2099-12", None, "成本率异常", "cost_ratio")
+    assert same != alerts_outbound.alert_key("2099-11", "销售部", "成本率异常", "cost_ratio")
+    assert same != alerts_outbound.alert_key("2099-11", None, "利润异常", "cost_ratio")
+    assert same != alerts_outbound.alert_key("2099-11", None, "成本率异常", "cost_amount")
+    assert "2099-11" in same and "成本率异常" in same
+    # 超长内容要截断：这一列是 300，插不进去会让整笔重算事务回滚
+    assert len(alerts_outbound.alert_key("2099-11", "部" * 200, "类型" * 200, "指标" * 200)) == 300
+
+
+def test_channel_matching_uses_level_switch_and_department_scope():
+    from backend import alerts_outbound
+
+    assert alerts_outbound.matches(_outbound_channel(min_level="medium"), _outbound_alert(level="high"))
+    assert alerts_outbound.matches(_outbound_channel(min_level="medium"), _outbound_alert(level="medium"))
+    assert not alerts_outbound.matches(_outbound_channel(min_level="medium"), _outbound_alert(level="low"))
+    assert not alerts_outbound.matches(_outbound_channel(min_level="high"), _outbound_alert(level="medium"))
+    assert not alerts_outbound.matches(_outbound_channel(enabled=False), _outbound_alert())
+
+    scoped = _outbound_channel(department="销售部")
+    assert alerts_outbound.matches(scoped, _outbound_alert(department="销售部"))
+    assert not alerts_outbound.matches(scoped, _outbound_alert(department="行政部"))
+    # 限定部门的通道不接全公司口径，否则「只关心销售部」的机器人会被公司级预警刷屏
+    assert not alerts_outbound.matches(scoped, _outbound_alert(department=None))
+    # 不限部门的通道两边都收
+    assert alerts_outbound.matches(_outbound_channel(), _outbound_alert(department="销售部"))
+
+
+def test_webhook_target_allows_lan_addresses_but_rejects_credentials():
+    """刻意不封内网：告警目标本来就是内网机器人；但 URL 里的用户名口令会被写进台账与日志。"""
+    from backend import alerts_outbound
+
+    check = alerts_outbound.check_webhook_target
+    assert check("  http://127.0.0.1:8060/hook  ") == "http://127.0.0.1:8060/hook"
+    assert check("https://alert-gw.internal:8443/x") == "https://alert-gw.internal:8443/x"
+    for bad in ("", "   ", "ftp://example.com/hook", "alert.example.com/hook",
+                "http://robot:secret@example.com/hook", "http:///hook"):
+        with pytest.raises(alerts_outbound.ConfigurationError):
+            check(bad)
+
+
+def test_webhook_signature_is_hmac_of_timestamp_and_body():
+    import hashlib
+    import hmac
+
+    from backend import alerts_outbound
+
+    body = b'{"event":"alert.created"}'
+    expected = "sha256=" + hmac.new(b"topsecret", b"1700000000." + body, hashlib.sha256).hexdigest()
+    assert alerts_outbound.sign("topsecret", "1700000000", body) == expected
+    # 密钥与时间戳都在签名里：换任何一个都验不过，重放旧时间戳也验不过
+    assert alerts_outbound.sign("other", "1700000000", body) != expected
+    assert alerts_outbound.sign("topsecret", "1700000001", body) != expected
+
+
+def test_webhook_send_signs_envelope_and_refuses_redirects():
+    from backend import alerts_outbound
+
+    server, base = _start_sink()
+    try:
+        _WebhookSink.reset("ok")
+        channel = _outbound_channel(target=f"{base}/hook?token=abc", secret="topsecret")
+        payload = alerts_outbound.snapshot(_outbound_alert())
+        settings = _outbound_settings()
+
+        ok, status, detail = alerts_outbound.send_webhook(
+            channel, payload, delivery_id=17, settings=settings)
+        assert (ok, status) == (True, 200)
+        sent = _WebhookSink.received[-1]
+        assert sent["path"] == "/hook?token=abc"
+        assert sent["headers"]["X-Finance-Event"] == alerts_outbound.WEBHOOK_EVENT
+        assert sent["headers"]["X-Finance-Delivery"] == "17"
+        # 签名覆盖「时间戳.正文」：拿收到的头和正文重算必须一模一样
+        assert sent["headers"]["X-Finance-Signature"] == alerts_outbound.sign(
+            "topsecret", sent["headers"]["X-Finance-Timestamp"], sent["body"])
+        body = json.loads(sent["body"].decode("utf-8"))
+        assert body["event"] == alerts_outbound.WEBHOOK_EVENT
+        assert body["delivery_id"] == 17
+        assert body["alert"]["metric_name"] == "cost_ratio"
+        assert body["alert"]["current_value"] == "0.912300"
+        assert body["alert"]["level_label"] == "高"
+
+        # 没配密钥就不带签名头：运维照着「有头就是配了密钥」排查，不能骗人
+        alerts_outbound.send_webhook(_outbound_channel(target=f"{base}/hook"), payload, settings=settings)
+        assert "X-Finance-Signature" not in _WebhookSink.received[-1]["headers"]
+        assert "X-Finance-Delivery" not in _WebhookSink.received[-1]["headers"]
+
+        # 3xx 不跟随：带签名的正文被转发到别的主机，等于把签名送出去
+        _WebhookSink.reset("redirect")
+        ok, status, detail = alerts_outbound.send_webhook(channel, payload, settings=settings)
+        assert ok is False and status == 302 and "302" in detail
+
+        # 5xx 是可重试的失败，但服务端的说明要带回来，否则台账里只剩一句「失败」
+        _WebhookSink.reset("error")
+        ok, status, detail = alerts_outbound.send_webhook(channel, payload, settings=settings)
+        assert ok is False and status == 500 and "boom" in detail
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_email_channel_reports_missing_smtp_configuration():
+    """没配 SMTP / 发件人时要当场说清缺什么，而不是糊一个 SMTPException 出去。"""
+    from backend import alerts_outbound
+
+    channel = _outbound_channel(kind="email", target="fin@example.com")
+    payload = alerts_outbound.snapshot(_outbound_alert())
+
+    with pytest.raises(alerts_outbound.ConfigurationError) as no_host:
+        alerts_outbound.send_email(channel, payload, settings=_outbound_settings())
+    assert "ALERT_SMTP_HOST" in str(no_host.value)
+
+    with pytest.raises(alerts_outbound.ConfigurationError) as no_sender:
+        alerts_outbound.send_email(channel, payload,
+                                   settings=_outbound_settings(alert_smtp_host="smtp.example.com"))
+    assert "ALERT_MAIL_FROM" in str(no_sender.value)
+
+    # 发件人配了、收件人是空的：同样是配置问题（通道建的时候校验过，这里防手改数据库）
+    with pytest.raises(alerts_outbound.ConfigurationError) as no_rcpt:
+        alerts_outbound.send_email(_outbound_channel(kind="email", target=""),
+                                   payload, settings=_outbound_settings(
+                                       alert_smtp_host="smtp.example.com", alert_mail_from="ops@example.com"))
+    assert "收件人" in str(no_rcpt.value)
+
+
+def test_delivery_budget_and_channel_state(db_session):
+    """失败要按预算重试，但「通道停了 / 通道没了」是当场判死——重试多少次都一样。"""
+    from sqlalchemy import select
+
+    from backend import alerts_outbound
+    from backend.models import AlertDelivery
+
+    channel = _outbound_channel(name="单测通道-预算")
+    alert = _outbound_alert()
+    db_session.add_all([channel, alert])
+    db_session.flush()
+
+    assert alerts_outbound.plan(db_session, period="2099-11") >= 1
+    rows = db_session.scalars(
+        select(AlertDelivery).where(AlertDelivery.channel_id == channel.id)).all()
+    assert len(rows) == 1
+    delivery, = rows
+    assert delivery.status == "pending" and delivery.attempts == 0
+    assert delivery.channel_name == "单测通道-预算"
+    assert delivery.channel_kind == "webhook"
+    assert delivery.alert_key == alerts_outbound.alert_key("2099-11", None, "成本率异常", "cost_ratio")
+    assert delivery.payload["metric_name"] == "cost_ratio"
+    # 重算会反复调 plan：同一份内容 + 同一个通道只能有一张单
+    assert alerts_outbound.plan(db_session, period="2099-11") == 0
+
+    settings = _outbound_settings(alert_max_attempts=2)
+    assert alerts_outbound.deliver(db_session, delivery, settings=settings) == "pending"
+    assert delivery.attempts == 1 and delivery.status == "pending"
+    assert "连接失败" in (delivery.last_error or "")
+    assert alerts_outbound.deliver(db_session, delivery, settings=settings) == "failed"
+    assert delivery.attempts == 2 and delivery.status == "failed"
+
+    # 停用：不发，也不留着重试
+    channel.enabled = False
+    delivery.status = "pending"
+    assert alerts_outbound.deliver(db_session, delivery, settings=settings) == "failed"
+    assert delivery.last_error == "通道已停用"
+
+    # 通道被删（外键置空）：台账还在，但没地方可发
+    delivery.channel_id = None
+    delivery.status = "pending"
+    assert alerts_outbound.deliver(db_session, delivery, settings=settings) == "failed"
+    assert delivery.last_error == "通道已被删除，无法投递"
+
+
+def test_plan_skips_settled_alerts_and_channels_below_the_level(db_session):
+    """只有「待处理」的预警才外发：已处理/已误报的不该在通道建好之后被补发一遍。"""
+    from sqlalchemy import func, select
+
+    from backend import alerts_outbound
+    from backend.models import AlertDelivery
+
+    channel = _outbound_channel(name="单测通道-状态")
+    quiet = _outbound_channel(name="单测通道-只看高级", min_level="high")
+    db_session.add_all([channel, quiet])
+    db_session.add_all([
+        _outbound_alert(alert_type="已处理", metric_name="settled_ratio", review_status="resolved"),
+        _outbound_alert(alert_type="误报", metric_name="false_ratio", review_status="false_positive"),
+        _outbound_alert(alert_type="待处理", metric_name="open_ratio", level="low"),
+    ])
+    db_session.flush()
+
+    alerts_outbound.plan(db_session, period="2099-11")
+
+    def count(channel_id: int) -> int:
+        return db_session.scalar(
+            select(func.count()).select_from(AlertDelivery)
+            .where(AlertDelivery.channel_id == channel_id))
+
+    mine = db_session.scalars(
+        select(AlertDelivery.metric_name).where(AlertDelivery.channel_id == channel.id)).all()
+    assert mine == ["open_ratio"]
+    assert count(quiet.id) == 0  # 只看高级的通道不接这条低级别预警
+
+
+def test_dispatch_commits_progress_before_asking_for_a_retry(db_session, monkeypatch):
+    """`run_job` 见到异常会 rollback：投递结果必须先 commit，否则下一轮重发一遍同样的通知。"""
+    from sqlalchemy import select
+
+    from backend import alerts_outbound, jobs
+    from backend.models import AlertDelivery, BackgroundJob
+
+    monkeypatch.setattr(jobs, "SCHEDULER", lambda delay, job_id: None)
+    channel = _outbound_channel(name="单测通道-重试")
+    alert = _outbound_alert(alert_type="重试", metric_name="retry_ratio")
+    db_session.add_all([channel, alert])
+    db_session.flush()
+    alerts_outbound.plan(db_session, period="2099-11")
+    delivery_id = db_session.scalars(
+        select(AlertDelivery.id).where(AlertDelivery.channel_id == channel.id)).one()
+
+    monkeypatch.setattr(alerts_outbound, "get_settings",
+                        lambda: _outbound_settings(alert_max_attempts=3))
+    job, created = jobs.submit(db_session, "alert.dispatch",
+                               {"delivery_ids": [delivery_id]}, max_attempts=3)
+    assert created is True
+    jobs.run_job(job.id, db=db_session)  # 处理函数抛 DeliveryPending，run_job 内部已 rollback
+
+    row = db_session.get(AlertDelivery, delivery_id)
+    assert row.attempts == 1 and row.status == "pending"  # 落盘过，没被 rollback 抹掉
+    assert "连接失败" in (row.last_error or "")
+    assert db_session.get(BackgroundJob, job.id).status == "queued"  # 还没好 ≠ 失败，按预算重排
+
+    # 预算用完这一轮：这张单判失败，任务本身算成功（没有待发的了，不用再重试）
+    monkeypatch.setattr(alerts_outbound, "get_settings",
+                        lambda: _outbound_settings(alert_max_attempts=1))
+    jobs.run_job(job.id, db=db_session)
+    row = db_session.get(AlertDelivery, delivery_id)
+    assert row.status == "failed" and row.attempts == 2
+    finished = db_session.get(BackgroundJob, job.id)
+    assert finished.status == "succeeded"
+    assert finished.result["failed"] == 1 and finished.result["pending"] == 0
+
+
+def test_channel_and_delivery_json_never_leak_the_secret():
+    """`secret` 只写不读：管理页要能显示「配没配」，但绝不能把密钥回给前端。"""
+    from backend import alerts_outbound
+    from backend.models import AlertDelivery
+
+    snapshot = alerts_outbound.channel_json(_outbound_channel(secret="topsecret-9f3c"),
+                                            {"pending": 2, "sent": 1, "failed": 0})
+    body = json.dumps(snapshot, ensure_ascii=False, default=str)
+    assert "topsecret-9f3c" not in body
+    assert snapshot["has_secret"] is True
+    assert snapshot["counts"] == {"pending": 2, "sent": 1, "failed": 0}
+    assert snapshot["kind_label"] == "Webhook（HTTP POST）"
+    assert snapshot["min_level_label"] == "低及以上（全部预警）"
+
+    plain = alerts_outbound.channel_json(_outbound_channel(secret=None))
+    assert plain["has_secret"] is False
+
+    delivery = AlertDelivery(alert_key="2099-11||成本率异常|cost_ratio", period="2099-11",
+                             department="", alert_type="成本率异常", metric_name="cost_ratio",
+                             level="high", payload={"metric_name": "cost_ratio"},
+                             status="pending", attempts=0, channel_name="单测通道")
+    serialized = json.dumps(alerts_outbound.serialize(delivery), ensure_ascii=False, default=str)
+    assert json.loads(serialized)["status_label"] == "待发送"
+    assert json.loads(serialized)["level_label"] == "高"
+    assert "topsecret" not in serialized
+
+
 

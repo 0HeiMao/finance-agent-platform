@@ -5,13 +5,22 @@
   "threshold": 0.002,
   "images": [
     {
+      "page": "/admin/alert-channels",
+      "size": "1440x900",
+      "file": "admin_alert-channels_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 189571,
+      "sha256": "c32dfbf7ec8321803d3e3d9df28c65faee4d5f0e65503c50f3f26e3a7f3ba7a3"
+    },
+    {
       "page": "/admin/users",
       "size": "1440x900",
       "file": "admin_users_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 218626,
-      "sha256": "c8754f5790f1da2bf5b501747f2a7997cfad0c35c3a31bcfcc77d4c14f75b110"
+      "bytes": 219063,
+      "sha256": "994764ec239f76913c3fc68f0fa95bc5e647c080e5c53f5fd58140bd9816526c"
     },
     {
       "page": "/agent",
@@ -19,8 +28,8 @@
       "file": "agent_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 104081,
-      "sha256": "1d11e0ae789591099cc5f69854ea67e49def958d2a204ee58465f37a595bb7f4"
+      "bytes": 104508,
+      "sha256": "436bceaa9328ec42bf781471b762eb2f3dd7c6706b4ab07019a91dc6646412be"
     },
     {
       "page": "/analysis/alerts",
@@ -28,8 +37,8 @@
       "file": "analysis_alerts_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 173007,
-      "sha256": "862515b757434ce1efb7cf1ec08cb82dd7bd15db91e44ed95108393c3b1c6f12"
+      "bytes": 173434,
+      "sha256": "5192c379b38142f6112a5626d7c65ac771f21df22799418daf227da4990bd53c"
     },
     {
       "page": "/analysis/revenue",
@@ -37,8 +46,8 @@
       "file": "analysis_revenue_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 88765,
-      "sha256": "55b9e5706c394202102db1d8f7d581b4fee0476660061e5e0ceb105a4e880946"
+      "bytes": 89257,
+      "sha256": "1d8fa658c8570f5ced20ed072c5cf6a4100dab89f84789ae06305a167a680ad7"
     },
     {
       "page": "/dashboard",
@@ -46,8 +55,8 @@
       "file": "dashboard_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 182532,
-      "sha256": "bbe34931a8ce53bd1c4412da35783a458b107a7a8cffe4d8ab2eb35844351419"
+      "bytes": 182968,
+      "sha256": "336f5972980994e31758d55b899f4acfa3d0c10a437d96f33755a4f96bdaac06"
     },
     {
       "page": "/dashboard",
@@ -64,8 +73,8 @@
       "file": "financial_transactions_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 162346,
-      "sha256": "e0821369ea49de5fc657a5793f9ef47f3d65de064a7a0d72ad6035ac3d4c8a3d"
+      "bytes": 162766,
+      "sha256": "3d8f2594d9321b3fc8c54a82d6a217caa3583a8488d98e9ba0289b4aa39151c7"
     },
     {
       "page": "/settings",

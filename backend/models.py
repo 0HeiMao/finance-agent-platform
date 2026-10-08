@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Index, Integer, Numeric, String, Text, func, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -234,4 +234,83 @@ class BackgroundJob(Base):
             unique=True,
             postgresql_where=text("status IN ('queued', 'running', 'succeeded')"),
         ),
+    )
+
+
+class AlertChannel(Base):
+    """预警外发通道（⑭）：一条「预警生成后往哪里发」的配置。
+
+    为什么要有通道表而不是几个常量：外发目标（企业微信/钉钉机器人、内部告警网关、邮件组）
+    是**部署环境的信息**，写在代码里等于每次换环境都要改代码；而且「发什么级别、发哪个部门」
+    本来就是业务规则，得让管理员在界面上调。
+
+    `secret` 只用于 webhook 的 HMAC-SHA256 签名（收到方据此确认这条通知真的来自本平台），
+    **任何接口都不会把它读回去**（列表只给 `has_secret`）——签名密钥泄露就等于任何人都能伪造通知。
+    邮件通道不用它，SMTP 口令在 .env 里（见 backend/config.py）。
+    """
+    __tablename__ = "alert_channels"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    # webhook / email（取值见 backend/alerts_outbound.py 的 KINDS）
+    kind: Mapped[str] = mapped_column(String(20), default="webhook")
+    # webhook 是 URL，email 是收件人（逗号分隔）
+    target: Mapped[str] = mapped_column(String(500))
+    # 只发这个级别及以上：low < medium < high（LEVEL_ORDER）。默认 low = 全都发。
+    min_level: Mapped[str] = mapped_column(String(20), default="low")
+    # 空 = 不限部门（含全公司口径的预警）；有值 = 只发这个部门口径的预警
+    department: Mapped[str | None] = mapped_column(String(100))
+    enabled: Mapped[bool] = mapped_column(default=True)
+    secret: Mapped[str | None] = mapped_column(String(200))
+    # 最近一次投递结果缓存（列表页直接显示，不必每次去扫 台账）
+    last_result: Mapped[str | None] = mapped_column(String(20))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
+
+
+class AlertDelivery(Base):
+    """投递单（⑭）：一条「某条预警送往某个通道」的持久记录，也是重试的单位。
+
+    三个刻意的选择：
+
+    1. **按逻辑键去重，不按预警行 id。** 重算是「先删旧行、再建新行」（见 api_analysis.calculate），
+       行 id 每轮都变；拿行 id 去重等于每重算一次就把同一批通知再轰一遍。
+       所以唯一键是 `(alert_key, channel_id)`，`alert_key` = 期间|部门|类型|指标名。
+    2. **自带 payload 快照。** 投递失败要重试，而重试时那条预警很可能已经被下一次重算删掉了；
+       没有快照就只能发一条「预警不存在」，或者更糟——发出被改过的内容。
+    3. **失败重试复用后台任务（backend/jobs.py）**，不自己写定时器：退避、预算、人工重试、
+       进程重启接续都是现成的，投递单只需要说清「这条还没发成功」。
+    """
+    __tablename__ = "alert_deliveries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # f"{period}|{department or ''}|{alert_type}|{metric_name}"，见 alerts_outbound.alert_key()
+    alert_key: Mapped[str] = mapped_column(String(300), index=True)
+    # 只作追溯：预警行会被重算删掉，所以这不是外键，也不保证还能查到
+    alert_id: Mapped[int | None] = mapped_column(Integer)
+    # 通道被删除时置空（ondelete=SET NULL）而不是级联删投递单：台账是「发过什么」的证据
+    channel_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("alert_channels.id", ondelete="SET NULL"), index=True)
+    # 快照：通道改名/改地址之后，台账里仍能看到当时是发给谁、什么类型的通道
+    channel_name: Mapped[str] = mapped_column(String(100))
+    channel_kind: Mapped[str] = mapped_column(String(20))
+    period: Mapped[str] = mapped_column(String(20), index=True)
+    department: Mapped[str | None] = mapped_column(String(100))
+    alert_type: Mapped[str] = mapped_column(String(100))
+    metric_name: Mapped[str] = mapped_column(String(100))
+    level: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # pending / sent / failed（取值见 alerts_outbound.STATUSES）
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    response_status: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
+    __table_args__ = (
+        # 「同一条预警 + 同一个通道」只发一次：并发重算/补发时靠数据库拦，而不是靠先查后插。
+        Index("uq_alert_deliveries_key_channel", "alert_key", "channel_id", unique=True),
     )

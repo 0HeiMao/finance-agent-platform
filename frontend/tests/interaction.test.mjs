@@ -485,6 +485,232 @@ test('后台任务（⑩）：同一批次重复提交被后端去重时，提�
   view.app.unmount()
 })
 
+// ------------------------------------------------------------ 预警外发（⑭）
+
+const CHANNEL_ROW = {
+  id: 5,
+  name: '财务群机器人',
+  kind: 'webhook',
+  kind_label: 'Webhook（HTTP POST）',
+  target: 'http://gateway.internal/hook',
+  min_level: 'low',
+  min_level_label: '低及以上（全部预警）',
+  department: '',
+  enabled: true,
+  has_secret: true,
+  last_result: null,
+  last_error: null,
+  last_sent_at: null,
+  created_at: '2026-10-08T16:00:00',
+  updated_at: '2026-10-08T16:00:00',
+  counts: { pending: 1, sent: 2, failed: 0 }
+}
+
+const DELIVERY_ROW = {
+  id: 41,
+  alert_key: '2026-10||成本率异常|cost_ratio',
+  alert_id: 1482,
+  channel_id: 5,
+  channel_name: '财务群机器人',
+  channel_kind: 'webhook',
+  channel_kind_label: 'Webhook（HTTP POST）',
+  period: '2026-10',
+  department: '',
+  alert_type: '成本率异常',
+  metric_name: 'cost_ratio',
+  level: 'high',
+  level_label: '高',
+  status: 'failed',
+  status_label: '已失败',
+  attempts: 3,
+  response_status: 500,
+  last_error: 'HTTP 500：网关忙',
+  sent_at: null,
+  created_at: '2026-10-08T17:02:11',
+  updated_at: '2026-10-08T17:03:20'
+}
+
+function channelsRoutes(extra = []) {
+  return [
+    {
+      path: '/api/v1/auth/me',
+      response: () => jsonResponse({ username: 'demo_analyst', unrestricted: true, departments: [] })
+    },
+    ...extra,
+    {
+      path: '/api/v1/admin/alert-channels',
+      response: () =>
+        jsonResponse({
+          data: [CHANNEL_ROW],
+          kinds: { webhook: 'Webhook（HTTP POST）', email: '邮件（SMTP）' },
+          min_levels: { low: '低及以上（全部预警）', medium: '中及以上', high: '仅高级预警' },
+          levels: { high: '高', medium: '中', low: '低' },
+          departments: ['018', '097'],
+          stats: { pending: 1, sent: 2, failed: 0 }
+        })
+    },
+    {
+      path: '/api/v1/admin/alert-deliveries',
+      response: () =>
+        jsonResponse({
+          data: [DELIVERY_ROW],
+          total: 1,
+          limit: 50,
+          offset: 0,
+          status_labels: { pending: '待发送', sent: '已送达', failed: '已失败' },
+          levels: { high: '高', medium: '中', low: '低' },
+          stats: { pending: 1, sent: 2, failed: 0 }
+        })
+    }
+  ]
+}
+
+async function mountChannels(routes) {
+  useRoutes(routes)
+  const router = makeRouter()
+  router.push('/admin')
+  await router.isReady()
+  const AdminAlertChannels = (await import('../src/views/AdminAlertChannels.vue')).default
+  const view = mount(AdminAlertChannels, { global: { plugins: [router] } })
+  assert.ok(await waitFor(() => view.text().includes('财务群机器人')), `实际渲染：${view.text()}`)
+  return view
+}
+
+/** 台账筛选里的「状态」下拉：只有它的选项里会出现 `pending` 这个值。 */
+function statusFilter(view) {
+  return view
+    .all((node) => node.type === 'select')
+    .find((node) =>
+      (node.children || []).some((child) => child.type === 'option' && child.props?.value === 'pending')
+    )
+}
+
+test('预警外发（⑭）：通道计数与投递台账都在，点「测试」把失败原因写回「最近结果」', async () => {
+  const view = await mountChannels(
+    channelsRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/alert-channels/5/test',
+        response: () =>
+          jsonResponse({
+            ok: false,
+            status: 500,
+            detail: 'HTTP 500：网关忙',
+            duration_ms: 12,
+            channel: {
+              ...CHANNEL_ROW,
+              last_result: 'failed',
+              last_error: 'HTTP 500：网关忙',
+              last_sent_at: '2026-10-08T18:00:00'
+            }
+          })
+      }
+    ])
+  )
+  // 台账那一列的三个数字是管理员判断「是不是堵住了」的唯一依据
+  assert.match(view.text(), /待发 1/)
+  assert.match(view.text(), /已送达 2/)
+  assert.match(view.text(), /全公司 · cost_ratio/)
+  assert.match(view.text(), /已失败/)
+  assert.match(view.text(), /HTTP 500：网关忙/) // 台账里的「失败原因」
+  assert.match(view.text(), /还没发过/)
+
+  await view.click('测试')
+  assert.ok(
+    fetchImpl.calls.some(
+      (call) => call.method === 'POST' && call.path === '/api/v1/admin/alert-channels/5/test'
+    ),
+    JSON.stringify(fetchImpl.calls)
+  )
+  // 测试失败也回 200：界面要按 `ok` 判断，把「发不出去」的原因摆出来，而不是当请求失败
+  assert.ok(
+    await waitFor(() => view.text().includes('发不出去：HTTP 500：网关忙')),
+    `实际渲染：${view.text()}`
+  )
+  assert.doesNotMatch(view.text(), /还没发过/)
+  assert.match(view.text(), /已配签名密钥/)
+  assert.doesNotMatch(view.text(), /outbound-verify/) // 密钥只写不读，界面上不会出现它
+  view.app.unmount()
+})
+
+test('预警外发（⑭）：点「补发通知」把待处理预警补成投递单，并重新读一次台账', async () => {
+  const view = await mountChannels(
+    channelsRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/alerts/notify',
+        response: () =>
+          jsonResponse({ period: '', created: 3, queued: 3, job: { id: 9 }, deduplicated: false })
+      }
+    ])
+  )
+  const readsBefore = fetchImpl.calls.filter((call) =>
+    call.path.startsWith('/api/v1/admin/alert-deliveries')
+  ).length
+
+  await view.click('补发通知')
+  const notifyCall = fetchImpl.calls.find((call) => call.path === '/api/v1/admin/alerts/notify')
+  assert.ok(notifyCall, JSON.stringify(fetchImpl.calls))
+  assert.equal(notifyCall.method, 'POST')
+  // 期间留空 = 全部：补的是「已存在的待处理预警」，不是「按期间重算」
+  assert.deepEqual(JSON.parse(notifyCall.body), { period: '' })
+  assert.ok(
+    await waitFor(() => view.text().includes('新建 3 条投递，其中 3 条已排队')),
+    `实际渲染：${view.text()}`
+  )
+  assert.ok(
+    fetchImpl.calls.filter((call) => call.path.startsWith('/api/v1/admin/alert-deliveries')).length >
+      readsBefore,
+    '补发之后要重新读台账，否则看不到新建的投递单'
+  )
+  view.app.unmount()
+})
+
+test('预警外发（⑭）：台账筛选带 status 查询参数，点「重发」打到 /retry 并显示排队', async () => {
+  const view = await mountChannels(
+    channelsRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/alert-deliveries/41/retry',
+        response: () =>
+          jsonResponse({
+            data: {
+              ...DELIVERY_ROW,
+              status: 'pending',
+              status_label: '待发送',
+              attempts: 1,
+              last_error: null
+            },
+            job: { id: 12 },
+            queued: true,
+            deduplicated: false
+          })
+      }
+    ])
+  )
+
+  const node = statusFilter(view)
+  assert.ok(node, `找不到状态筛选下拉：${view.text()}`)
+  await view.fire('change', node, { target: { value: 'failed' } })
+  await view.click('筛选')
+  assert.ok(
+    fetchImpl.calls.some(
+      (call) => call.method === 'GET' && call.path === '/api/v1/admin/alert-deliveries?status=failed&limit=50'
+    ),
+    JSON.stringify(fetchImpl.calls)
+  )
+
+  await view.click('重发')
+  assert.ok(
+    fetchImpl.calls.some(
+      (call) => call.method === 'POST' && call.path === '/api/v1/admin/alert-deliveries/41/retry'
+    ),
+    JSON.stringify(fetchImpl.calls)
+  )
+  assert.ok(await waitFor(() => view.text().includes('已重新排队，稍后自动重发')), `实际渲染：${view.text()}`)
+  view.app.unmount()
+})
+
 test.after(() => {
   resetShims()
   clearCurrentUser()

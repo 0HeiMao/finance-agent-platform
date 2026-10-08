@@ -287,6 +287,11 @@ def correct(db: Session, row_id: int, payload: dict, *, scope: Scope, actor: str
                  detail={"before": before, "after": after, "periods": sorted({old_period, new_period})},
                  request=request)
     db.commit()
+    # 预警外发（⑭）：更正可能改出新预警（旧行被删、新行是 pending），重算时排好的投递单
+    # 必须在 commit 之后再交给后台任务。排在 commit 之后、且排程失败不影响更正结果。
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    alerts_outbound.schedule_safely(db, periods=refreshed["recalculated"], actor=actor)
     return {"data": serialize(row), **refreshed}
 
 
@@ -331,4 +336,9 @@ def reverse(db: Session, row_id: int, *, scope: Scope, actor: str, reason: str |
                  detail={"period": period, "reversal_id": reversal.id, "reason": reason or "",
                          "revenue_amount": f"{row.revenue_amount:.2f}"}, request=request)
     db.commit()
+    # 预警外发（⑭）：冲销会让这一期的指标归零/预警消失，但**别的期间**（部门口径）可能因此
+    # 触发新的预警——重算时排出的一律在这里统一派发。
+    from backend import alerts_outbound  # noqa: PLC0415
+
+    alerts_outbound.schedule_safely(db, periods=refreshed["recalculated"], actor=actor)
     return {"original": serialize(row), "reversal": serialize(reversal), **refreshed}
