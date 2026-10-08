@@ -15,20 +15,37 @@
 **任何加列都必须往 `COLUMNS` 里加一行**，否则老库升级会漏——忘了的表现是接口 500，
 所以 `missing_columns()` 会在启动时把漏掉的列直接点名（见 `backend/main.py` 的启动钩子）；
 索引漏了则交给 `missing_indexes()` 点名。
+
+上面这些的前提是「**表本身先建出来**」，而表建不建得出来还取决于两件容易被忽略的事：
+① 表得先被注册进 `Base.metadata`（靠导入，`models` 之外的模块里的表同样要显式导入）；
+② 建 `document_chunks` 之前库里得有 `vector` 扩展。两件事在本地老库上都被初始化脚本
+一次性做掉了，所以只有「从零建的库」（CI 的一次性容器、新机器）才会暴露——
+`ensure_pgvector()` 就是为后者补的。
 """
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.db import Base, engine as default_engine
+
+logger = logging.getLogger("finance-api.migrations")
 
 # 显式导入模型模块：`create_all()` 只会建「已注册进 metadata」的表，而注册靠导入。
 # 少了这一行，在「只导入 migrations」的场景（一次性脚本、测试夹具）里新表会被静默漏掉——
 # 实测 `AuditLog` 就是这么消失的：只 `from backend.migrations import ensure_schema` 时
 # `audit_logs` 根本没建，接口再报 `relation "audit_logs" does not exist`。
 from backend import models as _models  # noqa: F401
+
+# 知识库表（`document_chunks`）不在 models.py 里，而在 RAG 模块里，所以是**同一个坑的第二例**：
+# 不导入它，`ensure_schema()` 就不会建这张表，而「测试夹具 / 一次性脚本」走的正是
+# 「只导入 migrations」这条路。CI 拿一个空库跑测试时，这里会变成
+# `relation "document_chunks" does not exist` —— 本地库因为早就建好了，一直看不出来。
+from backend.rag import pgvector_store as _pgvector_store  # noqa: F401
 
 # (表名, 列名, DDL 片段)。DDL 里不要写 SQL 关键字大小写混用以外的花活，便于跨库阅读。
 COLUMNS: list[tuple[str, str, str]] = [
@@ -98,11 +115,48 @@ INDEXES: list[tuple[str, str, str, str]] = [
 ]
 
 
+def has_pgvector(engine: Engine | None = None) -> bool:
+    """库里有 `vector` 扩展吗？`document_chunks.embedding` 是 `VECTOR(384)`，没有它这张表建不出来。"""
+    target = engine if engine is not None else default_engine
+    try:
+        with target.connect() as connection:
+            return bool(connection.scalar(
+                text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")))
+    except SQLAlchemyError:
+        return False
+
+
+def ensure_pgvector(engine: Engine | None = None) -> bool:
+    """保证库装着 `vector` 扩展（装好返回 True）。
+
+    这一步原来只写在 `scripts/init_pgvector_db.py` 里，于是**一个从头建的库**（CI 的一次性
+    容器、新同事的第一台机器）只要没手工跑过那个脚本，`create_all()` 就会炸在建
+    `document_chunks` 的那一刻：`type "vector" does not exist`。本地库早就初始化过，
+    所以这个洞只在空库上显形 —— CI 用的正好就是空库，一跑就撞上了。
+
+    装不上（比如镜像不是 `pgvector/pgvector`）只告警、不抛：结构问题应该由启动日志点名，
+    而不是让整个服务起不来 —— 与 `backend/main.py` 里「迁移失败只告警」的口径一致。
+    """
+    target = engine if engine is not None else default_engine
+    try:
+        with target.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    except SQLAlchemyError as exc:
+        logger.warning("pgvector 扩展不可用（%s）：知识库表 document_chunks 建不出来，"
+                       "请用 pgvector/pgvector 镜像，或在库里手工执行 CREATE EXTENSION vector", exc)
+        return False
+    return True
+
+
 def ensure_schema(engine: Engine | None = None) -> list[str]:
     """建缺失的表 + 补缺失的列 + 去掉过时的唯一约束/唯一索引，返回本次真正执行的 DDL 描述（空列表 = 结构已是最新）。"""
     target = engine if engine is not None else default_engine
-    Base.metadata.create_all(bind=target)
     applied: list[str] = []
+    # 先装扩展、再建表：`document_chunks.embedding` 是 `VECTOR(384)`，扩展不在时
+    # `create_all()` 会直接抛 `type "vector" does not exist`（且只在空库上抛）。
+    if not has_pgvector(target) and ensure_pgvector(target):
+        applied.append("pgvector 扩展")
+    Base.metadata.create_all(bind=target)
     with target.begin() as connection:
         for table, column, ddl in COLUMNS:
             exists = connection.scalar(

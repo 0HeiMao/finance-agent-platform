@@ -2465,6 +2465,52 @@ async def test_schema_matches_models(require_database):
     assert missing_indexes() == []
 
 
+async def test_fresh_database_can_be_built_from_migrations_alone(require_database, db_session):
+    """从零建的库（CI、换台机器、新同事）必须也能建全表 —— 本地老库看不出这个坑。
+
+    两件事都只有空库才暴露，而在本地被 `scripts/init_pgvector_db.py` 手工做掉了：
+
+    1. **表要注册进 metadata 才会被 `create_all()` 建出来**。`document_chunks` 定义在
+       `backend/rag/pgvector_store.py`，而 `migrations.py` 只 `import backend.models`，
+       于是「只导入 migrations」的路径（空库、一次性脚本）少建这张表，症状是启动日志一条 error、
+       过一阵 RAG 接口才报 `relation "document_chunks" does not exist`。`AuditLog` 当初是同一个坑。
+    2. **`embedding VECTOR(384) NOT NULL` 要求 `vector` 扩展先在**，否则建表直接
+       `type "vector" does not exist`，整个 `ensure_schema()` 半途而废（前面 8 张表建了、知识库表没有）。
+
+    这里用一个子进程只 `import backend.migrations`（不靠本文件已导入的其它模块帮忙）证明第 1 条，
+    再在真库上核对第 2 条：CI 的 job 会在**空库**上跑整套测试，所以这条断言在本地绿、在空库红是没用的
+    —— 它必须两边都成立，靠的是 `migrations.ensure_pgvector()` 自己把扩展装上。
+    """
+    import subprocess
+    import tempfile
+
+    from sqlalchemy import text
+
+    from backend.migrations import ensure_pgvector, has_pgvector
+    from backend.models import Base
+
+    probe = (
+        "import json, sys\n"
+        "import backend.migrations  # noqa: F401  只导入它，看表注册全不全\n"
+        "from backend.models import Base\n"
+        "json.dump(sorted(Base.metadata.tables), open(sys.argv[1], 'w', encoding='utf-8'))\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "tables.json"
+        completed = subprocess.run([sys.executable, "-c", probe, str(out_path)],
+                                   cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
+        tables = json.loads(out_path.read_text(encoding="utf-8"))
+
+    assert "document_chunks" in tables, f"只导入 migrations 时注册到的表：{tables}"
+    assert "document_chunks" in Base.metadata.tables
+
+    assert has_pgvector() is True or ensure_pgvector() is True
+    assert has_pgvector() is True
+    assert db_session.execute(text(
+        "SELECT 1 FROM pg_extension WHERE extname = 'vector'")).first() is not None
+
+
 async def test_required_indexes_are_declared_and_present(require_database, db_session):
     """索引要在三处对齐：模型的 `Index(...)`（新库）、`migrations.INDEXES`（老库）、真库的 `pg_indexes`。
 
@@ -2612,6 +2658,26 @@ async def test_quota_registry_reports_config_and_rejects_unknown_name():
 
 ROLLUP_QUARTER = "2098-Q2"
 ROLLUP_MONTHS = ("2098-04", "2098-05", "2098-06")
+# 缺月清单的种子：三季度的三个月只播两个月（且两个口径各一行），
+# 于是「缺月清单」的内容完全由用例自己决定，不依赖演示库里恰好有一行不完整的 2026 年度。
+INCOMPLETE_QUARTER = "2098-Q3"
+INCOMPLETE_MONTHS = ("2098-07", "2098-08")
+ROLLUP_TEST_YEAR = "2098"
+
+
+def _seed_department_metric(db, period: str, *, department: str = "部门A") -> None:
+    """给某个部门插一行月指标（落库行按 department 分组，缺月清单才有「部门行」那一半）。"""
+    from backend.models import FinancialMetric
+
+    revenue, expense = Decimal("100.00"), Decimal("10.00")
+    net = revenue - expense
+    db.add(FinancialMetric(
+        period=period, department=department, revenue_amount=revenue, cost_amount=Decimal("0"),
+        expense_amount=expense, gross_profit_amount=revenue, net_profit_amount=net,
+        gross_profit_ratio=Decimal("1.0000"),
+        net_profit_ratio=(net / revenue).quantize(Decimal("0.0001")),
+    ))
+    db.commit()
 
 
 def _seed_company_rows(db, period: str, rows) -> None:
@@ -2751,6 +2817,10 @@ async def test_admin_rollup_rebuild_is_audited_and_admin_only(anon_client, api_a
     _drop_rollups(db_session)
     for month in ROLLUP_MONTHS:
         _seed_metric(db_session, month, revenue="1000.00", expense="200.00")
+    # 一个注定「不完整」的季度：三个月只播两个月，且全公司与部门各一行
+    for month in INCOMPLETE_MONTHS:
+        _seed_metric(db_session, month, revenue="500.00", expense="100.00")
+        _seed_department_metric(db_session, month)
 
     headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
     try:
@@ -2764,23 +2834,28 @@ async def test_admin_rollup_rebuild_is_audited_and_admin_only(anon_client, api_a
     assert [item["value"] for item in listing.json()["grains"]] == ["quarter", "year"]
 
     rebuilt = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
-                                     json={"periods": [ROLLUP_QUARTER]})
+                                     json={"periods": [ROLLUP_QUARTER, INCOMPLETE_QUARTER]})
     assert rebuilt.status_code == 200, rebuilt.text
     payload = rebuilt.json()
-    assert payload["rows"] == 1
+    assert payload["rows"] == 3            # 二季度全公司 1 行 + 三季度全公司与部门各 1 行
     assert payload["data"][0]["period"] == ROLLUP_QUARTER
     assert payload["data"][0]["revenue_amount"] == 3000.0
     assert payload["data"][0]["complete"] is True
     assert payload["data"][0]["note"] == "已覆盖全部 3 个月"
     assert ROLLUP_QUARTER in payload["coverage"]["quarters"]
 
-    # 缺月清单要说清「是哪一行缺月」：全公司行与部门行都可能缺月，页面上不能只给期间标签
-    incomplete = payload["coverage"]["incomplete"]
-    assert incomplete, payload["coverage"]
-    assert all({"department", "department_label"} <= set(item) for item in incomplete)
+    # 缺月清单要说清「是哪一行缺月」：全公司行与部门行都可能缺月，页面上不能只给期间标签。
+    # 只看本用例自己的年份：演示库里本来就有不完整的 2026 年度行，跟着它断言等于没断言
+    # （空库上跑这条会直接挂掉——CI 上就是这么发现的）。
+    incomplete = [item for item in payload["coverage"]["incomplete"]
+                  if item["period"].startswith(ROLLUP_TEST_YEAR)]
+    assert {(item["grain"], item["period"], item["department"]) for item in incomplete} == {
+        ("quarter", INCOMPLETE_QUARTER, ""), ("quarter", INCOMPLETE_QUARTER, "部门A")}, incomplete
+    assert all(item["missing_months"] == ["2098-09"] for item in incomplete), incomplete
+    assert all({"department_label", "period_label"} <= set(item) for item in incomplete)
     for key in {(item["grain"], item["period"]) for item in incomplete}:
         group = [item["department"] for item in incomplete if (item["grain"], item["period"]) == key]
-        assert group == sorted(group, key=lambda name: name != ""), group
+        assert group == ["", "部门A"], group      # 全公司行排在同期的部门行前面
 
     # 期间与 grains 对不上、grains 本身不合法都要 422，而不是静默什么都不算
     bad = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,

@@ -85,7 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理：
+`scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节）：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -119,7 +120,9 @@
 
 ### 一键自检
 
-本目录是 git 仓库（`main` 分支），但**没有 CI 服务**可挂，所以「CI」落成一个谁都能在本机跑的入口：
+本目录是 git 仓库（`main` 分支）。推送/PR 时 `.github/workflows/ci.yml` 会跑结构体检、后端 pytest 与前端
+`npm ci`/`npm test`/`npm run build`（见下面「持续集成」一节）；而这台开发机上没有 CI 服务可挂，所以
+「CI」同时落成一个谁都能在本机跑的入口：
 
 ```powershell
 # 编码/语法体检 + 后端 pytest + 前端 node --test
@@ -151,7 +154,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 - **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
-  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 118 个用例与前端 15 个用例一起跑。
+  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 171 项与前端 35 项一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
   而钩子是 shell 脚本，行尾多一个 CR 会让 shebang 变成 `/bin/sh\r`，钩子直接报 bad interpreter。
@@ -199,10 +202,11 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 
 | 变更 | 落点 | 何时生效 |
 | --- | --- | --- |
-| 加表 | `backend/models.py` 里的模型 | 应用启动时 `create_all()` 建缺失的表 |
+| 加表 | 定义在 `backend/models.py`（定义在别的模块也行，但**必须被 `migrations.py` 导入**）里的模型 | 应用启动时 `create_all()` 建缺失的表 |
 | 加列 | `backend/migrations.py` 的 `COLUMNS` 加一行 `(表, 列, DDL)` | 启动时按 `information_schema` 查缺再 `ALTER TABLE`，幂等 |
 | 加索引 | 模型里声明（`index=True` 或 `__table_args__` 的 `Index(...)`）**并且**在 `backend/migrations.py` 的 `INDEXES` 加一行 `(表, 索引名, 列清单, 为什么)` | 启动时按 `pg_indexes` 查缺再 `CREATE INDEX IF NOT EXISTS`，幂等；`create_all()` 只在建表时建索引，**老库的表不会被补** |
-| 改列类型 / 装 `vector` 扩展 | `scripts/init_pgvector_db.py` 的 `COLUMN_TYPE_MIGRATIONS` | 手工跑一次该脚本 |
+| 改列类型 | `scripts/init_pgvector_db.py` 的 `COLUMN_TYPE_MIGRATIONS` | 手工跑一次该脚本 |
+| 装 `vector` 扩展 | `backend/migrations.py` 的 `ensure_pgvector()` | 启动时自动，且排在 `create_all()` **之前** |
 
 为什么不上 Alembic：这个项目的部署形态是「一个进程 + 一个库」，`ensure_schema()` 在启动时自动补齐；
 多一套「发版前记得跑 `alembic upgrade head`」的运维动作，反而多一个会忘的环节。代价是**加列与加索引的清单必须手工维护**，
@@ -228,6 +232,18 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 
 > `create_all()` 只建缺失的**表**，不会给已存在的表补**列**：这是上面这些坑的总根源。
 > 新加一列表看起来跑得通，是因为本地库往往是新库；老库升级时才会炸。
+
+> 反过来的方向同样会骗人：**从零建的库**（CI、新同事、换台机器）暴露的是「表根本没注册进 metadata」
+> 与「扩展没装」。这两个坑本来都被本地老库挡住了 —— 本地库是 `scripts/init_pgvector_db.py` 手工建的，
+> 它顺手装了 `vector` 扩展、也顺手建了 `document_chunks`。真在空库上跑一遍才发现 `ensure_schema()`
+> 只建出 8 张表，且在 `document_chunks` 上直接
+> `type "vector" does not exist`（`embedding VECTOR(384) NOT NULL` 要求扩展先在）：
+> ① `document_chunks` 定义在 `backend/rag/pgvector_store.py`，`migrations.py` 只导入了 `backend.models`；
+> ② `CREATE EXTENSION` 只写在上面那个手工脚本里。现在这两件事都由 `migrations.py` 自己保证
+> （导入 `pgvector_store` + `ensure_pgvector()` 先于 `create_all()`），回归闸门是
+> `test_fresh_database_can_be_built_from_migrations_alone`（它在子进程里只导入 `backend.migrations`）。
+> 本地库的 `create_all()` 与真机启动路径一直是好的，所以这类问题**只有空库才看得见** ——
+> 这也是「CI 用一个干净的 postgres 服务」比「在本地库上跑」更值钱的地方。
 
 ### 界面核对（三态与响应式）
 
@@ -273,7 +289,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **170** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**）、
+`tests/` 下三个文件共 **171** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -295,7 +311,9 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 重启收尸把 queued/running 标成失败、非管理员 403→**结构漂移**：模型里的列都在真库里
 （漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）、模型里声明的索引也都在真库里且列顺序不变
 （漏写 `migrations.INDEXES` 时点名）、明细接口发出的 SQL 里期间过滤是区间比较而不是 `to_char`（抓真实
-执行的 SQL 断言）→**按路径耗时**：`record_request` 后
+执行的 SQL 断言）、**从零建的库也建得全**：子进程里只导入 `backend.migrations` 时 `document_chunks`
+已在 metadata 里（表定义在 RAG 模块，漏导入就是空库少一张表），且真库的 `vector` 扩展就位
+（否则 `VECTOR(384)` 建不出来）→**按路径耗时**：`record_request` 后
 `snapshot()["paths"]` 给出每条的 count/p95/max，且 500 与 200 分开计数→**出口配额**：
 导出打满返回 429 + `Retry-After`、三个导出接口共用一本账（换路径绕不过）、
 问答是另一本账（导出打满仍能问答）、`/rag/search`+`/rag/answer`+`/ai/*` 共用问答配额、
@@ -362,6 +380,66 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 而是 dev server 转译 + 无头浏览器（见上）。
 把 `$env:TEMP`/`$env:TMP` 指到工作区内的临时目录后构建就能过（容器里没这个限制，
 `frontend/Dockerfile` 里就是普通的 `npm run build`）。
+
+## 持续集成（CI）
+
+`.github/workflows/ci.yml` 只做两件能在干净机器上完全复现的事：
+
+| job | 跑什么 | 覆盖到什么 |
+| --- | --- | --- |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick` → `verify_ci_workflow.py` → `python -m pytest` | 结构体检（编码/语法）+ 后端全量 171 项 |
+| `frontend` | node 20 + `npm ci` → `npm test` → `npm run build` | 前端 35 项 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+
+三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
+
+- **必须设 `DATABASE_URL` 与 `AUTH_SECRET_KEY`**：`tests/conftest.py` 连不上库就 `pytest.skip`，
+  少一个环境变量换来的是「**全 skip 的绿色流水线**」——一个问题都没验。密钥不设的话配置层会把它当占位值，
+  生成随机串并往工作区写 `.env`。
+- **镜像必须是 `pgvector/pgvector:pg16`**：换成普通 postgres，`document_chunks` 会以
+  `type "vector" does not exist` 失败。
+- **pytest 要用 `python -m pytest`**：`-m` 才会把仓库根放进 `sys.path`，直接 `pytest` 会 `ModuleNotFoundError: backend`。
+
+这套流水线不是「补个仪式」，它一上来就抓到两个只在**从零建的库**上出现的问题（`ensure_schema()` 少建
+`document_chunks`、`vector` 扩展没装），以及一个**断言依赖演示数据**的用例
+（`test_admin_rollup_rebuild_is_audited_and_admin_only` 假设库里恰好有一行不完整的落库行）。
+前两个的修法与回归闸门记录在「数据库迁移（不引入 Alembic）」一节，第三个改成了自己播数据。
+
+### 有意不进 CI 的门禁
+
+浏览器与真机验收留在本地，`PRECOMMIT_FULL=1 git commit …` 是它们的入口：
+
+- `scripts/check_pages.py`（17 页 × 1440/768/375）与 `scripts/ui_components_smoke.py`：要演示数据、
+  要真浏览器，后者还会**真的调一次大模型**（要 API Key）。
+- `scripts/verify_*.py`：全是「真 PostgreSQL + 真 ASGI 接口」的验收脚本，要演示批次与本地向量模型
+  （470MB，`data/models/` 不进版本库）。
+
+把它们塞进 CI 只会长期红着 —— 一条永远要人手动忽略的红线，和没有这条线差不多。CI 只保证一件事：
+**从零建的库上，表结构与测试套件是自洽的。**
+
+### 工作流自检（`scripts/verify_ci_workflow.py`）
+
+CI 配置本身没有测试，而它「绿」不等于它真的在测东西，所以这份 YAML 由
+`scripts/verify_ci_workflow.py` 静态核对 28 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
+没人跑的死代码）。它卡住的都是具体的事：镜像 tag 与 `docker-compose.yml` 漂了、少设 `DATABASE_URL`
+（全 skip）、`continue-on-error` 把失败吞了、环境变量名写错退化成默认值、脚本改名后工作流指向一个不存在的
+路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉。
+
+真机等价地跑一遍整条 `backend` job（不需要 GitHub，用空库代替干净的服务）：
+
+```powershell
+docker exec finance-postgres psql -U finance -d postgres -c "CREATE DATABASE finance_ci"
+$env:DATABASE_URL='postgresql+psycopg://finance:finance@localhost:5432/finance_ci'
+.\.venv\Scripts\python.exe scripts\check_all.py --quick
+.\.venv\Scripts\python.exe scripts\verify_ci_workflow.py
+.\.venv\Scripts\python.exe -m pytest
+Remove-Item Env:\DATABASE_URL      # 记得切回主库，跑完把 finance_ci 删掉
+```
+
+`frontend` job 同理（容器里没有本机那条 esbuild 限制）：
+
+```powershell
+docker run --rm -v "${PWD}\frontend:/src:ro" -w /build node:20 sh -c "cp -r /src/. /build/ && npm ci && npm test && npm run build"
+```
 
 ## 容器化部署（Docker）
 
