@@ -35,8 +35,29 @@ class Credentials(BaseModel):
     password: str = Field(..., min_length=6, max_length=128)
 
 def token_for(user: User) -> str:
+    """签发访问令牌。
+
+    `ver` 是签发那一刻的会话版本号：JWT 是无状态的、签出去就收不回来，所以「作废」只能靠
+    「令牌里的版本 ≠ 账号当前的版本」来判断（见 `current_user()`）。退出登录与管理员强制下线
+    都只是把 `users.token_version` 加一。
+    """
     expires = datetime.now(timezone.utc) + timedelta(minutes=get_settings().access_token_expire_minutes)
-    return jwt.encode({"sub": str(user.id), "username": user.username, "exp": expires}, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode({"sub": str(user.id), "username": user.username, "ver": token_version_of(user),
+                       "exp": expires}, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def token_version_of(user: User) -> int:
+    """账号当前的会话版本号。NULL（老库、老行）一律当 0，与「老令牌没有 `ver` 声明」同一个口径。"""
+    return int(user.token_version or 0)
+
+
+def revoke_tokens(user: User) -> int:
+    """把该账号所有已签发的令牌作废（版本号 +1），返回新的版本号。
+
+    只加不减：版本号回退会让「上一次下线之前签发的令牌」重新生效，那是安全洞。
+    """
+    user.token_version = token_version_of(user) + 1
+    return user.token_version
 
 @router.post("/register")
 def register(payload: Credentials, request: Request, db: Session = Depends(get_db)):
@@ -80,16 +101,24 @@ def login(payload: Credentials, request: Request, db: Session = Depends(get_db))
     limiter.reset(key)
     audit.record(db, user, "user.login", target_type="user", target_id=user.id,
                  detail={"username": user.username}, request=request, commit=True)
-    return {"access_token": token_for(user), "token_type": "bearer"}
+    return {"access_token": token_for(user), "token_type": "bearer", "token_version": token_version_of(user)}
 
 def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    """解析令牌并核对**会话版本号**：版本不一致就当作令牌已作废。
+
+    没有 `ver` 声明（本功能上线之前签发的令牌）按 0 处理，所以老令牌还能用到该账号第一次
+    退出登录为止——升级当天不会把所有人踢下线。
+    """
     try:
-        user_id = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM]).get("sub")
-        user = db.get(User, int(user_id))
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = db.get(User, int(payload.get("sub")))
+        issued = int(payload.get("ver") or 0)
     except (JWTError, TypeError, ValueError):
-        user = None
+        user, issued = None, 0
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效")
+    if issued != token_version_of(user):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "登录已失效（该账号已在别处退出，请重新登录）")
     return user
 
 
@@ -105,7 +134,9 @@ def _profile(user: User) -> dict:
     return {"id": user.id, "username": user.username,
             "department": departments[0] if departments else None,
             "departments": departments,
-            "unrestricted": not departments}
+            "unrestricted": not departments,
+            # 会话版本号：每次退出登录/被强制下线 +1，用来解释「为什么旧令牌突然 401」
+            "token_version": token_version_of(user)}
 
 
 @router.get("/me")
@@ -137,3 +168,24 @@ def update_me(payload: DepartmentInput, request: Request, user: User = Depends(c
     db.commit()
     db.refresh(user)
     return _profile(user)
+
+
+@router.post("/logout")
+def logout(request: Request, user: User = Depends(current_user),
+           db: Session = Depends(get_db)) -> dict:
+    """退出登录：作废该账号**所有**已经签发的令牌，而不只是清掉浏览器里的那一份。
+
+    JWT 是无状态的，服务端没有「已签发令牌」的名单可删，所以作废只能靠把会话版本号 +1：
+    所有旧令牌里的 `ver` 从此对不上，再用就是 401（见 `current_user()`）。
+    代价是**该账号在其他设备上的登录也会一起掉**——这正是退出登录该有的语义。
+    """
+    version = revoke_tokens(user)
+    db.add(user)
+    # detail 里叫 session_version 而不是 token_version：`audit._scrub()` 会把键名含
+    # "token" 的字段整条丢掉（防的是把令牌原文写进日志），叫 token_version 会静默消失。
+    audit.record(db, user, "user.logout", target_type="user", target_id=user.id,
+                 detail={"username": user.username, "session_version": version,
+                         "effect": "该账号此前签发的所有令牌立即失效"},
+                 request=request)
+    db.commit()
+    return {"username": user.username, "token_version": version, "logged_out": True}

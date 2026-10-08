@@ -12,6 +12,9 @@
    修掉的那个 bug：原来重试读的是空输入框，点了等于没点）。
 4. 管理概览的**慢接口告警**区块：标题在、区块不是空白（要么有空态说明、要么有点了名的告警行），
    并把这张卡片截图存到 `output/charts/ui_slow_alerts.png`。
+5. System 设置的「登录与令牌」卡片与用户管理的「会话」列 / 「强制下线」按钮（③）：只核对渲染与
+   禁用态，**不点「退出登录」**——那会真的把 demo 账号的会话版本推进一版。点它的是
+   `scripts/verify_session_revocation.py`，用的是临时账号。
 
 用法（要求后端 8000 与前端 dev server 5173 在跑）：
 
@@ -391,6 +394,65 @@ async def drive(ws_url: str, base: str, api: str, keep_open: bool) -> int:
             target_png.write_bytes(base64.b64decode(shot["data"]))
             check("管理概览：慢接口告警卡片截图已保存", target_png.exists(),
                   f"{target_png.relative_to(PROJECT_ROOT)}（{area['width']}x{area['height']}）")
+
+        # ---------- 会话版本与强制下线：设置页 / 用户管理（③） ----------
+        # ③ 的机制在服务端（把会话版本 +1，此前签发的令牌一起作废），但「卡片在不在、按钮点了
+        # 有没有反应」这一层只有真浏览器看得出来。这里只核对渲染与禁用态，**刻意不点「退出登录」**：
+        # 它会真的把 demo 账号的会话版本推进一版，让 verify_session_revocation.py 里
+        # 「演示账号的会话版本没被动过」这条断言失去意义（那个脚本才是点它的地方，用的是临时账号）。
+        await open_page(cdp, session, base, "/settings")
+        check("System 设置：登录与令牌卡片渲染出来", await wait_js(
+            cdp, session, "document.body.innerText.includes('登录与令牌')"))
+        session_card = await evaluate(cdp, session, """
+        (() => {
+          const card = [...document.querySelectorAll('.page-card')]
+            .find(x => x.textContent.includes('登录与令牌'));
+          if (!card) return '';
+          const text = card.innerText.replace(/\\s+/g, ' ').trim();
+          const buttons = [...card.querySelectorAll('button')].map(b => b.textContent.trim());
+          return JSON.stringify({ text, buttons });
+        })()
+        """)
+        session_card = json.loads(session_card) if session_card else {}
+        card_text = session_card.get("text", "")
+        check("System 设置：卡片里显示当前账号与会话版本（真数字，不是模板占位）",
+              bool(card_text) and "会话版本" in card_text
+              and any(ch.isdigit() for ch in card_text.split("会话版本", 1)[-1][:8]),
+              card_text[:160])
+        check("System 设置：有「退出登录（作废全部令牌）」按钮",
+              any("退出登录" in b for b in session_card.get("buttons", [])),
+              f"卡片里的按钮：{session_card.get('buttons')}")
+
+        await open_page(cdp, session, base, "/admin/users")
+        users_head = await wait_js(cdp, session, """
+        (() => {
+          const ths = [...document.querySelectorAll('table thead th')].map(x => x.textContent.trim());
+          return ths.includes('会话') ? JSON.stringify(ths) : '';
+        })()
+        """, timeout=20)
+        check("用户管理：表头有「会话」列", bool(users_head), f"表头：{users_head}")
+        sessions = await evaluate(cdp, session, """
+        (() => {
+          const rows = [...document.querySelectorAll('table tbody tr')];
+          return JSON.stringify(rows.map(tr => {
+            const cell = [...tr.querySelectorAll('td')].find(td => /未作废过|已作废/.test(td.innerText));
+            const kick = [...tr.querySelectorAll('button')]
+              .find(b => b.textContent.includes('强制下线'));
+            return { session: cell ? cell.innerText.replace(/\\s+/g, ' ').trim() : '',
+                     kick: !!kick, kick_disabled: kick ? kick.disabled : null,
+                     is_self: /当前账号/.test(tr.innerText) };
+          }));
+        })()
+        """)
+        sessions = json.loads(sessions) if sessions else []
+        check("用户管理：每行都有会话状态（未作废过 / 已作废 N 次）",
+              bool(sessions) and all(row["session"] for row in sessions),
+              f"{len(sessions)} 行，示例：{[row['session'] for row in sessions[:3]]}")
+        check("用户管理：每行都有「强制下线」按钮",
+              bool(sessions) and all(row["kick"] for row in sessions), f"{len(sessions)} 行")
+        mine = [row for row in sessions if row["is_self"]]
+        check("用户管理：自己那行的「强制下线」是禁用的（管理接口也拒绝自踢，这是第二道）",
+              bool(mine) and all(row["kick_disabled"] for row in mine), f"自己那行：{mine[:1]}")
 
     return finish(keep_open)
 

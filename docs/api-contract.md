@@ -24,9 +24,24 @@ Authorization: Bearer <access_token>
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/auth/register` | 请求 `{"username","password"}`；用户名重复返回 409 |
-| POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type"}` |
+| POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type","token_version"}` |
+| POST | `/auth/logout` | 退出登录：把该账号的会话版本 +1（此前签发的**每一份**令牌立即失效，含其它设备），返回 `{"username","token_version","logged_out":true}`；留 `user.logout` 审计 |
 | GET | `/auth/me` | 返回 `{id,username,department,departments,unrestricted}`；**权威值是数组 `departments`**，`department` 只是它的第一个元素（回落用），`departments` 为空表示不受限（财务管理员） |
 | PATCH | `/auth/me` | 请求 `{"departments": ["018","097"]}`（字符串形式 `{"department":"018"}` 仍兼容，≤100 字；`[]` 与空串等于清空）；部门只由服务端记录 **`User.departments`** 决定，最多 20 个 |
+
+### 会话版本号（令牌怎么被作废）
+
+JWT 是无状态的，**签出去就收不回来**，所以每个请求都会比对一次版本号：
+
+- 令牌声明里多一个 `ver`（签发时的 `users.token_version`）。`current_user()` 拿它与库里那行比对，
+  不一致就 401，文案是 `{"detail":"登录已失效（该账号已在别处退出，请重新登录）"}`——
+  这个理由与原「登录已失效」（令牌解不开 / 用户不存在）**必须分开**：前者重登即可，后者说明凭据已废。
+- **老令牌与老库都算版本 0**：没有 `ver` 声明的令牌按 0 处理，`token_version` 列是 `NOT NULL DEFAULT 0`，
+  所以升级不会把所有人踢下线。
+- 版本号**只增不减**（回退会让上一次下线前签发的令牌复活）。`POST /auth/logout` 与管理员强制下线
+  都只是 `+1`，数据一行都不动——被踢 ≠ 被停用，重新登录即可继续用。
+- 审计 detail 里的字段叫 `session_version`（不叫 `token_version`）：`audit._scrub()` 是按**子串**匹配
+  敏感键名的，键名含 `token` 会被整条丢掉，结果什么都没记下来。
 
 登录有**滑动窗口限流**（默认 10 次 / 300 秒，按「用户名 + 来源 IP」分桶，配置项 `LOGIN_MAX_ATTEMPTS` /
 `LOGIN_WINDOW_SECONDS`）：超过后即使密码正确也返回
@@ -406,6 +421,8 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 - `rag`：`max_distance`/`candidate_k`。
 - `directories[]`：`{name,path,configured,writable,error}`——`writable` 是真写一个探针文件再删的结果。
 - `data`：`periods`/`latest_period`/`counts{transactions,metrics,alerts,knowledge_chunks,users}`。
+- `me`：`{id,username,department,departments,unrestricted,token_version}`——设置页的「我的部门」与
+  「登录与令牌」卡片都读它；`token_version` 是当前账号的会话版本（令牌里的 `ver` 与它一致才放行）。
 - `config_problems[]`：复用启动时的 `Settings.validate()`（占位密钥、通配 CORS、非本机来源）。
 
 ## 知识库（RAG）
@@ -454,8 +471,9 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | GET | `/admin/overview` | 管理概览：计数、完整性体检、**季/年落库覆盖（`rollups`）**、最近批次、接口观测（含**慢接口告警** `observability.slow_paths`） |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
-| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
+| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
 | PATCH | `/admin/users/{id}` | `{"department":"财务部"}`；空字符串＝清空（升级为管理员） |
+| POST | `/admin/users/{id}/logout` | 强制下线：把该账号的会话版本 +1（它此前签发的令牌全部立刻失效），返回 `{"id","username","token_version","logged_out":true}`；留 `user.force_logout` 审计（含 `from_version`/`to_version`）。对自己操作复用 `_target_user()` 的 **400**（想让自己下线用 `/auth/logout`，两者审计语义不同） |
 | DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据） |
 | GET | `/admin/batches?limit=&offset=` | 按 `import_batch` 分组的批次列表（`total` 是批次个数，`limit` 上限 200） |
 | DELETE | `/admin/batches/{batch}` | 撤销批次：删明细 + 重算或清空受影响期间 |

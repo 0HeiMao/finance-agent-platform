@@ -116,6 +116,23 @@ async function removeUser(user) {
   }
 }
 
+async function forceLogout(user) {
+  busyId.value = user.id
+  error.value = ''
+  notice.value = ''
+  try {
+    const response = await apiFetch(`/admin/users/${user.id}/logout`, { method: 'POST' })
+    const updated = await response.json()
+    user.token_version = updated.token_version
+    notice.value = `已强制下线 ${updated.username}：它此前签发的令牌全部失效（会话版本 ${updated.token_version}）。`
+      + '对方正在打开的页面下一次请求就会被踢回登录页，重新登录即可继续使用。'
+  } catch (e) {
+    error.value = `强制下线失败：${e.message}`
+  } finally {
+    busyId.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -181,7 +198,7 @@ onMounted(load)
             <table>
               <thead>
                 <tr>
-                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>创建时间</th><th>操作</th>
+                  <th>id</th><th>用户名</th><th>角色</th><th>部门（可编辑，多个用「、」分隔）</th><th>会话</th><th>创建时间</th><th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -205,6 +222,10 @@ onMounted(load)
                       :disabled="user.is_self"
                     >
                   </td>
+                  <td>
+                    <span v-if="!user.token_version" class="muted">未作废过</span>
+                    <span v-else>已作废 {{ user.token_version }} 次</span>
+                  </td>
                   <td>{{ user.created_at || '—' }}</td>
                   <td>
                     <div class="row-actions">
@@ -213,6 +234,12 @@ onMounted(load)
                         :disabled="user.is_self || busyId === user.id"
                         @click="saveDepartment(user)"
                       >保存部门</button>
+                      <button
+                        class="btn"
+                        :disabled="user.is_self || busyId === user.id"
+                        title="作废该账号所有已签发的令牌：对方下次请求就会掉线，重新登录即可继续用"
+                        @click="forceLogout(user)"
+                      >强制下线</button>
                       <template v-if="confirmId !== user.id">
                         <button class="btn danger" :disabled="user.is_self" @click="confirmId = user.id">删除</button>
                       </template>
@@ -230,6 +257,8 @@ onMounted(load)
 
           <p class="muted">
             删除账号只移除登录凭据；财务数据按导入批次存在，需要清理请到「导入批次」撤销对应批次。
+            令牌是无状态的（签出去就收不回来），所以「强制下线」的做法是把该账号的<strong>会话版本 +1</strong>：
+            它此前签发的每一份令牌立刻作废，对方下次请求就掉线，重新登录即可继续用——数据不会被改动。
           </p>
         </section>
       </template>

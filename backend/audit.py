@@ -36,6 +36,8 @@ ACTIONS: dict[str, str] = {
     "user.department_self": "修改本人部门",
     "user.department_change": "修改他人部门",
     "user.delete": "删除账号",
+    "user.logout": "退出登录",
+    "user.force_logout": "强制下线",
     "data.import": "导入财务数据",
     "data.export": "导出数据",
     "transaction.update": "更正明细",

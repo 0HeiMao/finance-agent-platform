@@ -19,6 +19,11 @@ class User(Base):
     # 读权限**不要**用它，一律走 backend/scope.py 的 scope_of()（它会优先读 departments，
     # 列表为空时回落到这一列，所以多部门上线前建的账号行为不变）。
     department: Mapped[str | None] = mapped_column(String(100))
+    # 会话版本号：JWT 是无状态的，签发以后服务端收不回来（这正是它「不可撤销」的含义）。
+    # 令牌里带上签发时的 `ver`，每个请求都和这一列比一次：不相等就是「这个令牌已经作废」。
+    # 加一 = 该账号**所有**已发出的令牌立刻失效（退出登录、管理员强制下线都走它）。
+    # 默认 0 而不是 1：上线前签发的令牌没有 `ver` 声明，按 0 处理，所以升级不会把所有人踢下线。
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class FinancialTransaction(Base):

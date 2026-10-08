@@ -53,6 +53,9 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("financial_transactions", "reversed_at", "TIMESTAMP WITH TIME ZONE"),
     ("financial_transactions", "reversed_by", "VARCHAR(100)"),
     ("financial_transactions", "corrections", "INTEGER DEFAULT 0 NOT NULL"),
+    # 会话版本号：老库补列时必须给 DEFAULT 0，否则已有的账号行是 NULL，
+    # 「令牌里的 ver 与这一列比较」当场变成 null != 0 —— 所有人一起被踢下线。
+    ("users", "token_version", "INTEGER DEFAULT 0 NOT NULL"),
 ]
 
 # 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。

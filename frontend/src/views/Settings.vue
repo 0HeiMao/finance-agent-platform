@@ -11,6 +11,8 @@ const error = ref('')
 const saved = ref('')
 const saving = ref(false)
 const department = ref('')
+const loggingOut = ref(false)
+const loggedOut = ref('')
 
 async function load() {
   loading.value = true
@@ -50,6 +52,35 @@ async function saveDepartment() {
 
 function fmtCount(key) {
   return status.value?.data?.counts?.[key] ?? 0
+}
+
+/** 退出登录：先让服务端作废令牌（版本 +1），再清本机令牌。
+ *
+ * 顺序不能反：先清 localStorage 的话 `apiFetch` 就没令牌可带，服务端永远收不到这次退出，
+ * 那份令牌在别处（或已经被人复制走）照样能用。服务端没确认也照常清本机——
+ * 用户点了退出就必须退出，本机这份无论如何都不再留着。
+ * 不自动跳转：留一个「去登录页」按钮，把「服务端已作废」这句话先让用户看见。
+ */
+async function logout() {
+  loggingOut.value = true
+  error.value = ''
+  loggedOut.value = ''
+  try {
+    const r = await apiFetch('/auth/logout', { method: 'POST' })
+    const payload = await r.json()
+    loggedOut.value = `已退出登录：本账号所有已签发的令牌都已作废（会话版本 ${payload.token_version}），`
+      + '在别的设备/浏览器上打开的那一份也会立刻失效。'
+  } catch (e) {
+    loggedOut.value = `本机已退出，但服务端没有确认作废（${e.message}）：如果这是网络问题，`
+      + '请回到有网的环境再点一次；否则请让管理员在「用户管理」里强制下线。'
+  } finally {
+    localStorage.removeItem('access_token')
+    loggingOut.value = false
+  }
+}
+
+function goLogin() {
+  window.location.assign('/login')
 }
 
 onMounted(load)
@@ -116,6 +147,35 @@ onMounted(load)
             当前：<strong>{{ status.me.username }}</strong>（id {{ status.me.id }}）·
             {{ status.me.unrestricted ? '不受部门限制' : `限定 ${departmentsText(status.me.departments)}` }}
           </p>
+        </section>
+
+        <section class="page-card">
+          <div class="card-head"><h2>登录与令牌</h2></div>
+          <p class="muted">
+            令牌（JWT）是无状态的：签发之后服务端本来收不回来。所以「退出登录」不是清掉浏览器里那一份就完事，
+            而是把本账号的<strong>会话版本号 +1</strong>——此前签发的每一份令牌立刻作废，
+            在别的设备上打开的那份也一样（对方下一次请求会收到 401 并被送回登录页）。
+            发现账号可能被别人用时，除了在这里退出，还可以请管理员到「用户管理」里强制下线。
+          </p>
+          <div class="settings-grid">
+            <div>
+              <span>当前账号</span>
+              <strong>{{ status.me.username }}</strong>
+              <small>id {{ status.me.id }} · 会话版本 {{ status.me.token_version ?? 0 }}</small>
+            </div>
+            <div>
+              <span>本机会话</span>
+              <strong>{{ loggedOut ? '已退出' : '有效' }}</strong>
+              <small>{{ loggedOut ? '本机令牌已清除' : '令牌存在浏览器 localStorage（access_token）' }}</small>
+            </div>
+          </div>
+          <div class="upload-box">
+            <button class="btn danger" :disabled="loggingOut || Boolean(loggedOut)" @click="logout">
+              {{ loggingOut ? '退出中…' : '退出登录（作废全部令牌）' }}
+            </button>
+            <button v-if="loggedOut" class="btn primary" @click="goLogin">去登录页</button>
+          </div>
+          <p v-if="loggedOut" class="muted">{{ loggedOut }}</p>
         </section>
 
         <section class="page-card">

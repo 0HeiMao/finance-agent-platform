@@ -130,6 +130,8 @@ def system_status(db: Session = Depends(get_db), user: User = Depends(current_us
             # 一进页面就只看到第一个部门，点保存就把自己缩成了一个部门。
             "departments": list(departments_of(user)),
             "unrestricted": not departments_of(user),
+            # 会话版本号（退出登录/被强制下线的次数）：设置页要显示「我这份令牌是第几版」
+            "token_version": int(user.token_version or 0),
         },
         "config_problems": settings.validate(),
     }

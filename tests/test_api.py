@@ -3150,3 +3150,155 @@ async def test_rollup_rebuild_locks_the_quarter_it_rewrites(anon_client, auth_he
                         if sql.startswith("DELETE FROM financial_rollups"))
     assert first_lock < first_delete, seen
 
+
+# ---------------------------------------------------------------------------
+# 会话版本号与强制下线（③）
+# ---------------------------------------------------------------------------
+
+
+def _claims(token: str) -> dict:
+    """解开令牌看声明：`ver` 就是签发那一刻的会话版本号。"""
+    from jose import jwt as jose_jwt
+
+    from backend.auth import ALGORITHM, SECRET_KEY
+
+    return jose_jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _legacy_token(user_id: int) -> str:
+    """手搓一个「本功能上线之前签发的令牌」：没有 `ver` 声明。
+
+    这类令牌必须继续可用到该账号第一次退出登录为止——否则加这个功能等于把所有人踢下线。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from jose import jwt as jose_jwt
+
+    from backend.auth import ALGORITHM, SECRET_KEY
+
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    return jose_jwt.encode({"sub": str(user_id), "username": "legacy", "exp": expires},
+                           SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def test_token_carries_session_version_and_logout_revokes_it(anon_client, credentials):
+    """退出登录要把**所有**已签发的令牌作废，而不只是清浏览器里那一份。"""
+    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
+    login = await anon_client.post("/api/v1/auth/login", json=credentials)
+    assert login.status_code == 200, login.text
+    token = login.json()["access_token"]
+    assert login.json()["token_version"] == 0
+    assert _claims(token)["ver"] == 0
+    headers = _bearer(token)
+    me = await anon_client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200 and me.json()["token_version"] == 0
+
+    # 同一个账号再登录一次（换一台设备）：两份令牌的 ver 都是 0，都能用
+    other = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(other))).status_code == 200
+
+    logout = await anon_client.post("/api/v1/auth/logout", headers=headers)
+    assert logout.status_code == 200, logout.text
+    assert logout.json() == {"username": credentials["username"], "token_version": 1, "logged_out": True}
+
+    # 两台设备上的旧令牌一起失效，且报的是「已在别处退出」而不是含糊的「登录已失效」
+    for stale in (token, other):
+        denied = await anon_client.get("/api/v1/auth/me", headers=_bearer(stale))
+        assert denied.status_code == 401, denied.text
+        assert "已在别处退出" in denied.json()["detail"]
+
+    # 重新登录拿到 ver=1 的新令牌，可以正常用
+    fresh = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    assert _claims(fresh)["ver"] == 1
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(fresh))).status_code == 200
+
+    # 留痕：谁在什么时候把自己下线了
+    rows = (await _audit(anon_client, _bearer(fresh), action="user.logout"))["data"]
+    row = _find(rows, "user.logout")
+    assert row is not None, rows
+    assert row["actor"] == credentials["username"]
+    assert row["action_label"] == "退出登录"
+    # 键名不含 "token"：audit._scrub() 会把含 token 的字段整条丢掉（所以叫 session_version）
+    assert row["detail"]["session_version"] == 1
+
+
+async def test_legacy_token_without_version_claim_stays_valid_until_bumped(anon_client, credentials, db_session):
+    """没有 `ver` 声明的老令牌按 0 处理：升级当天不会把所有人踢下线，下线后立刻失效。"""
+    from backend.models import User
+
+    response = await anon_client.post("/api/v1/auth/register", json=credentials)
+    assert response.status_code == 200, response.text
+    user_id = response.json()["id"]
+
+    legacy = _legacy_token(user_id)
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(legacy))).status_code == 200
+
+    # 有人（自己或管理员）把这个账号的会话版本 +1 之后，老令牌也一起作废
+    user = db_session.get(User, user_id)
+    user.token_version = 1
+    db_session.flush()
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(legacy))).status_code == 401
+
+
+async def test_admin_can_force_logout_another_account(anon_client, auth_headers):
+    """管理员把人踢下线：目标账号的令牌立刻失效，管理员自己的令牌照旧可用。"""
+    # 刻意用与 auth_headers 不同的账号：那是夹具自己注册的账号，再注册同名会 409
+    victim = {"username": f"kick_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=victim)).status_code == 200
+    target_token = (await anon_client.post("/api/v1/auth/login", json=victim)).json()["access_token"]
+    target_me = await anon_client.get("/api/v1/auth/me", headers=_bearer(target_token))
+    assert target_me.status_code == 200, target_me.text
+    target_id = target_me.json()["id"]
+
+    kicked = await anon_client.post(f"/api/v1/admin/users/{target_id}/logout", headers=auth_headers)
+    assert kicked.status_code == 200, kicked.text
+    assert kicked.json() == {"id": target_id, "username": victim["username"],
+                             "token_version": 1, "logged_out": True}
+
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(target_token))).status_code == 401
+    # 管理员自己不受影响（踢的是别人）
+    assert (await anon_client.get("/api/v1/auth/me", headers=auth_headers)).status_code == 200
+
+    # 目标账号重新登录就能继续用（被踢 ≠ 被停用）
+    again = (await anon_client.post("/api/v1/auth/login", json=victim)).json()["access_token"]
+    assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(again))).status_code == 200
+
+    rows = (await _audit(anon_client, auth_headers, action="user.force_logout"))["data"]
+    row = _find(rows, "user.force_logout", target_id)
+    assert row is not None, rows
+    assert row["action_label"] == "强制下线"
+    assert row["detail"]["to_version"] == 1
+    # 被踢的人自己也能在审计里看到这条（不能只让管理员知道）
+    assert (await _audit(anon_client, _bearer(again), action="user.force_logout"))["data"]
+
+
+async def test_force_logout_guards_self_non_admin_and_unknown(anon_client, auth_headers, db_session):
+    """自己踢自己走 /auth/logout；非管理员的踢人请求是 403；不存在的账号 404。"""
+    me = await anon_client.get("/api/v1/auth/me", headers=auth_headers)
+    my_id = me.json()["id"]
+    self_kick = await anon_client.post(f"/api/v1/admin/users/{my_id}/logout", headers=auth_headers)
+    assert self_kick.status_code == 400, self_kick.text
+    assert "自己" in self_kick.json()["detail"]
+    assert (await anon_client.post("/api/v1/admin/users/99999999/logout", headers=auth_headers)).status_code == 404
+
+    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-password-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=scoped)).status_code == 200
+    token = (await anon_client.post("/api/v1/auth/login", json=scoped)).json()["access_token"]
+    # 新注册账号是没有部门的，而「无部门」在这个项目里就等于财务管理员 —— 必须先收窄成部门账号，
+    # 否则这个用例测的其实还是管理员，会「通过」得毫无意义。
+    narrowed = await anon_client.patch("/api/v1/auth/me", json={"departments": ["部门A"]},
+                                       headers=_bearer(token))
+    assert narrowed.status_code == 200 and narrowed.json()["unrestricted"] is False, narrowed.text
+    denied = await anon_client.post(f"/api/v1/admin/users/{my_id}/logout", headers=_bearer(token))
+    assert denied.status_code == 403, denied.text
+
+    # 名单接口带上会话版本号，管理页才能显示「这个账号被下线过几次」
+    listing = await anon_client.get("/api/v1/admin/users", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    for item in listing.json()["data"]:
+        assert isinstance(item["token_version"], int), item
+

@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from backend import audit, batch_ops, jobs, rollups
 from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.api_analysis import calculate
-from backend.auth import current_user
+from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import (AlertRule, BackgroundJob, FinancialAlert, FinancialMetric, FinancialRollup,
@@ -334,6 +334,8 @@ def list_users(
                 "departments": list(departments_of(user)),
                 "unrestricted": is_admin(user),
                 "created_at": user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else None,
+                # 会话版本号：0 表示「从没退出/被踢过」，>0 表示历史上有过多少次作废动作
+                "token_version": token_version_of(user),
                 "is_self": user.id == me.id,
             }
             for user in users
@@ -400,6 +402,25 @@ def delete_user(user_id: int, request: Request, db: Session = Depends(get_db), m
     db.delete(target)
     db.commit()
     return {"deleted": True, "username": username}
+
+
+@router.post("/users/{user_id}/logout")
+def force_logout_user(user_id: int, request: Request, db: Session = Depends(get_db),
+                      me: User = Depends(admin_user)):
+    """把某个账号**所有**已签发的令牌作废（会话版本号 +1），用于「人在别处、必须立刻踢掉」。
+
+    自己也走 `_target_user` 的 400：管理员想让自己下线，用 `POST /auth/logout` 更合适
+    （那个接口审计的是「本人退出」，这里审计的是「管理员踢人」，混在一起就查不清了）。
+    """
+    target = _target_user(db, user_id, me)
+    previous = token_version_of(target)
+    version = revoke_tokens(target)
+    db.add(target)
+    audit.record(db, me, "user.force_logout", target_type="user", target_id=target.id,
+                 detail={"username": target.username, "from_version": previous, "to_version": version,
+                         "effect": "该账号此前签发的所有令牌立即失效"}, request=request)
+    db.commit()
+    return {"id": target.id, "username": target.username, "token_version": version, "logged_out": True}
 
 
 @router.get("/departments")
