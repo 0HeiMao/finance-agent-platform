@@ -18,6 +18,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import backup_restore as backup  # noqa: E402
 import check_openapi_snapshot as snapshot_gate  # noqa: E402
 import check_visual_baseline  # noqa: E402
 from check_coverage import parse_counts, parse_total  # noqa: E402
@@ -935,5 +936,169 @@ def test_stable_payload_ignores_volatile_fields():
     assert stable_payload("batch.revert2", {"batch": "abc"}) != first
     # 字段顺序不影响指纹
     assert stable_payload("k", {"a": 1, "b": 2}) == stable_payload("k", {"b": 2, "a": 1})
+
+
+# ---------------------------------------------------------------------------- 备份与恢复（⑪）
+
+
+def _sound_backup_manifest():
+    """一份最小的、处处自洽的 manifest + 成员表，用来做「改一个字段就该报一处」的对照。"""
+    payload = b"1\tanalyst\t2026-10-08\n"
+    manifest = {
+        "format": backup.FORMAT,
+        "created_at": "2026-10-08T12:00:00Z",
+        "source": {"database": "finance", "server_version": "16.14", "git_commit": "abc1234"},
+        "database": {
+            "format": backup.COPY_FORMAT,
+            "entries": [{
+                "table": "users",
+                "file": "database/users.copy",
+                "columns": ["id", "username", "created_at"],
+                "rows": 1,
+                "bytes": len(payload),
+                "sha256": backup.digest_bytes(payload),
+            }],
+            "tables": {"users": 1},
+            "total_rows": 1,
+        },
+        "files": {"root": "data/uploads", "prefix": backup.FILES_PREFIX, "count": 0, "bytes": 0, "entries": []},
+        "excluded": [{"path": ".env", "why": "含密钥"}],
+    }
+    members = {backup.MANIFEST_NAME, "database/users.copy"}
+    digests = {"database/users.copy": backup.digest_bytes(payload)}
+    sizes = {"database/users.copy": len(payload)}
+    return manifest, members, digests, sizes
+
+
+def test_backup_manifest_problems_accepts_a_sound_archive():
+    manifest, members, digests, sizes = _sound_backup_manifest()
+    assert backup.manifest_problems(manifest, member_names=members, digests=digests, sizes=sizes) == []
+
+
+def test_backup_manifest_problems_catches_tampering_and_extras():
+    manifest, members, digests, sizes = _sound_backup_manifest()
+
+    def problems(**changes):
+        import copy as copy_module
+
+        broken = copy_module.deepcopy(manifest)
+        members_now = set(members)
+        digests_now = dict(digests)
+        sizes_now = dict(sizes)
+        changes["apply"](broken, members_now, digests_now, sizes_now)
+        return "\n".join(backup.manifest_problems(broken, member_names=members_now,
+                                                  digests=digests_now, sizes=sizes_now))
+
+    def flip_sha(m, _mem, digests_now, _sizes):
+        digests_now["database/users.copy"] = "0" * 64
+
+    def drop_member(m, members_now, _digests, _sizes):
+        members_now.discard("database/users.copy")
+
+    def add_extra(m, members_now, _digests, sizes_now):
+        members_now.add("database/leftover.copy")
+        sizes_now["database/leftover.copy"] = 3
+
+    def wrong_total(m, *_rest):
+        m["database"]["total_rows"] = 2
+
+    def wrong_rows(m, *_rest):
+        m["database"]["entries"][0]["rows"] = 5
+
+    def no_columns(m, *_rest):
+        m["database"]["entries"][0]["columns"] = []
+
+    def wrong_format(m, *_rest):
+        m["format"] = "finance-backup/99"
+
+    def files_count_mismatch(m, *_rest):
+        m["files"]["count"] = 1
+
+    assert "sha256 对不上" in problems(apply=flip_sha)
+    assert "数据文件不在归档里" in problems(apply=drop_member)
+    assert "manifest 没记录的文件：database/leftover.copy" in problems(apply=add_extra)
+    assert "total_rows" in problems(apply=wrong_total)
+    assert "行数与清单不一致" in problems(apply=wrong_rows)
+    assert "列清单不是非空字符串列表" in problems(apply=no_columns)
+    assert "格式版本不认识" in problems(apply=wrong_format)
+    assert "files.count" in problems(apply=files_count_mismatch)
+
+
+def test_backup_safe_member_name_rejects_escapes():
+    assert backup.safe_member_name("database/users.copy") == "database/users.copy"
+    assert backup.safe_member_name("./files/uploads/a.txt") == "./files/uploads/a.txt"
+    for hostile in ["", "/etc/passwd", "../secret", "a/../../b", "a/..", "C:/windows/x", "..\\..\\x"]:
+        with pytest.raises(backup.BackupError):
+            backup.safe_member_name(hostile)
+
+
+def test_backup_read_archive_refuses_members_that_escape(tmp_path):
+    """路径穿越要在读归档时就炸掉，而不是等解包时小心一点。"""
+    import io
+    import tarfile
+
+    hostile = tmp_path / "hostile.tar.gz"
+    with tarfile.open(hostile, "w:gz") as archive:
+        payload = json.dumps({"format": backup.FORMAT}).encode("utf-8")
+        info = tarfile.TarInfo(backup.MANIFEST_NAME)
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+        payload = b"x"
+        info = tarfile.TarInfo("../outside.txt")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    with pytest.raises(backup.BackupError, match="跑到归档外面"):
+        backup.read_archive(hostile)
+
+
+def test_backup_counts_diff_points_at_the_differing_table():
+    assert backup.counts_diff({"users": 5, "audit_logs": 585}, {"users": 5, "audit_logs": 585}) == []
+    problems = backup.counts_diff({"users": 5, "audit_logs": 585}, {"users": 4, "extra": 1})
+    assert len(problems) == 3
+    assert any("users 行数不一致：归档 5，目标库 4" in p for p in problems)
+    assert any("目标库里有表 extra，归档里没有" in p for p in problems)
+    assert any("归档里有表 audit_logs，目标库" in p for p in problems)
+
+
+def test_backup_format_bytes_and_default_archive_path():
+    assert backup.format_bytes(0) == "0 B"
+    assert backup.format_bytes(512) == "512 B"
+    assert backup.format_bytes(2048) == "2.0 KB"
+    assert backup.format_bytes(5 * 1024 * 1024) == "5.0 MB"
+    moment = datetime(2026, 10, 8, 21, 30, 15, tzinfo=UTC)
+    assert backup.default_archive_path(moment, Path("backups")) == Path("backups/finance-20261008-213015.tar.gz")
+
+
+def test_backup_upload_entries_hashes_files(tmp_path):
+    assert backup.upload_entries(tmp_path / "missing") == []
+    root = tmp_path / "uploads"
+    (root / "documents").mkdir(parents=True)
+    (root / "a.txt").write_text("hello", encoding="utf-8")
+    (root / "documents" / "b.txt").write_text("world", encoding="utf-8")
+    entries = backup.upload_entries(root)
+    assert [entry["path"] for entry in entries] == ["files/uploads/a.txt", "files/uploads/documents/b.txt"]
+    assert entries[0]["bytes"] == 5
+    assert entries[0]["sha256"] == backup.digest_bytes(b"hello")
+    assert entries[1]["source"].endswith("b.txt")
+
+
+def test_backup_prune_archives_keeps_the_newest(tmp_path):
+    import os
+
+    made = []
+    for index, stamp in enumerate(["20260101-000000", "20260102-000000", "20260103-000000"]):
+        path = tmp_path / f"finance-{stamp}.tar.gz"
+        path.write_bytes(b"x")
+        os.utime(path, (1_700_000_000 + index * 3600, 1_700_000_000 + index * 3600))
+        made.append(path)
+    removed = backup.prune_archives(tmp_path, keep=2)
+    assert removed == [made[0]]
+    assert sorted(p.name for p in tmp_path.glob(backup.ARCHIVE_GLOB)) == [made[1].name, made[2].name]
+    assert backup.prune_archives(tmp_path / "missing", keep=2) == []
+
+
+def test_backup_serial_columns_drops_unsafe_identifiers():
+    rows = [("users", "id"), ("bad name", "id"), ("users", "id; DROP TABLE users")]
+    assert backup.serial_columns(rows) == [("users", "id")]
 
 

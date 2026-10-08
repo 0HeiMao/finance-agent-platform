@@ -39,3 +39,6 @@ output/node-coverage-tmp/
 data/uploads/
 data/index/
 data/models/
+
+# ⑪ 备份归档（database.dump 里就是整库数据，体积大且常有敏感业务数据，不进仓库）
+backups/

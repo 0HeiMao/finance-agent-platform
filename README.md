@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十三个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十四个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下十四个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十五个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -108,6 +108,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_session_revocation.py` | 会话版本号与强制下线 22 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、部门受限账号 403、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
 | `verify_job_retry.py` | 后台任务幂等与重试 31 项，**分两阶段跑**（「重启之后会怎样」没法在一个进程里验，所以第一阶段埋现场后要重启后端，再跑 `--phase 2`）：无键去重复用队列里那条且 `payload.ip` 不参与指纹、`Idempotency-Key` 提交/同键重放拿回同一条（**成功过的任务重放仍回那条**，批次已被删也不是 404）、换个键拿 404、201 字符的键 422、真库部分唯一索引的 `indexdef` 与「直接插第二条同键」抛 `UniqueViolation`、失败任务第 4 次尝试要等 16 秒退避才回队列且 `next_attempt_at` 真在将来、`job.retry` 审计带 `previous_error`、重试未知任务 404 / 重试非失败状态 409、重启日志里的「启动接续」与埋下的 `running` 残骸被接续跑完（`attempts` 1→2、批次那 3 行真被删），跑完清掉探针批次与验证产生的任务行 |
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
+| `verify_backup_restore.py` | 备份与恢复 29 项：真库打一份归档（9 张表 9928 行 + 上传件）→ `verify` 只对着归档自检（每张表一个 `COPY` 成员、sha256 一个个重算、`.env`/`data/models`/`data/index` 都不在里面且排除理由写在 manifest 里）→ **恢复进临时库 `finance_restore_check`**（先用不带 `--yes` 的一次预演确认「预演之后临时库仍然不存在」，再真恢复）→ 逐表 `count(*)` 与活库对平、`vector` 列 5 行全非空且维度 384、序列已推到 `max(id)` 之后、恢复出的表能真查 → 上传件往返（写探针 → 备份 → 删 → 恢复到 `output/_restore_uploads` → 字节级一致，且**没有**写回真实 `data/uploads`）→ 三个负例该红的都红（改一个数据字节 → `verify` 点名 sha256；清单里多一列 → 恢复拒绝并点名这一列；清单 sha256 改坏 → 恢复拒绝）→ 同一个归档可反复恢复 → 跑完删临时库、探针文件与探针归档，**全程不动演示库 `finance`** |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -165,7 +166,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 192 项、前端 41 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 201 项、前端 41 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -338,7 +339,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **192** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**）、
+`tests/` 下三个文件共 **201** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -451,7 +452,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 192 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 201 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -543,7 +544,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 192 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 201 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 41 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -654,6 +655,61 @@ docker compose down
 它用文件重定向而不是 `subprocess` 管道收 docker 输出——在本机受限沙箱里，python 用管道接子进程时
 docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesktopLinuxEngine`），
 那种环境下脚本会把容器相关几项标 SKIP、只验 HTTP 部分。
+
+## 备份与恢复
+
+一条命令打一份归档（数据库 + 上传件）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\backup_restore.py backup          # → backups\finance-20261008-213015.tar.gz
+.\.venv\Scripts\python.exe scripts\backup_restore.py backup --keep 5 # 只留最近 5 份，其余删掉
+```
+
+实测：**9 张表 9928 行 + 上传件 = 169 KB**（演示库）。归档里只有三样东西：
+
+```
+manifest.json                 来源库/时间/代码 commit、逐表行数与 sha256、被排除的东西与理由
+database/<表名>.copy          每张表一个成员，内容是 PostgreSQL 的 COPY 文本
+files/uploads/**              上传件原样
+```
+
+**为什么不是 `pg_dump`。** 第一版就是拿 `docker exec finance-postgres pg_dump` 写的，两个理由让它改掉了：
+① **本项目的库结构由代码定义**（`backend/models.py` + `backend/migrations.py` 的 `ensure_schema()`），
+备份只需要数据 —— 再把 DDL 抄一份进归档，就会造出「归档里的结构与当前代码不一致」这种没人能修的状态；
+② 本机受限沙箱里 **python 子进程碰不到 Docker Desktop 的命名管道**（捕获输出、`DEVNULL`、重定向到文件、
+`inherit` 四种 stdio 都试过，全是 `permission denied ... npipe:////./pipe/dockerDesktopLinuxEngine`，
+而 pwsh 里直接跑 `docker` 完全正常）。数据库端口本来就发布在宿主机，所以脚本改用 `DATABASE_URL` 直连。
+
+数据走**服务端 `COPY (SELECT …) TO STDOUT` / `COPY … FROM STDIN`**（文本格式）：`vector`、`jsonb`、
+`timestamptz`、`numeric` 的文本形式由服务端自己生成、也由服务端自己解析回去，脚本里不需要序列化任何一种类型。
+实测 `document_chunks.embedding`（pgvector 384 维）往返后仍是 5 行非空、`vector_dims` 仍是 384。
+
+恢复分三步，**默认什么都不写**：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\backup_restore.py verify backups\finance-20261008-213015.tar.gz
+.\.venv\Scripts\python.exe scripts\backup_restore.py restore backups\finance-20261008-213015.tar.gz --database finance_restore_check --create   # 预演
+.\.venv\Scripts\python.exe scripts\backup_restore.py restore backups\finance-20261008-213015.tar.gz --database finance_restore_check --create --yes
+.\.venv\Scripts\python.exe scripts\backup_restore.py compare backups\finance-20261008-213015.tar.gz --database finance_restore_check
+```
+
+- `verify` 只对着归档自己检查（每个成员的 sha256/字节数、逐表行数与清单是否一致、有没有 manifest
+  没记录的多余文件），**不碰数据库**；`restore` 不带 `--yes` 时只打印「恢复几张表、恢复顺序、目标库在不在」。
+- 恢复的目标库默认是**归档里记的来源库**，所以要么显式 `--database`，要么就得接受「恢复到生产库」。
+- 恢复顺序按外键（`Base.metadata.sorted_tables`），装完还会 `setval` 把序列推到 `max(id)`——
+  `COPY` 进来的 id 不推进序列，不补这一步下次插入就撞主键。
+- 「结构来自代码、数据来自归档」的直接后果：**归档里有、当前模型里已经没有的列，恢复会点名这一列并拒绝**，
+  而不是悄悄丢掉。反过来，代码新加的列恢复后是默认值。
+- 归档里**没有** `.env`（含 `AUTH_SECRET_KEY`/`DEEPSEEK_API_KEY`）、`data/models`（约 470 MB，可重下）、
+  `data/index`（`scripts/reindex_embeddings.py` 可重建）、`data/raw` 与 `data/processed`（随 git 分发）。
+  这些理由写在 manifest 的 `excluded` 里，`verify` 会把它们打出来 —— 免得下一个人以为漏了。
+- 归档会被拷来拷去，所以成员名一律过 `safe_member_name`（绝对路径、`..`、盘符、反斜杠直接拒绝），
+  解包时还会再确认落点在目标目录内：路径穿越在读归档那一步就炸，不是「解包时小心一点」。
+
+真机验证是 `scripts/verify_backup_restore.py`（29 项）：拿真库打归档 → 自检 → **恢复进临时库
+`finance_restore_check`** → 逐表 `count(*)` 与活库对平、抽查 `vector` 列与序列 → 上传件往返
+（写探针 → 备份 → 删 → 恢复 → 字节级一致）→ 三个负例（改一个数据字节、清单里多一列、清单 sha256
+改坏）该红的都红 → 同一个归档可反复恢复 → 跑完删掉临时库与探针文件，**全程不动演示库 `finance`**。
 
 ## 页面
 
