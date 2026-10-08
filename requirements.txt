@@ -31,5 +31,8 @@ openai>=1.50,<2.0
 httpx>=0.27,<1.0
 # PPT 报告：用 python-pptx 的原生图表，不需要 matplotlib/PIL 画图（Pillow 是它的传递依赖）。
 python-pptx>=1.0,<2.0
+# 截图基线视觉回归（`scripts/check_visual_baseline.py` 与它的单测）要自己读像素、算差异、写差异图：
+# 这里显式声明 Pillow —— 它本来只是 python-pptx 的传递依赖，靠传递依赖会在对方换实现时突然断掉。
+Pillow>=10.0,<13.0
 # 旧版 .xls（BIFF）只能由 xlrd 读；openpyxl 只认 .xlsx。缺了它导入接口会返回 400 并提示装它或另存为 .xlsx。
 xlrd>=2.0.1,<3.0

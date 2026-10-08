@@ -37,9 +37,13 @@
 12. 接口契约快照（`docs/openapi.json`，由 `scripts/check_openapi_snapshot.py` 生成与比对）必须挂在
     `check_all.py --quick` 上 —— 也就是随 CI 一起跑；README 还得写明怎么更新（`--update`）与快照
     文件在哪。少任何一半，下一个人就会用「删掉这项检查」来让流水线变绿。
+13. 截图基线（`docs/visual-baseline/`）必须提交，而且必须挂在 `check_all.py --with-pages` 上 ——
+    它**故意不进 CI**（像素依赖本机字体渲染），但「图不在版本库里」是最容易犯的错：本地有、别人那边没有，
+    比对会整片不一样，接着就会有人把这一步删掉。README 还得写明怎么重刷（`--update-baseline`）。
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -59,8 +63,8 @@ PLACEHOLDER_SECRET = "change-this-secret-in-env"
 SELF_NAME = Path(__file__).name
 # runner 自带、不属于 backend/config.py 的变量。写错名字的 config 变量不在这里，所以查得出来。
 ALLOWED_EXTRA_ENV = {"PYTHONIOENCODING", "PYTHONUNBUFFERED", "PYTHONPATH", "GITHUB_TOKEN"}
-# 有意不进 CI 的真机脚本：要演示库 / 470MB 向量模型 / 真模型 API Key。
-LIVE_ONLY_SCRIPTS = ("check_pages.py", "ui_components_smoke.py")
+# 有意不进 CI 的真机脚本：要演示库 / 470MB 向量模型 / 真模型 API Key / 本机字体渲染的像素基线。
+LIVE_ONLY_SCRIPTS = ("check_pages.py", "ui_components_smoke.py", "check_visual_baseline.py")
 PATH_RE = re.compile(r"(?:frontend/|scripts/)?[\w][\w./-]*\.(?:py|txt|json|ini|yml|yaml|lock)")
 README_CI_HEADING = "## 持续集成"
 # 两个覆盖率门槛脚本（⑤ 的 CI 与 ⑥ 的阈值）：CI 必须调用它们，README 必须写明它们的阈值。
@@ -78,6 +82,11 @@ README_LINT_HEADING = "### 代码风格与 lint"
 SNAPSHOT_GATE = "check_openapi_snapshot.py"
 SNAPSHOT_PATH = PROJECT_ROOT / "docs" / "openapi.json"
 README_SNAPSHOT_HEADING = "### 接口契约快照"
+# ⑨ 的截图基线：图像与 manifest 必须提交，而且只在本地跑（像素依赖本机字体渲染）。
+VISUAL_GATE = "check_visual_baseline.py"
+VISUAL_BASELINE_DIR = PROJECT_ROOT / "docs" / "visual-baseline"
+VISUAL_MANIFEST = VISUAL_BASELINE_DIR / "manifest.json"
+README_VISUAL_HEADING = "### 截图基线视觉回归"
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -289,6 +298,25 @@ def lint_docs() -> None:
           "排版" in section and "写错" in section, "")
 
 
+def readme_section(heading: str, subsections: bool = False) -> tuple[bool, str]:
+    """取 README 里某个小节的正文，默认到下一个 `##`/`###` 标题为止。
+
+    两个坑：① **不能**用 `find("\\n#")` 找结尾 —— 小节里的 PowerShell 代码块带 `# 注释` 行，会被当成标题
+    截断（「截图基线视觉回归」那一节就这么被截到 187 字符，检查随即误报「没写怎么重刷基线」）；
+    ② 需要连着子小节一起读时（`## 持续集成（CI）` 下的「有意不进 CI 的门禁」）传 `subsections=True`，
+    这时只认 `##`。
+    """
+    if not README_PATH.exists():
+        return False, ""
+    text = README_PATH.read_text(encoding="utf-8")
+    index = text.find(heading)
+    if index < 0:
+        return False, ""
+    rest = text[index + len(heading):]
+    match = re.search(r"^## " if subsections else r"^#{2,3} ", rest, re.MULTILINE)
+    return True, (rest if match is None else rest[:match.start()])
+
+
 # ------------------------------------------------------------------ 「不进 CI」的边界
 
 def live_only_scripts(data: dict) -> None:
@@ -304,14 +332,10 @@ def live_only_scripts(data: dict) -> None:
     check("需要演示数据/模型 Key 的真机脚本没有进 CI", not offenders,
           "、".join(sorted(set(offenders))))
 
-    text = README_PATH.read_text(encoding="utf-8")
-    index = text.find(README_CI_HEADING)
-    if index < 0:
+    found, section = readme_section(README_CI_HEADING, subsections=True)
+    if not found:
         check(f"README 有「{README_CI_HEADING}」一节", False, "没有这一节，CI 的边界没有写下来")
         return
-    rest = text[index + len(README_CI_HEADING):]
-    end = rest.find("\n## ")
-    section = rest if end < 0 else rest[:end]
     check("README 的 CI 一节写明了哪些门禁只在本地跑",
           all(name in section for name in LIVE_ONLY_SCRIPTS),
           f"该节 {len(section)} 字符")
@@ -321,18 +345,11 @@ def live_only_scripts(data: dict) -> None:
 
 def coverage_docs() -> None:
     """两个门槛脚本的阈值必须在 README 里对得上 —— 数字只写在一个地方，另一处对着抄。"""
-    if not README_PATH.exists():
-        check("README 存在", False, str(README_PATH))
-        return
-    text = README_PATH.read_text(encoding="utf-8")
-    index = text.find(README_COVERAGE_HEADING)
-    if index < 0:
+    found, section = readme_section(README_COVERAGE_HEADING)
+    if not found:
         check(f"README 有「{README_COVERAGE_HEADING}」一节", False,
               "阈值与理由得写下来，不然下一个人只会把阈值调低")
         return
-    rest = text[index + len(README_COVERAGE_HEADING):]
-    end = rest.find("\n#")
-    section = rest if end < 0 else rest[:end]
     check("README 的「覆盖率门槛」一节写明了两个门槛脚本",
           all(name in section for name in (COVERAGE_GATE, FRONTEND_COVERAGE_GATE)),
           f"该节 {len(section)} 字符")
@@ -360,22 +377,57 @@ def snapshot_gates() -> None:
 
 def snapshot_docs() -> None:
     """README 得说清快照文件在哪、接口改了怎么更新 —— 否则下一个人只会把这项检查删掉。"""
-    if not README_PATH.exists():
-        check("README 存在", False, str(README_PATH))
-        return
-    text = README_PATH.read_text(encoding="utf-8")
-    index = text.find(README_SNAPSHOT_HEADING)
-    if index < 0:
+    found, section = readme_section(README_SNAPSHOT_HEADING)
+    if not found:
         check(f"README 有「{README_SNAPSHOT_HEADING}」一节", False,
               "不说清怎么更新（--update），这项检查下次就会被删掉")
         return
-    rest = text[index + len(README_SNAPSHOT_HEADING):]
-    end = rest.find("\n#")
-    section = rest if end < 0 else rest[:end]
     check("README 的「接口契约快照」一节写明了怎么更新快照",
           SNAPSHOT_GATE in section and "--update" in section, f"该节 {len(section)} 字符")
     check("README 写明了快照文件就是 docs/openapi.json",
           "docs/openapi.json" in section, "")
+
+
+def visual_gates() -> None:
+    """⑨ 的截图基线：图与 manifest 都得在仓库里，`--with-pages` 也得真的带上比对脚本。
+
+    基线图不在版本库是最容易犯的错 —— 本地有、CI/同事那边没有，比对会「整片不一样」，
+    接着就会有人把这一步删掉。所以这里把「提交了」这件事本身钉成不变量。
+    """
+    check_all = PROJECT_ROOT / "scripts" / CHECK_ALL
+    check(f"{CHECK_ALL} 的 --with-pages 里跑了 {VISUAL_GATE}",
+          check_all.exists() and VISUAL_GATE in check_all.read_text(encoding="utf-8"),
+          f"核对了 {check_all.name}")
+    if not VISUAL_MANIFEST.exists():
+        check("截图基线目录已提交（docs/visual-baseline/manifest.json）", False, str(VISUAL_MANIFEST))
+        return
+    try:
+        manifest = json.loads(VISUAL_MANIFEST.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        check("截图基线的 manifest.json 是合法 JSON", False, f"{exc}")
+        return
+    entries = manifest.get("images") or []
+    pictures = sorted(VISUAL_BASELINE_DIR.glob("*.png"))
+    check("截图基线图与 manifest 一一对应",
+          bool(entries) and len(entries) == len(pictures),
+          f"manifest 记了 {len(entries)} 张，目录里有 {len(pictures)} 张")
+    missing = [entry.get("file") for entry in entries
+               if not (VISUAL_BASELINE_DIR / str(entry.get("file"))).exists()]
+    check("manifest 点名的基线图都在", not missing, "、".join(str(name) for name in missing) or
+          f"{sum(p.stat().st_size for p in pictures) // 1024} KB")
+
+
+def visual_docs() -> None:
+    """README 得写明基线的口径（阈值 / 容差 / 怎么更新），否则下一个人只会提高阈值。"""
+    found, section = readme_section(README_VISUAL_HEADING)
+    if not found:
+        check(f"README 有「{README_VISUAL_HEADING}」一节", False,
+              "不说清怎么更新基线（--update-baseline），这项检查下次就会被删掉")
+        return
+    check("README 的「截图基线视觉回归」一节写明了怎么重刷基线",
+          VISUAL_GATE in section and "--update-baseline" in section, f"该节 {len(section)} 字符")
+    check("README 写明了基线目录就是 docs/visual-baseline",
+          "docs/visual-baseline" in section, "")
 
 
 def main() -> int:
@@ -392,6 +444,8 @@ def main() -> int:
     lint_docs()
     snapshot_gates()
     snapshot_docs()
+    visual_gates()
+    visual_docs()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} 项通过", flush=True)
     return 0 if passed == len(RESULTS) else 1

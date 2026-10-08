@@ -19,8 +19,10 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_openapi_snapshot as snapshot_gate  # noqa: E402
+import check_visual_baseline  # noqa: E402
 from check_coverage import parse_counts, parse_total  # noqa: E402
 from check_frontend_coverage import COVERED_MODULES, parse_coverage_table  # noqa: E402
+from PIL import Image  # noqa: E402
 
 from backend.api_financial import AMOUNT_COLUMNS, validate_row  # noqa: E402
 from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of  # noqa: E402
@@ -817,3 +819,73 @@ def test_snapshot_path_normalization_treats_parameter_names_as_the_same_route():
     assert snapshot_gate.normalize_path("/api/v1/financial/transactions/{id}") == \
         snapshot_gate.normalize_path("/api/v1/financial/transactions/{transaction_id}")
     assert snapshot_gate.normalize_path("/api/v1/health/") == "/api/v1/health"
+
+
+# ------------------------------------------------- 截图基线视觉回归（⑨）
+
+def _solid(size, colour):
+    return Image.new("RGB", size, colour)
+
+
+def test_visual_diff_ignores_differences_within_tolerance():
+    """抗锯齿与字体微调本来就让像素差 1~3：容差之内不许报成「变了」，否则每次跑都是假红。"""
+    base = _solid((4, 4), (100, 100, 100))
+    live = base.copy()
+    live.putpixel((1, 1), (108, 100, 100))  # 单通道差 8 = 容差边界，不算变
+    assert check_visual_baseline.compare_images(base, live, tolerance=8).pixels == 0
+    live.putpixel((1, 1), (109, 100, 100))  # 差 9 > 容差，算变
+    result = check_visual_baseline.compare_images(base, live, tolerance=8)
+    assert result.pixels == 1 and result.ratio == pytest.approx(1 / 16)
+    assert result.max_delta == 9
+
+
+def test_visual_diff_reports_size_mismatch():
+    """版面高度也是视觉结果：多出一行、图表被压扁都会改尺寸，必须单独判失败。"""
+    result = check_visual_baseline.compare_images(_solid((4, 4), (0, 0, 0)), _solid((4, 5), (0, 0, 0)))
+    assert result.size_mismatch is True and result.ratio == 1.0
+
+
+def test_visual_diff_image_marks_changed_pixels_red():
+    """差异图是给人看的：变了的涂红、没变的压成灰 —— 否则「0.4% 不一样」等于让人自己找。"""
+    base = _solid((3, 3), (0, 0, 0))
+    live = base.copy()
+    live.putpixel((2, 2), (255, 255, 255))
+    marked = check_visual_baseline.diff_image(base, live, tolerance=8)
+    assert marked.getpixel((2, 2)) == (220, 30, 30)
+    assert marked.getpixel((0, 0)) != (220, 30, 30)
+
+
+def test_visual_baseline_file_names_are_stable():
+    assert check_visual_baseline.baseline_file("/admin/users", "1440x900") == "admin_users_1440x900.png"
+    assert check_visual_baseline.baseline_file("/", "375x812") == "root_375x812.png"
+
+
+def test_visual_manifest_catches_missing_extra_and_tampered_baselines(tmp_path):
+    """基线目录是数据，光比对不校验数据本身的话：少一张图 = 静默跳过一页，手工改图 = 悄悄改基线。"""
+    picture = tmp_path / "dashboard_1440x900.png"
+    _solid((4, 4), (10, 20, 30)).save(picture)
+    entry = {"page": "/dashboard", "size": "1440x900", "file": picture.name,
+             "width": 4, "height": 4, "sha256": check_visual_baseline.file_digest(picture)}
+    manifest = {"images": [entry]}
+    assert check_visual_baseline.manifest_problems(manifest, tmp_path) == []
+
+    (tmp_path / "extra_1440x900.png").write_bytes(picture.read_bytes())
+    problems = check_visual_baseline.manifest_problems(manifest, tmp_path)
+    assert any("没登记" in problem for problem in problems)
+
+    tampered = tmp_path / "dashboard_1440x900.png"
+    _solid((4, 4), (99, 99, 99)).save(tampered)
+    problems = check_visual_baseline.manifest_problems(manifest, tmp_path)
+    assert any("sha256" in problem for problem in problems)
+
+    bigger = {"images": [dict(entry, width=8)]}
+    assert any("尺寸与 manifest 不符" in problem
+               for problem in check_visual_baseline.manifest_problems(bigger, tmp_path))
+
+
+def test_visual_manifest_reports_missing_file(tmp_path):
+    manifest = {"images": [{"page": "/x", "size": "1440x900", "file": "x_1440x900.png",
+                            "width": 4, "height": 4, "sha256": "0" * 64}]}
+    problems = check_visual_baseline.manifest_problems(manifest, tmp_path)
+    assert problems and "基线图缺失" in problems[0]
+

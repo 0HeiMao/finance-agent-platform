@@ -1,0 +1,80 @@
+{
+  "note": "由 scripts/check_visual_baseline.py --update-baseline 生成：这是首屏视觉基线，有意的界面改动要连图和代码一起提交",
+  "full_page": false,
+  "tolerance": 8,
+  "threshold": 0.002,
+  "images": [
+    {
+      "page": "/admin/users",
+      "size": "1440x900",
+      "file": "admin_users_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 218626,
+      "sha256": "c8754f5790f1da2bf5b501747f2a7997cfad0c35c3a31bcfcc77d4c14f75b110"
+    },
+    {
+      "page": "/agent",
+      "size": "1440x900",
+      "file": "agent_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 104081,
+      "sha256": "1d11e0ae789591099cc5f69854ea67e49def958d2a204ee58465f37a595bb7f4"
+    },
+    {
+      "page": "/analysis/alerts",
+      "size": "1440x900",
+      "file": "analysis_alerts_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 173007,
+      "sha256": "862515b757434ce1efb7cf1ec08cb82dd7bd15db91e44ed95108393c3b1c6f12"
+    },
+    {
+      "page": "/analysis/revenue",
+      "size": "1440x900",
+      "file": "analysis_revenue_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 88765,
+      "sha256": "55b9e5706c394202102db1d8f7d581b4fee0476660061e5e0ceb105a4e880946"
+    },
+    {
+      "page": "/dashboard",
+      "size": "1440x900",
+      "file": "dashboard_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 182532,
+      "sha256": "bbe34931a8ce53bd1c4412da35783a458b107a7a8cffe4d8ab2eb35844351419"
+    },
+    {
+      "page": "/dashboard",
+      "size": "375x812",
+      "file": "dashboard_375x812.png",
+      "width": 375,
+      "height": 812,
+      "bytes": 49222,
+      "sha256": "c8b442b6abb8b138085ddf0615581724e2500313d9088fc38189bcc856675532"
+    },
+    {
+      "page": "/financial/transactions",
+      "size": "1440x900",
+      "file": "financial_transactions_1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "bytes": 162346,
+      "sha256": "e0821369ea49de5fc657a5793f9ef47f3d65de064a7a0d72ad6035ac3d4c8a3d"
+    },
+    {
+      "page": "/settings",
+      "size": "375x812",
+      "file": "settings_375x812.png",
+      "width": 375,
+      "height": 812,
+      "bytes": 78081,
+      "sha256": "722aeba3c870e82b3141e87dc522220ecbfc2b11a7f990ad4f4530ae9ef4e7b9"
+    }
+  ]
+}

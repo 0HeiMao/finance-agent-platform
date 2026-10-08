@@ -16,13 +16,15 @@ python 直接 `SyntaxError: invalid non-printable character U+FEFF`。所以第�
 用法：
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py              # 体检 + lint + 接口快照 + 后端 + 前端（两边都含覆盖率门槛）
     .\\.venv\\Scripts\\python.exe scripts\\check_all.py --quick      # 只做编码/语法体检 + 后端 ruff + 接口契约快照（不碰数据库、不需要 npm）
-    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描
+    .\\.venv\\Scripts\\python.exe scripts\\check_all.py --with-pages # 再加 17 页 × 3 档扫描 + 首屏截图基线比对
       （--with-pages 需要后端 127.0.0.1:8000 与前端 127.0.0.1:5173 已启动）
 
 后端/前端两步分别委托给 `scripts/check_coverage.py` 与 `scripts/check_frontend_coverage.py`：
 覆盖率只有在整套用例都跑完时才有意义，所以阈值判定不放 `pytest.ini`（理由见 README「覆盖率门槛」）。
 接口契约快照（`docs/openapi.json`）也在 `--quick` 这一层：它要导入应用（约 2 秒，不连数据库），
 而「接口改了却没更新快照」正是最该在提交那一刻就红的事（理由见 README「接口契约快照」）。
+`--with-pages` 的两步（页面溢出扫描 + 首屏截图基线）都要求前后端在跑，而且像素依赖本机字体渲染，
+所以它们**不进 CI**（理由见 README「截图基线视觉回归」）。
 """
 from __future__ import annotations
 
@@ -257,6 +259,20 @@ def run_pages() -> Step:
     return step
 
 
+def run_visual_baseline() -> Step:
+    """⑨ 截图基线视觉回归：首屏像素与 `docs/visual-baseline/` 比。"""
+    step = Step("截图基线视觉回归（scripts/check_visual_baseline.py）")
+    code, output = _run([_venv_python(), str(PROJECT_ROOT / "scripts" / "check_visual_baseline.py")],
+                        PROJECT_ROOT)
+    if code != 0:
+        step.detail = ("首屏像素与基线不一致（有意的界面改动：跑 check_visual_baseline.py "
+                       "--update-baseline，把新基线和代码一起提交；差异图在 output/charts/）\n"
+                       + _tail(output, 25))
+        return step
+    step.pass_(f"退出码 0（{sum(1 for line in output.splitlines() if line.startswith('一致'))} 张首屏与基线一致）")
+    return step
+
+
 def main() -> int:
     _console()
     parser = argparse.ArgumentParser(description="一键自检：编码/语法/lint + 接口快照 + 后端测试 + 前端测试")
@@ -274,6 +290,7 @@ def main() -> int:
         steps.append(check_frontend_format())
     if args.with_pages:
         steps.append(run_pages())
+        steps.append(run_visual_baseline())
 
     print("\n结果汇总")
     for step in steps:

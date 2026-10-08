@@ -89,6 +89,7 @@
 （第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
+`check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
 lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `npm run lint`/`npm run format:check` 承担，
 见「代码风格与 lint」一节）：
 
@@ -109,7 +110,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
-还有六个不查数据、只查界面的脚本：
+还有七个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -120,7 +121,9 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
 | `ui_components_smoke.py` | 在真浏览器里点四个自研组件 40 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）、管理概览的慢接口告警区块（标题在、区块不是空白、告警行点名路径与次数，并把这张卡片截到 `output/charts/ui_slow_alerts.png`）、会话版本的两处界面（设置页有「登录与令牌」卡片且会话版本是真数字、有「退出登录」按钮；用户管理表头有「会话」列、每行有会话状态与「强制下线」按钮、自己那行禁用——**刻意不点退出登录**，点了会把 demo 账号的会话版本推进一版）、账号锁定的界面面（用户管理表头有「登录」列、每行登录状态是「正常 / 失败 N 次 / 已锁定」、每行有「解锁」按钮且**演示库没人被锁所以全部禁用**；再清掉本地令牌打开 `guestOnly` 的注册页，核对口令规则提示与 placeholder 都写到「至少 10 位」、填 6 位口令点注册被**前端当场拦下不发请求**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
 
-六个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
+| `check_visual_baseline.py` | 把 8 张首屏截图冻结进仓库（`docs/visual-baseline/`），之后每次跑都逐像素比对：`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、`/financial/transactions`、`/agent`、`/admin/users` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812。单通道差 ≤ 8 不算变、不一样像素占比 > 0.2% 判失败、**基线尺寸变了直接判失败**，并把差异图（变了的地方涂红）写到 `output/charts/`。为什么要有它：`check_pages.py` 只查「无横向溢出 + 渲染出内容」，把 KPI 数字改成白色、把图表容器高度写成 0、把表头文字删掉，它全都照样绿 |
+
+七个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
 ### 一键自检
 
@@ -134,7 +137,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 .\.venv\Scripts\python.exe scripts\check_all.py
 # 只做编码/语法体检 + 后端 ruff + 接口契约快照（几秒钟、不碰数据库，适合改完文件先自查）
 .\.venv\Scripts\python.exe scripts\check_all.py --quick
-# 再加 17 页 × 3 档的真机页面扫描（要求前后端已启动）
+# 再加 17 页 × 3 档的真机页面扫描与首屏截图基线比对（要求前后端已启动）
 .\.venv\Scripts\python.exe scripts\check_all.py --with-pages
 ```
 
@@ -161,7 +164,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 179 项、前端 35 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 185 项、前端 35 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -291,13 +294,50 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 管理员页面的表格与列表同样在三档下核对过：宽表用 `.table-wrap` 横滚，知识库、体检项与部门列表用
 列表卡片，手机上不会只剩第一列。
 
+### 截图基线视觉回归
+
+`check_pages.py` 查的是**几何与存在性**（无横向溢出、页面真的渲染出内容），`ui_*_smoke.py` 查的是**交互路径**。
+这两类都拦不住「没坏但变丑了」：把 KPI 数字改成白色、把图表容器高度写成 0、把表头文字删掉，它们照样全绿。
+所以这里退一步，把**首屏的像素**冻结进仓库，以后每次跑都逐像素比对：
+
+```powershell
+# 比对（要求后端 8000 与前端 dev server 5173 在跑）
+.\.venv\Scripts\python.exe scripts\check_visual_baseline.py
+# 有意的界面改动之后重刷基线，并把 docs/visual-baseline/ 与代码一起提交
+.\.venv\Scripts\python.exe scripts\check_visual_baseline.py --update-baseline
+# 只核对某一页某一档
+.\.venv\Scripts\python.exe scripts\check_visual_baseline.py --pages /settings --sizes 375x812
+```
+
+基线是 `docs/visual-baseline/` 下 8 张首屏图（`/dashboard`、`/analysis/revenue`、`/analysis/alerts`、
+`/financial/transactions`、`/agent`、`/admin/users` 各 1440×900，`/dashboard` 与 `/settings` 各 375×812；
+合计约 1 MB，`manifest.json` 记下每张的页面、视口、宽高与 sha256）。**只截首屏**：整页图动辄 1.7 MB × 17 页，
+进版本库不值当，`--full-page` 留着手动看。
+
+判定口径（都能单测）：单个通道差值 ≤ `--tolerance`（默认 8）不算变 —— 抗锯齿与字体微调本来就让几个像素差 1~3，
+容差太小会把每次运行都变成假红；不一样的像素占比超过 `--threshold`（默认 0.2%）判失败；
+**基线尺寸变了直接判失败**（版面高度也是视觉结果：多出一行、图表被压扁都会改高度）；
+基线文件本身也被校验（少一张、多一张、宽高或 sha256 对不上都报出来）。差异图写到 `output/charts/`，
+**把变了的地方涂红、其余压成灰底**，所以「差 0.4%」不用人自己找。
+
+**页面上会自己变的内容由前端标注 `data-visual-mask`**，截图时注入的样式把它的字变透明（占位还在，
+所以版面变了仍然会红）。这是**在源头消掉噪声**，而不是把阈值抬高到噪声之上：抬高阈值会把真正的视觉改动
+一起放过。现在只有 `/dashboard` 的「数据更新于 2026/10/8 21:3x:xx」用了它 —— 加它之前实测同一份代码跑两次，
+8 张里有 6 张逐像素完全一致，`/dashboard` 两张差 193 / 196 个像素（0.015% / 0.064%，差异图里红点全落在那句时间戳的秒数上），
+加完 `data-visual-mask` 后 8 张**全部 0 像素差异**。
+
+**它不进 CI**：像素依赖本机字体与抗锯齿，换台机器、换个 Edge 版本就会整片差一点，这类基线只在
+「同一台机器上前后的两次运行」之间有比较意义（理由与其它本地门禁一起写在「有意不进 CI 的门禁」一节）。
+在这台机器上它是 `check_all.py --with-pages` 的第二步（第一步是页面溢出扫描）：临时改一处样式（`body` 换个底色）
+实测 **243241/1296000 = 18.769%** 差异 → 退出码 1 并写出差异图，复原后回到 0 像素，所以这条门禁真的会红。
+
 ### 单元测试
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **179** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**）、
+`tests/` 下三个文件共 **185** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -404,7 +444,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 179 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 185 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -496,7 +536,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 179 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 185 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -523,6 +563,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 - `scripts/check_pages.py`（17 页 × 1440/768/375）与 `scripts/ui_components_smoke.py`：要演示数据、
   要真浏览器，后者还会**真的调一次大模型**（要 API Key）。
+- `scripts/check_visual_baseline.py`：像素依赖本机字体与抗锯齿，换台机器、换个 Edge 版本整片都不一样，
+  基线只在「同一台机器上前后两次运行」之间有比较意义（口径与约定见「截图基线视觉回归」一节）。
 - `scripts/verify_*.py`：全是「真 PostgreSQL + 真 ASGI 接口」的验收脚本，要演示批次与本地向量模型
   （470MB，`data/models/` 不进版本库）。
 
@@ -532,13 +574,17 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 ### 工作流自检（`scripts/verify_ci_workflow.py`）
 
 CI 配置本身没有测试，而它「绿」不等于它真的在测东西，所以这份 YAML 由
-`scripts/verify_ci_workflow.py` 静态核对 46 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
+`scripts/verify_ci_workflow.py` 静态核对 51 项，并且**它自己也被工作流调用**（否则这份自检迟早变成
 没人跑的死代码）。它卡住的都是具体的事：镜像 tag 与 `docker-compose.yml` 漂了、少设 `DATABASE_URL`
 （全 skip）、`continue-on-error` 把失败吞了、环境变量名写错退化成默认值、脚本改名后工作流指向一个不存在的
 路径、`npm install` 取代了 `npm ci`、真机脚本混进流水线、README 这一节被删掉、lint 或覆盖率门槛从流水线里
 悄悄消失（含 README 里写的阈值/配置文件与脚本对不上），以及**契约快照这一步被人从 `check_all.py --quick`
-里摘掉、快照文件被删、README 那节没写怎么 `--update`**。它自己也有个坑：`python scripts/xxx.py` 只把
+里摘掉、快照文件被删、README 那节没写怎么 `--update`**、**截图基线图没进版本库或这一步被人从
+`--with-pages` 里摘掉、README 那节没写怎么 `--update-baseline`**。它自己也有个坑：`python scripts/xxx.py` 只把
 `scripts/` 放进 `sys.path`，所以脚本开头得自己把仓库根插进去 —— 这条在本地（带 `PYTHONPATH` 手跑）看不出来。
+它还踩过一个真的解析坑：README 小节里的 PowerShell 代码块带 `# 注释` 行，用 `find("\n#")` 找小节结尾会被
+当成标题截断（「截图基线视觉回归」那节一度只读到 187 字符，于是误报「没写怎么重刷基线」），所以取小节统一走
+`readme_section()`（按 `##`/`###` 标题切，需要连着子小节读时传 `subsections=True`）。
 
 真机等价地跑一遍整条 `backend` job（不需要 GitHub，用空库代替干净的服务）：
 

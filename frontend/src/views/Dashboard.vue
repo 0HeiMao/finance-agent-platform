@@ -240,7 +240,8 @@ const alertRange = computed(() => {
           <div>
             <h1>财务看板概览</h1>
             <p>
-              {{ updatedText }}<span v-if="data && data.range"> · 期间 {{ data.range.label }}</span>
+              <span data-visual-mask>{{ updatedText }}</span>
+              <span v-if="data && data.range"> · 期间 {{ data.range.label }}</span>
             </p>
           </div>
         </div>
