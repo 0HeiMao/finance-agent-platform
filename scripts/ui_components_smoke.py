@@ -1,0 +1,388 @@
+"""⑩ 组件真机冒烟：在真浏览器里点一遍单元测试碰不到的东西。
+
+单元测试（`frontend/tests/*.test.mjs`）跑在自制的对象树渲染器里，能验逻辑、验不了
+「真 DOM + 真接口 + 真流式响应」。这个脚本补上那一段，只看三件事：
+
+1. 口径切换器：真实 `/analysis/departments` 回来的选项、切到某部门后状态真的落盘、
+   页面上出现「只看「…」的明细」提示，切回全公司又消失。
+2. 导出按钮：点「导出 CSV」走真接口，提示里必须出现**后端 Content-Disposition 给的文件名**
+   （`明细-….csv`），不是前端拼的兜底名。
+3. Agent 对话框：真发一问看流式回答；再用 CDP 把 `chat/stream` 断掉制造真实错误，
+   输入框此时已被清空——点「重试」必须重发**上一条问题**（这正是单元测试抓到、
+   修掉的那个 bug：原来重试读的是空输入框，点了等于没点）。
+
+用法（要求后端 8000 与前端 dev server 5173 在跑）：
+
+    .\\.venv\\Scripts\\python.exe scripts\\ui_components_smoke.py
+    .\\.venv\\Scripts\\python.exe scripts\\ui_components_smoke.py --keep-browser
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from check_pages import (  # noqa: E402  （同目录脚本，靠上面的 sys.path 找到）
+    CdpSession,
+    _auto_login_page,
+    _browser,
+    _console,
+    _debugger_url,
+    _post_json,
+)
+
+DEFAULT_BASE = "http://127.0.0.1:5173"
+DEFAULT_API = "http://127.0.0.1:8000"
+USERNAME = "demo_analyst"
+PASSWORD = "demo_password_2026"
+QUESTION = "2026-07 的收入是多少？"
+PORT = 9381
+
+RESULTS: list[tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> bool:
+    RESULTS.append((name, bool(ok), detail))
+    mark = "PASS" if ok else "FAIL"
+    print(f"[{mark}] {name}" + (f" —— {detail}" if detail and not ok else ""), flush=True)
+    return bool(ok)
+
+
+def login(api: str) -> str:
+    payload = _post_json(f"{api}/api/v1/auth/login", {"username": USERNAME, "password": PASSWORD})
+    token = payload.get("access_token")
+    if not token:
+        raise SystemExit(f"登录失败：{payload}")
+    return token
+
+
+async def evaluate(cdp: CdpSession, session: str, expression: str):
+    result = await cdp.send("Runtime.evaluate", {"expression": expression, "returnByValue": True},
+                            session_id=session)
+    return result["result"].get("value")
+
+
+async def wait_js(cdp: CdpSession, session: str, expression: str, timeout: float = 20.0,
+                  poll: float = 0.3):
+    """轮询 JS 谓词，直到它返回真值；返回最后一次的值，方便把现场写进失败信息。"""
+    deadline = time.time() + timeout
+    value = None
+    while True:
+        value = await evaluate(cdp, session, expression)
+        if value:
+            return value
+        if time.time() >= deadline:
+            return value
+        await asyncio.sleep(poll)
+
+
+async def wait_ready(cdp: CdpSession, session: str, timeout: float = 30.0) -> bool:
+    ok = await wait_js(
+        cdp, session,
+        "(() => { const app = document.getElementById('app');"
+        " return !!app && (document.body.innerText || '').trim().length > 200; })()",
+        timeout=timeout)
+    return bool(ok)
+
+
+async def open_page(cdp: CdpSession, session: str, base: str, route: str) -> None:
+    await cdp.navigate(f"{base}/_autologin.html?to={route}", session)
+    if not await wait_ready(cdp, session):
+        raise SystemExit(f"页面没渲染出来：{route}")
+
+
+async def drive(ws_url: str, base: str, api: str, keep_open: bool) -> int:
+    import websockets
+
+    async with websockets.connect(ws_url, max_size=None) as websocket:
+        cdp = CdpSession(websocket)
+        target = await cdp.send("Target.createTarget", {"url": "about:blank"})
+        attached = await cdp.send("Target.attachToTarget",
+                                  {"targetId": target["targetId"], "flatten": True})
+        session = attached["sessionId"]
+        for domain in ("Page.enable", "Runtime.enable", "Network.enable"):
+            await cdp.send(domain, {}, session_id=session)
+
+        # ---------- 口径切换器 + 导出：/analysis/revenue 同时有这两个组件 ----------
+        await open_page(cdp, session, base, "/analysis/revenue")
+        check("口径切换器：真浏览器里渲染出下拉", await evaluate(
+            cdp, session, "!!document.querySelector('.scope-switcher select')"))
+        check("口径切换器：不受限账号默认「全公司（全部部门）」", await evaluate(
+            cdp, session,
+            "(() => { const s = document.querySelector('.scope-switcher select');"
+            " return s ? s.selectedOptions[0].textContent.trim() : ''; })()"
+        ) == "全公司（全部部门）")
+        options = await wait_js(
+            cdp, session,
+            "(() => { const s = document.querySelector('.scope-switcher select');"
+            " if (!s || s.options.length < 2) return '';"
+            " return JSON.stringify([...s.options].map(o => ({ value: o.value, text: o.textContent.trim() }))); })()",
+            timeout=20)
+        options = json.loads(options) if options else []
+        departments = [item for item in (options or []) if item["value"]]
+        check("口径切换器：选项来自真实接口且含部门行", len(departments) >= 1,
+              f"实际选项：{options}")
+        if not departments:
+            return finish(keep_open)
+
+        # 口径是模块级 ref（不落盘，见 frontend/src/api/scope.js 的注释），所以「切了有没有生效」
+        # 只能在网络上看：把 fetch 与 XHR 都记一笔，切完之后请求里必须出现 department=…
+        await evaluate(cdp, session, """
+        (() => {
+          window.__reqs = [];
+          const originalFetch = window.fetch;
+          window.fetch = function (...args) {
+            window.__reqs.push(String(args[0]));
+            return originalFetch.apply(this, args);
+          };
+          const originalOpen = XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+            window.__reqs.push(String(url));
+            return originalOpen.call(this, method, url, ...rest);
+          };
+          return true;
+        })()
+        """)
+
+        picked = departments[0]["value"]
+        switch_js = """
+        (() => {
+          const s = document.querySelector('.scope-switcher select');
+          s.value = %s;
+          s.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        })()
+        """ % json.dumps(picked)
+        await evaluate(cdp, session, switch_js)
+        scoped_call = await wait_js(
+            cdp, session,
+            "(() => { const hit = (window.__reqs || []).find(u => u.includes('department=' + %s));"
+            " return hit || ''; })()" % json.dumps(picked), timeout=15)
+        check(f"口径切换器：切到部门 {picked} 后后续请求带上了 department={picked}",
+              bool(scoped_call), f"记录到的请求：{await evaluate(cdp, session, 'JSON.stringify(window.__reqs)')}")
+        check("口径切换器：页面上出现「只看…的明细」提示", await wait_js(
+            cdp, session,
+            "(() => { const h = document.querySelector('.scope-hint');"
+            " return h ? h.textContent.trim() : ''; })()", timeout=10))
+        await evaluate(cdp, session, """
+        (() => {
+          const s = document.querySelector('.scope-switcher select');
+          s.value = '';
+          s.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        })()
+        """)
+        check("口径切换器：切回全公司后提示消失", await wait_js(
+            cdp, session, "!document.querySelector('.scope-hint')", timeout=10))
+
+        click_js = """
+        (() => {
+          const b = [...document.querySelectorAll('.export-menu button')]
+            .find(x => x.textContent.trim() === %s);
+          if (!b) return false;
+          b.click();
+          return true;
+        })()
+        """ % json.dumps("导出 CSV")
+        check("导出按钮：页面上找得到「导出 CSV」", bool(await evaluate(cdp, session, click_js)))
+        await evaluate(cdp, session, """
+        (() => { const b = [...document.querySelectorAll('.export-menu button')]
+            .find(x => x.textContent.trim() === '导出 CSV'); if (b) b.click(); return true; })()
+        """)
+        message = await wait_js(
+            cdp, session,
+            "(() => { const m = document.querySelector('.export-msg');"
+            " return m ? m.textContent.trim() : ''; })()", timeout=30)
+        check("导出按钮：真下载后用后端给的文件名提示「已保存」",
+              bool(message) and "已保存" in str(message), f"提示：{message}")
+        # 后端（backend/api_export.py:179）给的明细名是 ASCII 的 `transactions-{期间}-{口径}.csv`，
+        # `filename*=` 与 `filename=` 同值，所以这里看不出「中文真名」；但前端兜底名是
+        # `transactions-{期间}.csv`（没有口径后缀），断言带 `-all` 才证明名字来自 Content-Disposition。
+        check("导出按钮：文件名来自 Content-Disposition（带口径后缀）",
+              ".csv" in str(message) and "-all" in str(message), f"提示：{message}")
+        check("导出按钮：提示不带失败样式", not await evaluate(
+            cdp, session,
+            "(() => { const m = document.querySelector('.export-msg');"
+            " return !!m && m.classList.contains('bad'); })()"))
+
+        # ---------- Agent 对话框：真流式 + 断网重试 ----------
+        await open_page(cdp, session, base, "/agent")
+        check("Agent 对话框：真浏览器里渲染出输入框", await evaluate(
+            cdp, session, "!!document.querySelector('.agent-input-row input')"))
+        check("Agent 对话框：空输入点发送不会发问", await evaluate(cdp, session, """
+        (() => {
+          const b = [...document.querySelectorAll('.agent-input-row button')]
+            .find(x => x.textContent.includes('发送'));
+          if (!b) return false;
+          b.click();
+          return document.querySelectorAll('.agent-message').length === 0;
+        })()
+        """))
+
+        type_js = """
+        (() => {
+          const el = document.querySelector('.agent-input-row input');
+          if (!el) return false;
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(el, %s);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          return true;
+        })()
+        """
+        send_js = """
+        (() => {
+          const b = [...document.querySelectorAll('.agent-input-row button')]
+            .find(x => x.textContent.includes('发送'));
+          if (!b) return false;
+          b.click();
+          return true;
+        })()
+        """
+        await evaluate(cdp, session, type_js % json.dumps(QUESTION))
+        await evaluate(cdp, session, send_js)
+        check("Agent 对话框：提问立刻进消息流", bool(await wait_js(
+            cdp, session,
+            "document.querySelectorAll('.agent-message').length >= 2", timeout=20)))
+        answer = await wait_js(cdp, session, """
+        (() => {
+          const rows = [...document.querySelectorAll('.agent-message')];
+          const last = rows[rows.length - 1];
+          if (!last || rows.length < 2) return '';
+          const send = [...document.querySelectorAll('.agent-input-row button')]
+            .find(x => x.textContent.includes('发送'));
+          if (!send) return '';   // 还在流式（按钮显示「停止」）
+          const text = last.innerText.trim();
+          return text.length > 10 ? text : '';
+        })()
+        """, timeout=120)
+        check("Agent 对话框：流式回答落到页面上（真模型调用）", bool(answer),
+              f"末条消息：{str(answer)[:120]}")
+        check("Agent 对话框：回答带依据来源", "依据" in str(answer), f"末条消息：{str(answer)[:200]}")
+
+        await evaluate(cdp, session, """
+        (() => { const b = [...document.querySelectorAll('button')]
+            .find(x => x.textContent.trim() === '清空会话'); if (b) b.click(); return true; })()
+        """)
+        check("Agent 对话框：清空会话后回到空态", bool(await wait_js(
+            cdp, session,
+            "!!document.querySelector('.agent-empty') && document.querySelectorAll('.agent-message').length === 0",
+            timeout=10)))
+
+        # 断掉 chat/stream：前端拿到的是一次真实的连接失败，于是出现错误与「重试」
+        blocked = True
+        try:
+            await cdp.send("Network.setBlockedURLs", {"urls": ["*chat/stream*"]}, session_id=session)
+        except RuntimeError as exc:
+            blocked = False
+            check("Agent 对话框：能断掉 chat/stream 制造真实错误", False, str(exc))
+        if blocked:
+            await evaluate(cdp, session, type_js % json.dumps(QUESTION))
+            await evaluate(cdp, session, send_js)
+            error_text = await wait_js(
+                cdp, session,
+                "(() => { const e = document.querySelector('.agent-error');"
+                " return e ? e.innerText.trim() : ''; })()", timeout=30)
+            check("Agent 对话框：流断掉时页面显示错误", bool(error_text), f"错误区：{error_text}")
+            check("Agent 对话框：错误旁边有「重试」按钮", await evaluate(cdp, session, """
+            [...document.querySelectorAll('button')].some(x => x.textContent.trim() === '重试')
+            """))
+            empty_input = await evaluate(
+                cdp, session, "document.querySelector('.agent-input-row input').value === ''")
+            check("Agent 对话框：此时输入框已经空了（所以重试必须用上一条问题）", bool(empty_input))
+            messages_before = await evaluate(
+                cdp, session, "document.querySelectorAll('.agent-message').length")
+
+            await cdp.send("Network.setBlockedURLs", {"urls": []}, session_id=session)
+            await evaluate(cdp, session, """
+            (() => { const b = [...document.querySelectorAll('button')]
+                .find(x => x.textContent.trim() === '重试'); if (b) b.click(); return true; })()
+            """)
+            retried = await wait_js(cdp, session, """
+            (() => {
+              const rows = [...document.querySelectorAll('.agent-message')];
+              const last = rows[rows.length - 1];
+              if (!last || rows.length < 2) return '';
+              const send = [...document.querySelectorAll('.agent-input-row button')]
+                .find(x => x.textContent.includes('发送'));
+              if (!send) return '';
+              const text = last.innerText.trim();
+              return text.length > 10 ? text : '';
+            })()
+            """, timeout=120)
+            check("Agent 对话框：点「重试」用上一条问题重发并拿到回答", bool(retried),
+                  f"末条消息：{str(retried)[:120]}")
+            check("Agent 对话框：重试后错误区消失", bool(await wait_js(
+                cdp, session, "!document.querySelector('.agent-error')", timeout=10)))
+            check("Agent 对话框：重试后消息流变长（重发的是上一条提问）",
+                  (await evaluate(cdp, session, "document.querySelectorAll('.agent-message').length")
+                   or 0) > (messages_before or 0),
+                  f"重试前 {messages_before} 条")
+            await evaluate(cdp, session, """
+            (() => { const b = [...document.querySelectorAll('button')]
+                .find(x => x.textContent.trim() === '清空会话'); if (b) b.click(); return true; })()
+            """)
+
+    return finish(keep_open)
+
+
+def finish(keep_open: bool) -> int:
+    failed = [item for item in RESULTS if not item[1]]
+    print(f"\n共 {len(RESULTS)} 项：通过 {len(RESULTS) - len(failed)}，失败 {len(failed)}", flush=True)
+    for name, _, detail in failed:
+        print(f"  FAIL {name} —— {detail}", flush=True)
+    return 1 if failed else 0
+
+
+def main() -> int:
+    _console()
+    parser = argparse.ArgumentParser(description="⑩ 组件真机冒烟（真实浏览器 + 真实接口）")
+    parser.add_argument("--base-url", default=DEFAULT_BASE)
+    parser.add_argument("--api-base", default=DEFAULT_API)
+    parser.add_argument("--browser", default="")
+    parser.add_argument("--keep-browser", action="store_true")
+    parser.add_argument("--port", type=int, default=PORT)
+    args = parser.parse_args()
+
+    token = login(args.api_base)
+    page = _auto_login_page(token)
+    profile = Path(tempfile.mkdtemp(prefix="ui-components-"))
+    browser = args.browser or _browser()
+    process = subprocess.Popen(
+        [browser, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+         "--no-default-browser-check", "--disable-extensions",
+         # 和 check_pages.py 同一个坑：从 Python 子进程里启动时 Chromium 的沙箱初始化会卡住，
+         # 表现为**浏览器级命令能回、页面级命令（Page/Runtime/Network）一律不回包**——
+         # 因为没有渲染进程，attach 出来的 session 永远没有响应。
+         "--no-sandbox", f"--remote-debugging-port={args.port}", f"--user-data-dir={profile}",
+         "--window-size=1440,900", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    exit_code = 1
+    try:
+        ws_url = _debugger_url(args.port)
+        exit_code = asyncio.run(drive(ws_url, args.base_url, args.api_base, args.keep_browser))
+    finally:
+        if not args.keep_browser:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            shutil.rmtree(profile, ignore_errors=True)
+            page.unlink(missing_ok=True)
+            print("已关闭无头浏览器并删除临时登录页", flush=True)
+    print(f"UI_COMPONENTS_EXIT={exit_code}", flush=True)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

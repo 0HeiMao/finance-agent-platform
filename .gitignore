@@ -19,6 +19,8 @@ node_modules/
 frontend/dist/
 # 本机跑 `npm run build` 时把 TEMP/TMP 指到工作区里，绕开受限环境对系统临时目录的写入拦截
 frontend/.build-tmp/
+# 同一个理由：在仓库根跑 `npm test`（TEMP 展开成 $PWD 时）会在根目录留一份 Node 编译缓存
+.build-tmp/
 
 # 编辑器/IDE 的本地工程文件
 .idea/

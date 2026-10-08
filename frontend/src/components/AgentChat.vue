@@ -20,6 +20,8 @@ const messages = ref([])
 const loading = ref(false)
 const error = ref('')
 const listRef = ref(null)
+// 「重试」要重发的是上一条问题：发完之后输入框已经被清空，读 input.value 只会拿到空串
+const lastQuestion = ref('')
 let controller = null
 
 const KIND_LABEL = {
@@ -53,6 +55,7 @@ async function scrollToBottom() {
 async function ask(text) {
   const question = (text || '').trim()
   if (!question || loading.value) return
+  lastQuestion.value = question
   error.value = ''
   messages.value.push({ role: 'user', text: question })
   input.value = ''
@@ -89,6 +92,11 @@ async function ask(text) {
 
 function sendMessage() {
   ask(input.value)
+}
+
+/** 「重试」重发上一条问题：发过之后输入框已清空，再读 input.value 只会什么都不做。 */
+function retry() {
+  ask(lastQuestion.value || input.value)
 }
 
 function stop() {
@@ -155,7 +163,7 @@ function clearSession() {
 
     <div v-if="error" class="agent-error">
       {{ error }}
-      <button class="btn" @click="sendMessage">重试</button>
+      <button class="btn" @click="retry">重试</button>
     </div>
 
     <div class="agent-input-row">

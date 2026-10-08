@@ -10,7 +10,7 @@
 │   ├── periods.py        # 月/季/年口径的纯函数（构成月份、规范写法、同粒度上一期）
 │   ├── rollups.py        # 季度/年度合计的落库与读取（financial_rollups 表）
 │   └── transactions.py   # 明细单行更正/冲销（不删原行；改完重算受影响期间）
-├── frontend/             # Vue 3 + Vite 界面；纯函数在 src/utils/，`npm test` 零依赖单测
+├── frontend/             # Vue 3 + Vite 界面；纯函数与 .vue 组件都在 tests/ 下用 `npm test` 零依赖测（无 jsdom）
 │   ├── Dockerfile        # 前端镜像：node 里构建 → nginx 托管静态包并反代 /api
 │   └── nginx.conf        # SPA 回退、/api 反代、SSE 关缓冲
 ├── Dockerfile            # 后端镜像（python:3.11-slim + 单独的 CPU 版 torch）
@@ -99,7 +99,7 @@
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
-还有五个不查数据、只查界面的脚本：
+还有六个不查数据、只查界面的脚本：
 
 | 脚本 | 覆盖范围 |
 | --- | --- |
@@ -108,8 +108,9 @@
 | `ui_alert_review_smoke.py` | 在真浏览器里点预警的「确认异常 / 备注 / 退回」：断言状态徽标与顶部「待处理」计数跟着变（按**相对变化**断言，不写死条数）。`ElMessageBox` 的输入框这类只在点击后才存在的 DOM，只有真点一遍才看得到 |
 | `ui_alert_rule_tiers_smoke.py` | 在真浏览器里核对分档规则页 12 项：「适用范围」列与 `默认`/`分档` 标签、默认行删除按钮禁用并带原因、两个维度都空时前端拦下并提示、用 DOM 填表新增一条分档规则后表格真的多出一行（跑完删掉临时规则） |
 | `ui_transactions_smoke.py` | 在真浏览器里点一遍明细更正页 20 项：筛选到探针期间、点「更正」出现行内编辑区（十个字段）、改收入金额保存后提示带「已重算 2097-03」且单元格变 `777.77`、点「冲销」先要原因再确认、列表从 3 行变 4 行且出现「冲销行」（费用 `-200.00`）与「已冲销」（跑完撤销整批探针数据） |
+| `ui_components_smoke.py` | 在真浏览器里点三个自研组件 22 项：口径切换器（默认项、选项来自真接口、切到某部门后**后续请求真的带上 `department=`**、提示条出现与消失）、导出按钮（真下载 93 行 16 KB 且提示用后端 `Content-Disposition` 的名字）、Agent 对话框（空输入不发问、真模型流式回答带「依据：」、`Network.setBlockedURLs` 断流后出现错误与「重试」、点重试**用的是上一条问题**）。**只有它能发现「单测过了但真页面上不工作」** —— 写它时当场抓到 AgentChat「重试」按钮拿到的是已被清空的输入框 |
 
-五个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
+六个脚本都要求后端 8000 与前端 dev server 5173 在跑（`check_pages.py` 支持 `--sizes/--pages/--out-dir/--viewport-only`）。
 
 ### 一键自检
 
@@ -292,21 +293,36 @@ PPT 的下载用例会真的用 `python-pptx` 打开返回的字节流，断言�
 ### 前端单元测试
 
 ```powershell
-cd frontend; npm test        # 等价于 node --test tests/*.test.mjs
+cd frontend; npm test        # 等价于 node --test --import ./tests/support/register.mjs tests/*.test.mjs
 ```
 
-18 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom**，本机 Node v24 直接用）：
+35 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
   `departmentsText` 反向拼成「018、097」）。去重不只是好看：后端按月校验「行数 == 部门数」，
-  元组里有重复元素会把完整数据判成缺数据。
-  这些函数原本写在 `AdminBatches.vue` 的 `<script setup>` 里，`.vue` 需要编译器才能 import，
-  所以抽成了普通 ES 模块——**能被 node 直接测的纯函数就别留在组件里**。
+  元组里有重复元素会把完整数据判成缺数据。这些函数原本写在 `AdminBatches.vue` 的 `<script setup>` 里，
+  `.vue` 需要编译器才能 import，所以抽成了普通 ES 模块——**能被 node 直接测的纯函数就别留在组件里**。
   时间断言一律用不带时区的本地时间字符串，任何时区的机器结果一致。
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（11 项）：
+  `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
+  `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
+  `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
+  （不能走 Vite 的 `ssrLoadModule`：SFC 被编成 SSR，注入的 `useSSRContext()` 没有上下文，
+  挂载时报 `Cannot read properties of undefined (reading 'modules')`），并把 `src/**/*.js` 里的
+  `import.meta.env` 换成 `(globalThis.__VITE_ENV__ || {})`；
+  `tests/support/render.mjs` 用 Vue 的 `createRenderer` 造了一棵对象树渲染器 + 最小浏览器垫片
+  （`localStorage`/`fetch`/`matchMedia`/`URL.createObjectURL`/`document.createElement('a')`，
+  下载落到 `downloads` 数组里），`mount()` 返回 `text()/button()/click()/fire()/setSelectValue()/input()`。
+  两个垫片细节是必须的：`v-model` 在原生 `input` 上要 `addEventListener` 与 `getRootNode()`
+  （并让根节点 `instanceof globalThis.Document`），`v-html` 的内容要单独记进 `el.rawHtml` 才算可见文本。
+  覆盖的是**行为而不是快照**：分页守卫（末页再点不发事件）、口径切换器写进请求参数、
+  导出提示取自响应头、侧边栏高亮、Agent 的 SSE 流与错误重试。
+  这套测试当场抓到一个真 bug：`AgentChat.vue` 的「重试」按钮读的是发送后已被清空的输入框，
+  等于点了没点——修法是记住 `lastQuestion`。
 
 `npm run build` 在本机沙箱会因 esbuild 清理临时文件被拒而失败
 （`[vite:esbuild-transpile] remove …: Access is denied.`），所以界面验收不靠构建产物，
