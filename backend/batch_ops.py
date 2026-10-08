@@ -34,11 +34,17 @@ def revert_batch(
     actor: str | None = None,
     ip: str | None = None,
     job_id: int | None = None,
+    allow_missing: bool = False,
 ) -> dict:
     """撤销一个批次：先删该批次明细，再重算受影响期间（没有剩余明细的期间连指标一起清掉）。
 
     删除与重算写在同一个事务里：撤销到一半就退出会留下「明细没了、指标还在」的幽灵报表，
     那比不撤销更糟。`audit.record` 也在这条事务里，所以业务回滚时审计不会留下一条假记录。
+
+    `allow_missing`（⑩ 幂等重试）：重跑一个任务时「一行都没删」不是错误，而是**上一次尝试已经把
+    行删掉了**的正常结局——进程可能正是在「删完还没写回任务状态」的那一刻挂的。这时返回
+    `already_reverted=True` 的空结果，任务判成功。第一次尝试（含同步接口）保持严格：空批次就是
+    调用方点错了，必须报 `BatchNotFound`，否则界面会把「批次本来就不存在」显示成撤销成功。
     """
     rows = db.execute(
         select(func.distinct(func.to_char(FinancialTransaction.transaction_date, "YYYY-MM")))
@@ -51,8 +57,21 @@ def revert_batch(
         delete(FinancialTransaction).where(FinancialTransaction.import_batch == batch)
     ).rowcount or 0
     if not deleted:
-        db.rollback()
-        raise BatchNotFound("批次不存在或已被撤销")
+        if not allow_missing:
+            db.rollback()
+            raise BatchNotFound("批次不存在或已被撤销")
+        # 已经撤销过了：不重算、不清指标（上一次尝试已经做完了），只留一条审计说明是重跑
+        audit.record(db, actor, "batch.revert", target_type="batch", target_id=batch,
+                     detail={"deleted_rows": 0, "periods": affected, "recalculated": [],
+                             "cleared": [], "already_reverted": True, "ip": ip, "job": job_id})
+        db.commit()
+        return {
+            "batch": batch,
+            "deleted_rows": 0,
+            "recalculated": [],
+            "cleared": [],
+            "already_reverted": True,
+        }
 
     recalculated: list[str] = []
     cleared: list[str] = []

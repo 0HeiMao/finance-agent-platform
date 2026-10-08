@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下十三个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十四个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -106,6 +106,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_indexes.py` | 明细读路径索引 23 项：`missing_indexes()` 在真库上为空、三条索引的 `indexdef` 与列顺序（`(department, transaction_date)`，顺序反了第二列就用不上）、按期间拉明细结果与旧口径一致（93 行）、管理概览不断、`EXPLAIN (ANALYZE)` 里「部门 + 期间」真的走 `ix_financial_transactions_department_date`、冲销来源/预警状态各走自己的索引、**旧的 `to_char(...)` 形状用不上复合索引**（`Filter` 里逐行算）、80 万行同构临时表上 `Seq Scan` 36.70 ms → 建完复合索引 0.02 ms（1931×）、同结果集的一对写法（1314 行）区间比较 5.1× 且 `Index Cond` 里带日期、跑完 `DROP TABLE` |
 | `verify_recalc_lock.py` | 并发重算互斥（期间锁）18 项：锁 key 稳定/不撞号/在 bigint 内、月会连季与年一起锁且按名字排序、起始干净（无数据无残留锁）、**进程外一条真连接持锁时另一个事务真的被挡住**（`SET LOCAL lock_timeout='400ms'` 必报 lock timeout）、另一年不被挡、同年不同季共享年锁而不同年份零共享、持锁方提交/回滚都自动释放、真机 HTTP：无竞争重算 32 ms → 有人持锁 2031 ms（持锁 2000 ms）、导入与单行更正同样被挡且指标随后等于明细之和、两个并发重算都 200 且不丢更新、跑完 0 条残留 advisory 锁 |
 | `verify_session_revocation.py` | 会话版本号与强制下线 22 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、部门受限账号 403、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
+| `verify_job_retry.py` | 后台任务幂等与重试 31 项，**分两阶段跑**（「重启之后会怎样」没法在一个进程里验，所以第一阶段埋现场后要重启后端，再跑 `--phase 2`）：无键去重复用队列里那条且 `payload.ip` 不参与指纹、`Idempotency-Key` 提交/同键重放拿回同一条（**成功过的任务重放仍回那条**，批次已被删也不是 404）、换个键拿 404、201 字符的键 422、真库部分唯一索引的 `indexdef` 与「直接插第二条同键」抛 `UniqueViolation`、失败任务第 4 次尝试要等 16 秒退避才回队列且 `next_attempt_at` 真在将来、`job.retry` 审计带 `previous_error`、重试未知任务 404 / 重试非失败状态 409、重启日志里的「启动接续」与埋下的 `running` 残骸被接续跑完（`attempts` 1→2、批次那 3 行真被删），跑完清掉探针批次与验证产生的任务行 |
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
@@ -164,7 +165,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 185 项、前端 35 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 192 项、前端 41 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -337,7 +338,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **185** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**）、
+`tests/` 下三个文件共 **192** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -356,7 +357,12 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 `offset` 真的换页、部门/是否受限与文档类型筛选、`status` 在服务端过滤、越界参数 422）→
 **后台任务**：提交后立刻 202 且明细还在（提交 ≠ 执行）、执行成功才删明细并重算、
 审计里带任务 id、不存在的批次 404 且不留任务记录、未注册的任务类型标记失败、
-重启收尸把 queued/running 标成失败、非管理员 403→**结构漂移**：模型里的列都在真库里
+双击同一批次不排出第二条任务（`deduplicated: true`）、同一个 `Idempotency-Key` 重放拿回同一条任务
+（连已经成功过的也算，且同一个键在批次已被删掉之后仍然回同一条任务而不是 404）、超长键 422、
+失败按 2/4/8… 秒退避自动重排（`next_attempt_at` 有值才算在等）、重跑时「一行都没删」判成功并标
+`already_reverted`（审计里第二条 `batch.revert` 记 `deleted_rows: 0`）、人工重试只认 failed 且
+**追加**一份预算（原失败原因保留、留 `job.retry` 审计）、重启接续把 queued/running 放回队列
+（预算用完或类型已注销才判失败）、非管理员 403→**结构漂移**：模型里的列都在真库里
 （漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）、模型里声明的索引也都在真库里且列顺序不变
 （漏写 `migrations.INDEXES` 时点名）、明细接口发出的 SQL 里期间过滤是区间比较而不是 `to_char`（抓真实
 执行的 SQL 断言）、**从零建的库也建得全**：子进程里只导入 `backend.migrations` 时 `document_chunks`
@@ -396,7 +402,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
-35 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
+41 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
@@ -407,7 +413,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
-- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（11 项）：
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（14 项）：
   `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
   `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
   `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
@@ -420,7 +426,8 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
   两个垫片细节是必须的：`v-model` 在原生 `input` 上要 `addEventListener` 与 `getRootNode()`
   （并让根节点 `instanceof globalThis.Document`），`v-html` 的内容要单独记进 `el.rawHtml` 才算可见文本。
   覆盖的是**行为而不是快照**：分页守卫（末页再点不发事件）、口径切换器写进请求参数、
-  导出提示取自响应头、侧边栏高亮、Agent 的 SSE 流与错误重试。
+  导出提示取自响应头、侧边栏高亮、Agent 的 SSE 流与错误重试、后台任务失败行点「重试」打的是
+  `POST /admin/jobs/{id}/retry`、被后端去重时提示的是「没有重复提交」而不是「已提交」。
   这套测试当场抓到一个真 bug：`AgentChat.vue` 的「重试」按钮读的是发送后已被清空的输入框，
   等于点了没点——修法是记住 `lastQuestion`。
 
@@ -444,7 +451,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 185 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 87.96%、分支 87.42% | **87.0% / 86.0%** | 全量 192 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.37% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -501,7 +508,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 `docs/api-contract.md` 是**手写**的散文契约（先 409 再 400 的顺序、两处 429 的文案必须一字不差、
 `session_version` 为什么不能叫 `token_version`），写得细，但**没有任何东西保证它和代码一致** ——
 删掉一个接口、把 `period` 从必填改成可选、给响应模型加一个字段，散文不会自己跟着变。
-机器可读的那一半由 FastAPI 生成，整份冻结成 `docs/openapi.json`（当前 70 个接口 / 23 个模型 / 128 KB）：
+机器可读的那一半由 FastAPI 生成，整份冻结成 `docs/openapi.json`（当前 71 个接口 / 23 个模型 / 130 KB）：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_openapi_snapshot.py           # 比对（check_all --quick 里已经包含这一步）
@@ -510,7 +517,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 它查三件事：快照与**当前代码生成的**接口逐字节一致；`docs/api-contract.md` 接口表里点名的每个
 「方法 + 路径」都真实存在；每个接口都带一句说明（`summary` / `description`，即路由函数的 docstring）。
-不一致时它打印的是人话差异，而不是让人自己去看 128 KB 的 JSON diff：
+不一致时它打印的是人话差异，而不是让人自己去看 130 KB 的 JSON diff：
 
 ```text
 + 新增接口 POST /api/v1/admin/rollups/rebuild
@@ -536,8 +543,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 185 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 35 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 192 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 41 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -664,7 +671,7 @@ docker CLI 连不上 Docker Desktop 的命名管道（`npipe://./pipe/dockerDesk
 | `/agent` | 财务分析 Agent 工作台（示例问题 + 流式问答 + 依据） | `POST /ai/agent/chat/stream`（SSE） |
 | `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild` |
 | `/admin/users` | 用户管理（按用户名/部门/是否受限筛选、分页、改部门、删除） | `GET/PATCH/DELETE /admin/users[/{id}]` |
-| `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs` |
+| `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务：第几次尝试、失败可**重试**） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs`、`POST /admin/jobs/{job_id}/retry` |
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
 | `/admin/departments` | 部门权限（账号绑部门、各部门数据规模） | `GET /admin/departments`、`PATCH /admin/users/{id}` |
 | `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述；按部门、按期间分档） | `GET /admin/alert-rules`、`POST /admin/alert-rules`、`PUT /admin/alert-rules/id/{id}`、`DELETE /admin/alert-rules/id/{id}`、`PUT /admin/alert-rules/{alert_type}`（只改默认规则） |
@@ -841,7 +848,7 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   中文标签）、对象类型与 id、来源 IP、以及一小袋 detail（如改规则的前后阈值、撤销批次删了多少行）。
   **不记密码、令牌、文件内容与明细金额**：`_scrub()` 会把键名含 `password/token/secret/authorization/api_key/hash`
   的字段整条丢掉（任意嵌套深度都丢）、字符串截断到 200 字、列表只留前 50 项。
-- 17 个动作在 `ACTIONS` 里登记；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
+- 28 个动作在 `ACTIONS` 里登记（含 ⑩ 的 `job.retry` 重试后台任务）；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
 - **审计失败不影响业务**：`record()` 内部兜住所有异常，写日志失败只记 error，不会把接口带崩。
 - detail 与业务写在**同一个事务**里（`record(..., commit=False)`），业务回滚时日志也不落地；
   只有登录失败/被限流这两条走 `commit=True`（那时没有业务事务可依附）。
@@ -908,16 +915,44 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   自己开一个 `Session`（请求级 Session 那时已经关了）。
 - **状态机**：`queued → running → succeeded / failed`。失败原因截断到 500 字写进 `error`，
   结果（删除行数、重算期间、清空期间）写进 `result`，界面上「最近的后台任务」直接读它。
-- **重启收尸**：进程重启时 `jobs.reap_stale_jobs()` 把遗留的 `queued`/`running` 一律标成
-  `failed`（`error = 进程重启，任务未完成`）——否则界面上会永远挂着一个「运行中」。
-  代价说明写进了代码 docstring：**这是单进程内存队列，多副本部署要换成外部队列**。
+- **提交是幂等的**：同一批次已有任务在队列里（`queued`/`running`）时再点一次，不排第二条，
+  返回的还是那条老任务并带上 `deduplicated: true`（界面上必须说出来，否则用户以为点了两次就撤销了两次）。
+  另外认 `Idempotency-Key` 请求头：同一个键重放拿回同一条任务 —— **连已经成功过的也算**，
+  因为「这个键代表的那件事已经做完了」正是客户端重试时最想听到的答案。兜底是一张
+  **部分唯一索引**（`idempotency_key` 唯一，但只约束 `queued/running/succeeded`）：先查后插在并发下
+  仍有窗口，索引负责在那一刻抛 `IntegrityError`，代码捕获后回头取那条已存在的任务。
+  键**不参与**活跃去重的指纹计算：`payload` 里的 `ip` 每请求都在变，拿它当身份会让同一次撤销被排两遍。
+- **失败会重试**：处理函数抛异常不再等于判死。`attempts` 每次执行加一，`max_attempts` 默认 3；
+  还有预算就放回 `queued` 并写 `next_attempt_at = now + 2·2^(n-1) 秒`（封顶 60 秒，退避序列 2、4、8…），
+  由模块级 `SCHEDULER`（默认 `threading.Timer`，测试直接替换它）到点再跑一次；预算用尽才落 `failed`。
+- **重复执行必须安全**：处理函数要按**幂等**写。撤销任务的重跑是这样收口的 —— `context["is_retry"]`
+  会传给 `batch_ops.revert_batch(..., allow_missing=...)`：第一次跑时「一行都没删」是真异常（批次不存在
+  或已被别人撤销），重跑时同样的情形说明**上次已经把活干完了**，于是判成功并在 `result` 里标
+  `already_reverted: true`，而不是让一个已经完成的任务永远显示失败。
+- **重启接续**：进程重启时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running` 放回队列接着跑
+  （`error = 进程重启，任务已重新排队（下次是第 N 次尝试）`），并且**保留**已经用掉的尝试次数；
+  只有两种情况判失败：预算已用完（`error` 里点名用了几次），或者这个 `kind` 已经没有处理函数了
+  （代码删了、库里还留着行）。放回队列的任务会立刻被调度一次，所以重启后不需要人工去点。
+- **人工重试**：`POST /admin/jobs/{job_id}/retry`（只认 `failed`，其它状态 409）把任务放回队列并
+  **追加**一份预算（`max_attempts = attempts + 3`），不把 `attempts` 归零 —— 归零会让重跑被当成
+  「第一次尝试」，正好丢掉「上次可能已经做完了」这个信息。上次的失败原因保留在 `error` 里，
+  按下去会在 `audit` 记一条 `job.retry`（带 `previous_error`）。
 - **提交不等于执行**：用例专门断言「POST 之后明细还在」，再手工调 `jobs.run_job` 才断言数据被删，
   避免把「入队成功」当成「撤销完成」。
 - **撤销逻辑只有一份**：同步的 `DELETE /admin/batches/{batch}` 与后台任务都调
   `backend/batch_ops.revert_batch()`——删除、重算、审计写在同一个事务里，撤销到一半不会留下
   「明细没了、指标还在」的幽灵报表。
+- **单进程内存队列的边界**：多副本部署要换成外部队列。`BackgroundTasks` + `threading.Timer` 只在这一个
+  进程里有意义（重试定时器重启即丢，靠启动接续补回来；但两个副本会各自接续同一批任务），
+  所以这条约束写进了代码 docstring 与本节。
 - 前端 `/admin/batches` 提交后按 800ms 轮询任务状态，撤销中的批次按钮变成「撤销中…」并禁止重复提交；
-  页面下方列出最近 5 条任务（类型/状态/提交人/耗时/结果）。
+  页面下方列出最近 5 条任务（类型/状态/第几次尝试/提交人/耗时/结果），失败的行有「重试」按钮，
+  排队等退避的行把 `next_attempt_at` 显示在结果列的 tooltip 里。
+- **真机验证**：`scripts/verify_job_retry.py`（31 项）打真后端、查真库，**分两阶段**——第一阶段跑完会把
+  一条任务造成 `running` 残骸并写下 `output/_job_retry_state.json`，人为重启后端（启动日志里能看到
+  「启动接续：N 条未完成的后台任务已重新排队」），第二阶段再确认那条残骸被接续跑完（`attempts` 从 1 涨到 2、
+  批次的行真的被删掉）。这条链路里「重启」是脚本自己造不出来的前提，所以立项时就按两阶段设计，
+  而不是把重启之后的断言删掉。
 
 ### 安全收口
 

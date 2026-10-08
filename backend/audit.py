@@ -48,6 +48,7 @@ ACTIONS: dict[str, str] = {
     "metrics.calculate": "重算指标",
     "rollups.rebuild": "重算季/年落库",
     "batch.revert": "撤销导入批次",
+    "job.retry": "重试后台任务",
     "knowledge.add": "写入知识库",
     "knowledge.delete": "删除知识库来源",
     "alert.review": "处理预警",

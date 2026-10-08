@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, Index, Integer, Numeric, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -198,8 +198,10 @@ class BackgroundJob(Base):
     `run_monthly_analysis` 也没人调用。真需要异步的只有「撤销批次」这一条（期间多、每期全量重算），
     于是用「进程内线程 + 这张表」落地：任务状态可查询、失败有记录，不再假装有一个消息队列。
 
-    代价写在 README 里：单进程内存队列，进程重启时未完成的任务由 `jobs.reap_stale_jobs()` 标记失败，
-    多副本部署需要换成真正的外部队列。
+    代价写在 README 里：单进程内存队列，多副本部署需要换成真正的外部队列。进程重启时
+    `jobs.resume_interrupted_jobs()` 会把还挂在 `queued`/`running` 的记录**重新排队重跑**
+    （所以处理函数必须幂等：同一份 payload 跑两遍不能多删一行、也不能报「已经被撤销了」），
+    已经用完重试预算的才标记为失败。
     """
     __tablename__ = "background_jobs"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -213,3 +215,23 @@ class BackgroundJob(Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ⑩ 幂等：调用方给的去重键（HTTP 头 `Idempotency-Key`，没有就留空）。
+    # 唯一性是**部分**的（见 __table_args__）：同一个键同时只能有一条「排队中/运行中/成功过」的任务，
+    # 但失败过的不算 —— 失败之后本来就该允许拿同一个键重新提交。
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    # 重试：`attempts` 是已经试过几次（`run_job` 一进来就加一），`max_attempts` 是预算，
+    # `next_attempt_at` 是下一次重试的时间（只有 status=queued 且它非空时才是「等重试」）。
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default="3")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        # 「先查再插」在并发下会漏：两个请求同时查空、各自插一条。这条部分唯一索引把它变成
+        # 数据库层面的保证，撞上时 `jobs.submit()` 把已有那条读回来，接口照样返回同一个任务 id。
+        # 谓词里没有 failed —— 失败的任务不占键，人工重试与重新提交都不该被一条旧记录挡住。
+        Index(
+            "uq_background_jobs_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running', 'succeeded')"),
+        ),
+    )

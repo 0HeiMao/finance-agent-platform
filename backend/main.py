@@ -25,7 +25,7 @@ from backend.api_system import router as system_router
 from backend.auth import router as auth_router
 from backend.config import get_settings
 from backend.db import engine
-from backend.jobs import reap_stale_jobs
+from backend.jobs import resume_interrupted_jobs
 from backend.migrations import ensure_schema, missing_columns, missing_indexes
 from backend.observability import record_request, snapshot
 
@@ -105,15 +105,20 @@ def _validate_config_on_startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("schema 迁移失败（数据库可能不可用）：%s", exc)
 
-    # 后台任务是进程内队列：进程重启时还挂在 queued/running 的记录再也不会有人来跑，
-    # 必须在这里收尸，否则界面上会永远显示"运行中"。
+    # 后台任务是进程内队列：进程重启时还挂在 queued/running 的记录不会有人来跑。
+    # ⑩ 之后不再一律判死——处理函数是幂等的，所以默认**重新排队重跑**（启动后各开一个定时器执行），
+    # 只有「类型已经没有处理函数」和「已经用完重试预算」两种情况才标记失败。
     try:
         with Session(engine) as session:
-            reaped = reap_stale_jobs(session)
-        if reaped:
-            logger.info("启动清理：%s 条未完成的后台任务已标记为失败", reaped)
+            resumed = resume_interrupted_jobs(session)
+        if resumed["requeued"]:
+            logger.info("启动接续：%s 条未完成的后台任务已重新排队：%s",
+                        len(resumed["requeued"]), resumed["requeued"])
+        if resumed["failed"]:
+            logger.info("启动清理：%s 条未完成的后台任务已标记为失败：%s",
+                        len(resumed["failed"]), resumed["failed"])
     except Exception as exc:  # noqa: BLE001
-        logger.error("后台任务清理失败：%s", exc)
+        logger.error("后台任务接续失败：%s", exc)
 
     # 慢接口告警的阈值只在启动时说一次：出问题时看日志的人得知道「超过多少才算慢」，
     # 否则一条告警到底严不严无从判断。

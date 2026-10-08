@@ -4,11 +4,13 @@ import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
 import PagePager from '../components/PagePager.vue'
 import {
+  attemptsText,
   describeResult,
   durationText,
   formatTime,
   periodsText,
   resultText,
+  retryWaitText,
   statusLabel
 } from '../utils/format'
 
@@ -117,11 +119,34 @@ async function removeBatch(batch) {
     const job = await response.json()
     pendingBatch.value = batch.batch
     confirmBatch.value = ''
-    notice.value = `已提交后台任务 #${job.id}：正在删除 ${batch.rows} 行明细并重算受影响期间，可以离开本页。`
+    // ⑩ 后端会挡住重复提交：同一批次已有任务在跑 / 已经用同一个 Idempotency-Key 交过，
+    // 回来的还是那条老任务。必须说出来，否则用户以为点了两次就撤销了两次。
+    notice.value = job.deduplicated
+      ? `这个批次的撤销任务 #${job.id} 已经在队列里了（${statusLabel(job.status)}），没有重复提交。`
+      : `已提交后台任务 #${job.id}：正在删除 ${batch.rows} 行明细并重算受影响期间，可以离开本页。`
     loadJobs()
     watchJob(job.id)
   } catch (e) {
     error.value = `撤销失败：${e.message}`
+  } finally {
+    busy.value = ''
+  }
+}
+
+/** ⑩ 失败任务的人工重试：后端会追加一份预算并把它放回队列，这里接着轮询。 */
+async function retryJob(job) {
+  error.value = ''
+  notice.value = ''
+  busy.value = `job-${job.id}`
+  try {
+    const response = await apiFetch(`/admin/jobs/${job.id}/retry`, { method: 'POST' })
+    const updated = await response.json()
+    notice.value = `任务 #${updated.id} 已重新排队（第 ${Number(updated.attempts || 0) + 1}/${updated.max_attempts} 次尝试）。`
+    await loadJobs()
+    watchJob(updated.id)
+    pendingBatch.value = ''
+  } catch (e) {
+    error.value = `重试失败：${e.message}`
   } finally {
     busy.value = ''
   }
@@ -262,6 +287,7 @@ onUnmounted(stopPolling)
                   <th>提交时间</th>
                   <th>耗时</th>
                   <th>结果</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -270,17 +296,30 @@ onUnmounted(stopPolling)
                   <td>{{ job.kind_label }}</td>
                   <td>
                     <span class="job-status" :class="job.status">{{ statusLabel(job.status) }}</span>
+                    <div class="muted">{{ attemptsText(job) }}</div>
                   </td>
                   <td>{{ job.actor || '—' }}</td>
                   <td>{{ formatTime(job.created_at) }}</td>
                   <td>{{ durationText(job) }}</td>
-                  <td :title="resultText(job)">{{ resultText(job) }}</td>
+                  <td :title="retryWaitText(job)">{{ resultText(job) }}</td>
+                  <td>
+                    <button
+                      v-if="job.status === 'failed'"
+                      class="btn"
+                      :disabled="busy === `job-${job.id}`"
+                      @click="retryJob(job)"
+                    >
+                      {{ busy === `job-${job.id}` ? '提交中…' : '重试' }}
+                    </button>
+                    <span v-else class="muted">—</span>
+                  </td>
                 </tr>
               </tbody>
             </table>
           </div>
           <p class="muted">
-            后台任务是进程内队列：进程重启会把未完成的任务标记为失败，多副本部署需要换成外部队列。
+            后台任务是进程内队列：进程重启会把未完成的任务重新排队接着跑；失败按
+            2、4、8…秒退避自动重试，用完预算才判失败，之后可以在这里人工重试（追加一份预算）。多副本部署需要换成外部队列。
           </p>
         </section>
       </template>

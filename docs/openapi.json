@@ -1881,7 +1881,7 @@
     },
     "/api/v1/admin/jobs/batch-revert": {
       "post": {
-        "description": "把「撤销批次 + 重算」排成后台任务，立刻返回 `202` 与任务记录。\n\n提交前只做一次便宜的 `count(*)` 校验：批次不存在就直接 404，不必为一个注定失败的任务\n建一条记录（那样界面上会长出一条没人能修的 failed，而用户其实只是点错了）。\n真正的删除与重算在 `jobs.run_job` 里执行，失败原因落在任务的 `error` 上。",
+        "description": "把「撤销批次 + 重算」排成后台任务，立刻返回 `202` 与任务记录。\n\n提交前只做一次便宜的 `count(*)` 校验：批次不存在就直接 404，不必为一个注定失败的任务\n建一条记录（那样界面上会长出一条没人能修的 failed，而用户其实只是点错了）。\n真正的删除与重算在 `jobs.run_job` 里执行，失败原因落在任务的 `error` 上。\n\n**幂等**（⑩）：请求头 `Idempotency-Key` 有值就用它去重；没有值时也会拦住「同一批次正在撤销中」\n的重复提交。去重命中时不新建任务，返回的还是那一条（`deduplicated: true`），\n所以用户双击「撤销」不会把同一批重算两遍。",
         "operationId": "submit_batch_revert_api_v1_admin_jobs_batch_revert_post",
         "requestBody": {
           "content": {
@@ -1965,6 +1965,52 @@
           }
         ],
         "summary": "Get Job",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/jobs/{job_id}/retry": {
+      "post": {
+        "description": "人工重试一条失败的任务：放回队列、追加一份重试预算，立刻返回 `202`。\n\n只允许对 `failed` 的任务重试：对成功的任务「重试」意味着再删一次已经删掉的数据\n（处理函数是幂等的，所以只会是一条空结果，但把「撤销」按钮再按一次仍然是个坏主意），\n对还在排队/运行中的任务重试则会排出第二条一模一样的活儿，两者都直接 409。",
+        "operationId": "retry_job_api_v1_admin_jobs__job_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Retry Job",
         "tags": [
           "admin"
         ]

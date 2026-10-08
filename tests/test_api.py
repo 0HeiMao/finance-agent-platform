@@ -2390,14 +2390,16 @@ async def test_unknown_job_kind_fails_loudly(anon_client, auth_headers, db_sessi
     assert body["kind_label"] == "not.registered"
 
 
-async def test_jobs_list_filters_and_restart_reaping(anon_client, api_app, auth_headers, db_session):
-    """任务列表的筛选/分页与"进程重启收尸"，以及受限账号不得查看后台任务。"""
+async def test_jobs_list_filters_and_restart_resume(anon_client, api_app, auth_headers, db_session):
+    """任务列表的筛选/分页与「进程重启接续」，以及受限账号不得查看后台任务。"""
     from backend import jobs
     from backend.models import BackgroundJob
 
-    queued = jobs.submit(db_session, "batch.revert", {"batch": "pytest-queued"}, actor="pytest")
-    running = jobs.submit(db_session, "batch.revert", {"batch": "pytest-running"}, actor="pytest")
+    queued, _ = jobs.submit(db_session, "batch.revert", {"batch": "pytest-queued"}, actor="pytest")
+    running, _ = jobs.submit(db_session, "batch.revert", {"batch": "pytest-running"}, actor="pytest")
     running.status = "running"
+    # 预算已经用完：这种情况下重启也没有重跑的意义，只能判死
+    running.attempts = running.max_attempts
     db_session.flush()
 
     listed = await anon_client.get("/api/v1/admin/jobs?limit=100", headers=auth_headers)
@@ -2425,13 +2427,24 @@ async def test_jobs_list_filters_and_restart_reaping(anon_client, api_app, auth_
     assert missing.status_code == 404
     assert "没有这条后台任务" in missing.json()["detail"]
 
-    # 进程重启：还挂在 queued/running 的记录标记为失败（否则界面永远显示"运行中"）
-    reaped = jobs.reap_stale_jobs(db_session)
-    assert reaped >= 2
-    for job_id in (queued.id, running.id):
-        fetched = await anon_client.get(f"/api/v1/admin/jobs/{job_id}", headers=auth_headers)
-        assert fetched.json()["status"] == "failed"
-        assert fetched.json()["error"] == "进程重启，任务未完成"
+    # 进程重启（⑩）：还有预算的**重新排队重跑**（处理函数幂等，重跑安全），用完预算的才判死。
+    # schedule=False：用例里不许真开定时器，否则断言跑完还会有一段真撤销在后台跑。
+    orphan = BackgroundJob(kind="not.registered", status="queued", actor="pytest", payload={})
+    db_session.add(orphan)
+    db_session.flush()
+    resumed = jobs.resume_interrupted_jobs(db_session, schedule=False)
+    assert resumed["total"] >= 2
+    assert queued.id in resumed["requeued"] and running.id in resumed["failed"]
+    assert orphan.id in resumed["failed"]
+    fetched = await anon_client.get(f"/api/v1/admin/jobs/{queued.id}", headers=auth_headers)
+    assert fetched.json()["status"] == "queued"
+    assert "重新排队" in fetched.json()["error"]
+    fetched = await anon_client.get(f"/api/v1/admin/jobs/{running.id}", headers=auth_headers)
+    assert fetched.json()["status"] == "failed"
+    assert "已用完" in fetched.json()["error"]
+    fetched = await anon_client.get(f"/api/v1/admin/jobs/{orphan.id}", headers=auth_headers)
+    assert fetched.json()["status"] == "failed"
+    assert "已经没有处理函数" in fetched.json()["error"]
 
     headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
     try:
@@ -2446,6 +2459,218 @@ async def test_jobs_list_filters_and_restart_reaping(anon_client, api_app, auth_
     # 收尾：把本用例造的任务标记清楚，避免影响后续断言（用例结束整体回滚，这里只是语义整洁）
     for job in (queued, running):
         assert isinstance(db_session.get(BackgroundJob, job.id), BackgroundJob)
+
+
+async def test_batch_revert_submit_is_idempotent(anon_client, auth_headers, db_session):
+    """⑩ 重复提交不会排出第二条任务：默认拦「同一批次正在撤销中」，给了 Idempotency-Key 连成功过的也复用。"""
+    from sqlalchemy import func, select
+
+    from backend import jobs
+    from backend.models import BackgroundJob, FinancialTransaction
+
+    period = "2097-11"
+    batch = f"pytest-{uuid.uuid4().hex[:6]}-idem"
+    _seed_batch_rows(db_session, batch, period, [("100", "0", "0"), ("200", "0", "0")])
+
+    first = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": batch},
+                                   headers=auth_headers)
+    assert first.status_code == 202, first.text
+    one = first.json()
+    assert one["deduplicated"] is False
+    # 新字段：重试相关的状态要能在任务记录里读出来（界面靠它显示"第几次"
+    assert one["attempts"] == 0 and one["max_attempts"] == 3
+    assert one["next_attempt_at"] is None and one["idempotency_key"] is None
+
+    # 双击「撤销」：第二次点击不该再排一条（否则同一批会被重算两遍）
+    second = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": batch},
+                                    headers=auth_headers)
+    assert second.status_code == 202, second.text
+    assert second.json()["id"] == one["id"]
+    assert second.json()["deduplicated"] is True
+    assert db_session.scalar(
+        select(func.count()).select_from(BackgroundJob)
+        .where(BackgroundJob.payload["batch"].astext == batch)) == 1
+
+    # 带上 Idempotency-Key：任务执行完（批次明细已经没有）之后，同一个键的请求重放
+    # 仍然拿回**同一条**任务，而不是 404 —— 客户端重试的意义就在这里
+    keyed_batch = f"pytest-{uuid.uuid4().hex[:6]}-keyed"
+    _seed_batch_rows(db_session, keyed_batch, period, [("100", "0", "0")])
+    key = f"pytest-key-{uuid.uuid4().hex[:8]}"
+    keyed_headers = {**auth_headers, "Idempotency-Key": key}
+    created = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": keyed_batch},
+                                     headers=keyed_headers)
+    assert created.status_code == 202, created.text
+    job_id = created.json()["id"]
+    assert created.json()["idempotency_key"] == key
+    jobs.run_job(job_id, db_session)
+    assert db_session.scalar(
+        select(func.count()).select_from(FinancialTransaction)
+        .where(FinancialTransaction.import_batch == keyed_batch)) == 0
+
+    replayed = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": keyed_batch},
+                                      headers=keyed_headers)
+    assert replayed.status_code == 202, replayed.text
+    assert replayed.json()["id"] == job_id and replayed.json()["deduplicated"] is True
+    assert replayed.json()["status"] == "succeeded"
+
+    # 换个键就是另一件事：批次已经撤掉了，这时必须 404，而不是伪造一条新任务
+    other = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": keyed_batch},
+                                   headers={**auth_headers, "Idempotency-Key": f"{key}-other"})
+    assert other.status_code == 404
+    # 键太长直接 422（别让一个超长字符串去撞 VARCHAR(200)）
+    too_long = await anon_client.post(
+        "/api/v1/admin/jobs/batch-revert", json={"batch": batch},
+        headers={**auth_headers, "Idempotency-Key": "x" * 201})
+    assert too_long.status_code == 422
+    assert "Idempotency-Key" in too_long.json()["detail"]
+
+
+async def test_failed_job_retry_is_idempotent(anon_client, auth_headers, db_session):
+    """⑩ 失败任务能人工重试，而且重试是**幂等**的：上次已经删掉的行不会让这次再判失败。"""
+    from backend import batch_ops, jobs
+    from backend.models import BackgroundJob
+
+    period = "2097-11"
+    batch = f"pytest-{uuid.uuid4().hex[:6]}-retry"
+    _seed_batch_rows(db_session, batch, period, [("100", "0", "0")])
+
+    submitted = await anon_client.post("/api/v1/admin/jobs/batch-revert", json={"batch": batch},
+                                       headers=auth_headers)
+    assert submitted.status_code == 202, submitted.text
+    job_id = submitted.json()["id"]
+    # 还在排队中的任务不接受重试（重试会排出第二条一样的活儿）
+    queued_retry = await anon_client.post(f"/api/v1/admin/jobs/{job_id}/retry", headers=auth_headers)
+    assert queued_retry.status_code == 409
+    assert "只有失败的任务" in queued_retry.json()["detail"]
+
+    # 模拟「任务还没跑，数据已经被同步接口撤销掉了」：第一次执行必然失败（一行都没删）。
+    # 还有预算 → 只是放回队列等重试，不是判死。
+    batch_ops.revert_batch(db_session, batch, actor="pytest")
+    jobs.run_job(job_id, db_session)
+    row = db_session.get(BackgroundJob, job_id)
+    assert row.status == "queued", row.error
+    assert row.attempts == 1 and row.next_attempt_at is not None
+    assert "第 1 次尝试失败：批次不存在或已被撤销" in row.error
+
+    # 自动重跑：这一跑知道自己是重跑（is_retry），所以「一行都没删」不再算失败 —— 上次已经把活干完了。
+    # 任务判成功，结果里明确写着 already_reverted，而不是假装又删了 0 行。
+    jobs.run_job(job_id, db_session)
+    row = db_session.get(BackgroundJob, job_id)
+    assert row.status == "succeeded", row.error
+    assert row.attempts == 2 and row.error is None and row.next_attempt_at is None
+    assert row.result["deleted_rows"] == 0 and row.result["already_reverted"] is True
+    assert row.result["recalculated"] == [] and row.result["cleared"] == []
+
+    # 审计里两条 batch.revert：第一条真删了行，第二条是重跑的空结果（标了 already_reverted）
+    trail = await anon_client.get("/api/v1/admin/audit?action=batch.revert&limit=50", headers=auth_headers)
+    assert trail.status_code == 200, trail.text
+    entries = [entry for entry in trail.json()["data"] if entry["target_id"] == batch]
+    assert len(entries) == 2, entries
+    assert entries[0]["detail"]["already_reverted"] is True
+    assert entries[0]["detail"]["deleted_rows"] == 0
+    assert entries[0]["detail"]["job"] == job_id
+
+    # 已经成功的任务不接受重试（把「撤销」再按一次不是个合理的操作）
+    again = await anon_client.post(f"/api/v1/admin/jobs/{job_id}/retry", headers=auth_headers)
+    assert again.status_code == 409
+    assert "只有失败的任务" in again.json()["detail"]
+
+
+async def test_manual_retry_appends_budget_keeps_reason_and_is_audited(anon_client, auth_headers,
+                                                                       db_session):
+    """⑩ 预算用尽后的人工重试：追加一份预算、保留上次的失败原因、留痕，且只认 failed。"""
+    from backend import jobs
+    from backend.models import BackgroundJob
+
+    def boom(db, payload, context):
+        raise RuntimeError("故意失败")
+
+    jobs.HANDLERS["pytest.boom"] = boom
+    try:
+        # 预算故意只给 1 次：跑一次就判死，正是需要人来点「重试」的状态
+        job, created = jobs.submit(db_session, "pytest.boom", {"n": 1}, actor="pytest", max_attempts=1)
+        assert created
+        jobs.run_job(job.id, db_session)
+        row = db_session.get(BackgroundJob, job.id)
+        assert row.status == "failed" and row.attempts == 1 and row.next_attempt_at is None
+        assert "第 1 次尝试失败：故意失败" in row.error
+
+        retried = await anon_client.post(f"/api/v1/admin/jobs/{job.id}/retry", headers=auth_headers)
+        assert retried.status_code == 202, retried.text
+        body = retried.json()
+        assert body["status"] == "queued"
+        # 追加一份预算，编号继续涨（界面显示「第 2/4 次」），而不是把 attempts 归零 ——
+        # 归零会让重跑被当成「第一次尝试」，正好丢掉「上次可能已经做完了」这个信息
+        assert body["attempts"] == 1 and body["max_attempts"] == 4
+        assert "第 1 次尝试失败" in body["error"]  # 上次原因保留，重跑期间界面还能看到
+
+        # 重跑仍然失败，但这次有预算 → 又回到队列
+        jobs.run_job(job.id, db_session)
+        row = db_session.get(BackgroundJob, job.id)
+        assert row.status == "queued" and row.attempts == 2
+        assert "第 2 次尝试失败：故意失败" in row.error
+
+        # 排队中的任务再点重试 → 409；未知 id → 404
+        assert (await anon_client.post(f"/api/v1/admin/jobs/{job.id}/retry",
+                                       headers=auth_headers)).status_code == 409
+        assert (await anon_client.post("/api/v1/admin/jobs/99999999/retry",
+                                       headers=auth_headers)).status_code == 404
+
+        trail = await anon_client.get("/api/v1/admin/audit?action=job.retry&limit=50", headers=auth_headers)
+        assert trail.status_code == 200, trail.text
+        entries = [entry for entry in trail.json()["data"] if entry["target_id"] == str(job.id)]
+        assert entries and entries[0]["detail"]["kind"] == "pytest.boom"
+        assert "故意失败" in entries[0]["detail"]["previous_error"]
+    finally:
+        jobs.HANDLERS.pop("pytest.boom", None)
+
+
+async def test_run_job_retries_with_backoff_and_stops_at_budget(anon_client, auth_headers, db_session,
+                                                                monkeypatch):
+    """⑩ 处理函数抛异常不再等于判死：按预算指数退避重排，用完预算才落 failed。"""
+    from backend import jobs
+    from backend.models import BackgroundJob
+
+    seen: list[dict] = []
+
+    def boom(db, payload, context):
+        seen.append(context)
+        raise RuntimeError("故意失败")
+
+    jobs.HANDLERS["pytest.boom"] = boom
+    try:
+        job, created = jobs.submit(db_session, "pytest.boom", {"n": 1}, actor="pytest", max_attempts=2)
+        assert created and job.attempts == 0
+
+        jobs.run_job(job.id, db_session)
+        row = db_session.get(BackgroundJob, job.id)
+        assert row.status == "queued", row.error  # 还有一次预算 → 放回队列
+        assert row.attempts == 1 and row.finished_at is None
+        assert row.next_attempt_at is not None
+        assert "第 1 次尝试失败：故意失败" in row.error
+        assert seen[0]["is_retry"] is False and seen[0]["attempt"] == 1
+
+        jobs.run_job(job.id, db_session)
+        row = db_session.get(BackgroundJob, job.id)
+        assert row.status == "failed" and row.attempts == 2
+        assert row.next_attempt_at is None and row.finished_at is not None
+        assert "第 2 次尝试失败：故意失败" in row.error
+        # 重跑的那一次带着 is_retry=True：处理函数靠它区分「第一次做」和「上次可能已经做了」
+        assert seen[1]["is_retry"] is True and seen[1]["attempt"] == 2
+
+        # 退避：第 1 次重试 2 秒、第 2 次 4 秒……封顶 60 秒（生产路径才真挂定时器，这里换成记录器）
+        timers: list[tuple[float, int]] = []
+        monkeypatch.setattr(jobs, "SCHEDULER", lambda delay, job_id: timers.append((delay, job_id)))
+        row.status = "queued"
+        row.max_attempts = 3  # 再给一次预算，才有「第 2 次失败 → 4 秒后重试」这条退避曲线
+        db_session.flush()
+        assert jobs.mark_failure(db_session, row, RuntimeError("再来一次"),
+                                 retry=True, schedule=True) == "queued"
+        assert timers == [(4.0, job.id)]
+        assert jobs.retry_delay(1) == 2.0 and jobs.retry_delay(2) == 4.0
+        assert jobs.retry_delay(6) == 60.0 and jobs.retry_delay(20) == 60.0
+    finally:
+        jobs.HANDLERS.pop("pytest.boom", None)
 
 
 # ---------------------------------------------------------------- 结构漂移

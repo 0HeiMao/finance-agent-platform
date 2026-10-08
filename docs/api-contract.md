@@ -528,28 +528,52 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | GET | `/admin/audit?action=&actor=&target_type=&ip=&since=&until=&limit=&offset=` | 审计日志（倒序，返回 `data/total/limit/offset/actions/actors/ips/retention_days/export_limit`） |
 | GET | `/admin/audit/export?action=&actor=&target_type=&ip=&since=&until=` | 导出审计 CSV（带 BOM，Excel 可直接打开） |
 | POST | `/admin/audit/purge` | 按保留期清理审计（默认 `dry_run` 只报数，真删留痕） |
-| POST | `/admin/jobs/batch-revert` | `{"batch":"…"}`，提交撤销批次的后台任务，立即 **202** 返回任务（`status="queued"`）；批次不存在 → 404 |
+| POST | `/admin/jobs/batch-revert` | `{"batch":"…"}`，提交撤销批次的后台任务，立即 **202** 返回任务（`status="queued"`）；批次不存在 → 404；可选请求头 `Idempotency-Key`（≤200 字符，超长 422），重放同一个键拿回同一条任务并带 `deduplicated: true` |
 | GET | `/admin/jobs?status=&kind=&limit=&offset=` | 后台任务列表（倒序，返回 `data/total/limit/offset/kinds/statuses`，`limit` 上限 200） |
 | GET | `/admin/jobs/{job_id}` | 单条任务（不存在 → 404） |
+| POST | `/admin/jobs/{job_id}/retry` | 重试失败的任务：放回 `queued` 并**追加**一份预算（`max_attempts = attempts + 3`），保留上次的 `error`；任务不存在 → 404，状态不是 `failed` → 409 |
 
 ### 后台任务
 
 撤销批次要重算所有受影响期间，接口不再同步等着跑完：`POST /admin/jobs/batch-revert` 只往
 `background_jobs` 表写一条 `queued` 记录并交给 FastAPI 的 `BackgroundTasks`，**202** 就返回
-（`{"id","kind","kind_label","status","actor","payload","result","error","created_at","started_at","finished_at"}`）。
+（`{"id","kind","kind_label","status","actor","payload","result","error","created_at","started_at","finished_at",
+"idempotency_key","attempts","max_attempts","next_attempt_at","deduplicated"}`）。
 前端轮询 `GET /admin/jobs/{id}` 看 `status`：
 
 | status | 含义 |
 | --- | --- |
-| `queued` | 已入队，还没开始（**提交成功 ≠ 已执行**，此时明细还在） |
+| `queued` | 已入队，还没开始（**提交成功 ≠ 已执行**，此时明细还在）；带着 `next_attempt_at` 说明是在等退避重试 |
 | `running` | 正在删除明细并重算受影响期间 |
-| `succeeded` | `result = {"batch","deleted_rows","recalculated":[…],"cleared":[…]}` |
-| `failed` | `error` 是失败原因（截断 500 字）；进程重启遗留的任务由启动时的 `reap_stale_jobs()` 标成这个状态，`error = "进程重启，任务未完成"` |
+| `succeeded` | `result = {"batch","deleted_rows","recalculated":[…],"cleared":[…]}`；重跑时若上次已经删干净，`deleted_rows=0` 且带 `already_reverted: true` |
+| `failed` | `error` 是失败原因（截断 500 字）；只有**预算用完**（`attempts >= max_attempts`）或任务类型已经没有处理函数才会落在这里。重试一次会把 `max_attempts` 抬高 3 |
 
 `status` 越界（不在 `queued/running/succeeded/failed` 里）→ 422，`limit=0`/`offset=-1` → 422；
 `kind` 是任务类型（当前只有 `batch.revert`，中文名见 `kinds`）。同步的
 `DELETE /admin/batches/{batch}` 仍然可用（脚本与 curl 方便），与后台任务调的是同一份
-`backend/batch_ops.revert_batch()`。**边界**：这是进程内队列，多副本部署需要换成外部队列。
+`backend/batch_ops.revert_batch()`。
+
+**提交是幂等的**（⑩）：
+
+- 同一批次已有 `queued`/`running` 的任务时，再提交不排第二条，返回那条老任务 + `deduplicated: true`；
+- 带 `Idempotency-Key` 时按这个键去重，**`succeeded` 的也算命中**（「这件事已经做完了」正是客户端重试
+  最想听到的答案），所以同一个键在批次已经被删掉之后仍然回同一条任务（不会变成 404）；
+- 兜底是 `background_jobs` 上的**部分唯一索引** `uq_background_jobs_idempotency_key`
+  （只约束 `queued/running/succeeded`）：先查后插在并发下仍有窗口，索引负责那一刻抛
+  `IntegrityError`，代码捕获后回头取那条已存在的任务。注意**不参与**指纹计算的字段是 `payload.ip`
+  —— 它每请求都在变，拿它当身份会让同一次撤销被排两遍。
+
+**失败会退避重试**（⑩）：处理函数抛异常时，还有预算就放回 `queued` 并写
+`next_attempt_at = now + 2·2^(n−1) 秒`（2、4、8…，封顶 60），到点由进程内的调度器再跑；
+`attempts` 每次执行加一（从 1 开始计），`error` 记为「第 N 次尝试失败：…」。
+**重复执行必须安全**：撤销任务把 `context["is_retry"]`（`attempts > 1`）传给
+`revert_batch(allow_missing=…)`，重跑时「一行都没删」判成功并标 `already_reverted`。
+
+**进程重启接续**（⑩）：启动时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running` 放回队列
+（`error = "进程重启，任务已重新排队（下次是第 N 次尝试）"`，保留已用掉的次数）并立刻调度一次；
+预算用完的判 `failed`（`error` 点名用了几次），`kind` 已无处理函数的判 `failed`
+（`error = "进程重启，且这个任务类型已经没有处理函数"`）。**边界**：这是进程内队列，
+重试定时器活在进程内存里（重启即丢，靠启动接续补回来），多副本部署需要换成外部队列。
 
 ### 列表分页与筛选（`/admin/*` 与 `/analysis/alerts/all`）
 
@@ -714,10 +738,13 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 }
 ```
 
-- 登记的 17 个动作：`user.register`、`user.login`、`user.login_failed`、`user.login_blocked`、
-  `user.department_self`、`user.department_change`、`user.delete`、`data.import`、`data.export`、
-  `metrics.calculate`、`batch.revert`、`knowledge.add`、`knowledge.delete`、`alert.review`、
-  `alert_rule.update`、`audit.export`、`audit.purge`。写未登记的动作不会失败，但会在服务端打 warning。
+- 登记的 28 个动作：`user.register`、`user.login`、`user.login_failed`、`user.login_blocked`、
+  `user.login_locked`、`user.unlock`、`user.register_rejected`、`user.department_self`、
+  `user.department_change`、`user.delete`、`user.logout`、`user.force_logout`、`data.import`、
+  `data.export`、`transaction.update`、`transaction.reverse`、`metrics.calculate`、`rollups.rebuild`、
+  `batch.revert`、`job.retry`、`knowledge.add`、`knowledge.delete`、`alert.review`、
+  `alert_rule.update`、`alert_rule.create`、`alert_rule.delete`、`audit.export`、`audit.purge`。
+  写未登记的动作不会失败，但会在服务端打 warning。
 - `action` / `actor` / `target_type` 都是精确匹配；`ip` 是**前缀匹配**（前端下拉直接给整串，
   手工传 `127` 这种前缀也能用）；`limit` 默认 50，`offset` 用于翻页，`total` 不受 `limit` 影响
   （`total` 是筛选后的总行数，筛选发生在 count 与 limit 之前）。

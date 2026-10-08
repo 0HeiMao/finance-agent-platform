@@ -593,11 +593,55 @@ def submit_batch_revert(
     提交前只做一次便宜的 `count(*)` 校验：批次不存在就直接 404，不必为一个注定失败的任务
     建一条记录（那样界面上会长出一条没人能修的 failed，而用户其实只是点错了）。
     真正的删除与重算在 `jobs.run_job` 里执行，失败原因落在任务的 `error` 上。
+
+    **幂等**（⑩）：请求头 `Idempotency-Key` 有值就用它去重；没有值时也会拦住「同一批次正在撤销中」
+    的重复提交。去重命中时不新建任务，返回的还是那一条（`deduplicated: true`），
+    所以用户双击「撤销」不会把同一批重算两遍。
     """
-    if not batch_ops.batch_rows(db, payload.batch):
+    key = (request.headers.get("Idempotency-Key") or "").strip()
+    if len(key) > jobs.IDEMPOTENCY_KEY_MAX:
+        raise HTTPException(422, f"Idempotency-Key 太长（最多 {jobs.IDEMPOTENCY_KEY_MAX} 字符）")
+    # 去重查在「批次还在不在」之前：同一个键的请求重放时，批次很可能已经被第一次执行删掉了，
+    # 这时正确回答是「还是那条任务」，而不是 404 —— 否则客户端的重试永远拿不到它要的结果。
+    if jobs.find_key_holder(db, key) is None and not batch_ops.batch_rows(db, payload.batch):
         raise HTTPException(404, "批次不存在或已被撤销")
-    job = jobs.submit(db, "batch.revert", {"batch": payload.batch, "ip": audit.client_ip(request)},
-                      actor=me.username)
+    job, created = jobs.submit(
+        db, "batch.revert", {"batch": payload.batch, "ip": audit.client_ip(request)},
+        actor=me.username, idempotency_key=key or None,
+    )
+    if created:
+        background.add_task(jobs.run_job, job.id)
+    else:
+        logger.info("后台任务去重：批次 %s 已有任务 #%s（状态 %s）", payload.batch, job.id, job.status)
+    return {**jobs.serialize(job), "deduplicated": not created}
+
+
+@router.post("/jobs/{job_id}/retry", status_code=202)
+def retry_job(
+    job_id: int,
+    background: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db),
+    me: User = Depends(admin_user),
+):
+    """人工重试一条失败的任务：放回队列、追加一份重试预算，立刻返回 `202`。
+
+    只允许对 `failed` 的任务重试：对成功的任务「重试」意味着再删一次已经删掉的数据
+    （处理函数是幂等的，所以只会是一条空结果，但把「撤销」按钮再按一次仍然是个坏主意），
+    对还在排队/运行中的任务重试则会排出第二条一模一样的活儿，两者都直接 409。
+    """
+    job = db.get(BackgroundJob, job_id)
+    if job is None:
+        raise HTTPException(404, "没有这条后台任务")
+    if job.status != "failed":
+        raise HTTPException(409, f"只有失败的任务才需要重试（当前状态：{jobs.STATUS_LABELS.get(job.status, job.status)}）")
+    if job.kind not in jobs.HANDLERS:
+        raise HTTPException(409, f"这个任务类型已经没有处理函数了，重试也不会成功：{job.kind}")
+    jobs.prepare_retry(db, job)
+    audit.record(db, me.username, "job.retry", target_type="job", target_id=str(job.id),
+                 detail={"kind": job.kind, "previous_error": job.error,
+                         "ip": audit.client_ip(request)})
+    db.commit()
     background.add_task(jobs.run_job, job.id)
     return jobs.serialize(job)
 

@@ -79,6 +79,13 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("users", "failed_attempts", "INTEGER DEFAULT 0 NOT NULL"),
     ("users", "locked_until", "TIMESTAMP WITH TIME ZONE"),
     ("users", "last_failed_at", "TIMESTAMP WITH TIME ZONE"),
+    # ⑩ 后台任务幂等重试：去重键、重试预算、下次重试时间。
+    # 两个 INTEGER 都带 DEFAULT：老库里已有的任务行否则是 NULL，「已经试过几次」一读就是 NULL，
+    # 重试判断（attempts < max_attempts）当场变成 None < None 而抛类型错。
+    ("background_jobs", "idempotency_key", "VARCHAR(200)"),
+    ("background_jobs", "attempts", "INTEGER DEFAULT 0 NOT NULL"),
+    ("background_jobs", "max_attempts", "INTEGER DEFAULT 3 NOT NULL"),
+    ("background_jobs", "next_attempt_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。
@@ -113,6 +120,18 @@ INDEXES: list[tuple[str, str, str, str]] = [
      "⑨ 加列时带的 index=True 没落到老库：冲销行找原行、明细列表标注「已冲销」都要走它"),
     ("financial_alerts", "ix_financial_alerts_review_status", "review_status",
      "⑥/⑨ 加列时带的 index=True 没落到老库：预警列表默认按 pending 过滤，缺索引只能顺序扫"),
+]
+
+# 需要**唯一**（且带 WHERE 的）索引：(表名, 索引名, 列名, WHERE 片段, 为什么要它)。
+# 单列一份而不是塞进 INDEXES：`CREATE INDEX` 与 `CREATE UNIQUE INDEX ... WHERE` 不是同一句话，
+# 混在一起迟早会有人漏掉 unique。这里建的是**部分唯一索引**，谓词必须与模型 `__table_args__`
+# 里那句一字不差，否则「模型声明了、库上没有」会被 `missing_indexes()` 点名（这是好事）。
+UNIQUE_INDEXES: list[tuple[str, str, str, str, str]] = [
+    ("background_jobs", "uq_background_jobs_idempotency_key", "idempotency_key",
+     "status IN ('queued', 'running', 'succeeded')",
+     "⑩ 去重是先查再插，两个请求挤在一起就可能同时查空、各自插一条；这条部分唯一索引把"
+     "「同一个键同时只有一条活着或成功过的任务」变成数据库保证。failed 故意不在谓词里 —— "
+     "失败之后本来就该允许拿同一个键重新提交"),
 ]
 
 
@@ -196,6 +215,16 @@ def ensure_schema(engine: Engine | None = None) -> list[str]:
                 continue
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"))
             applied.append(f"{table}.{name}（索引）")
+        for table, name, columns, where, _why in UNIQUE_INDEXES:
+            exists = connection.scalar(
+                text("SELECT 1 FROM pg_indexes"
+                     " WHERE schemaname = current_schema() AND tablename = :table AND indexname = :name"),
+                {"table": table, "name": name})
+            if exists:
+                continue
+            connection.execute(text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({columns}) WHERE {where}"))
+            applied.append(f"{table}.{name}（部分唯一索引）")
     return applied
 
 

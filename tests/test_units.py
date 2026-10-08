@@ -26,6 +26,13 @@ from PIL import Image  # noqa: E402
 
 from backend.api_financial import AMOUNT_COLUMNS, validate_row  # noqa: E402
 from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of  # noqa: E402
+from backend.jobs import (  # noqa: E402
+    attempts_of,
+    can_retry,
+    max_attempts_of,
+    retry_delay,
+    stable_payload,
+)
 from backend.main import app  # noqa: E402
 from backend.rag.document_parser import extract_text, split_text  # noqa: E402
 
@@ -888,4 +895,45 @@ def test_visual_manifest_reports_missing_file(tmp_path):
                             "width": 4, "height": 4, "sha256": "0" * 64}]}
     problems = check_visual_baseline.manifest_problems(manifest, tmp_path)
     assert problems and "基线图缺失" in problems[0]
+
+
+# ---------------------------------------------------------------- 后台任务幂等（⑩）
+
+def test_retry_delay_grows_exponentially_and_caps():
+    """退避是为了躲开「数据库正忙」这类瞬时失败：等 2、4、8… 秒，封顶 60 秒（不然越等越久没人看）。"""
+    assert [retry_delay(n) for n in (1, 2, 3, 4)] == [2.0, 4.0, 8.0, 16.0]
+    assert retry_delay(6) == 60.0
+    assert retry_delay(20) == 60.0
+    # 0/负数（老记录 attempts 是 NULL 时按 0 读）不能算出比基准更短、也不能是负的
+    assert retry_delay(0) == 2.0 and retry_delay(-3) == 2.0
+
+
+def test_attempts_and_budget_read_null_as_defaults():
+    """加列之前建的任务行 attempts/max_attempts 是 NULL：按 0 次与默认预算读，不能抛类型错。"""
+    legacy = SimpleNamespace(attempts=None, max_attempts=None)
+    assert attempts_of(legacy) == 0
+    assert max_attempts_of(legacy) == 3
+    assert can_retry(legacy) is True
+
+    exhausted = SimpleNamespace(attempts=3, max_attempts=3)
+    assert can_retry(exhausted) is False
+    assert can_retry(SimpleNamespace(attempts=2, max_attempts=3)) is True
+    # 预算被人工追加过（prepare_retry）：编号继续涨，仍然还有机会
+    assert can_retry(SimpleNamespace(attempts=4, max_attempts=6)) is True
+    # max_attempts 被写成 0 时不能让任务变成「一次都不许试」
+    assert max_attempts_of(SimpleNamespace(attempts=0, max_attempts=0)) == 3
+
+
+def test_stable_payload_ignores_volatile_fields():
+    """来源 IP 每次请求都可能不同，把它算进指纹等于没去重；其余字段必须参与比对。"""
+    first = stable_payload("batch.revert", {"batch": "abc", "ip": "10.0.0.1"})
+    second = stable_payload("batch.revert", {"batch": "abc", "ip": "10.0.0.2"})
+    assert first == second
+    assert stable_payload("batch.revert", {"batch": "abc"}) == first
+    assert stable_payload("batch.revert", {"batch": "abd", "ip": "10.0.0.1"}) != first
+    # kind 不同就不是同一件事（键里必须带上 kind）
+    assert stable_payload("batch.revert2", {"batch": "abc"}) != first
+    # 字段顺序不影响指纹
+    assert stable_payload("k", {"a": 1, "b": 2}) == stable_payload("k", {"b": 2, "a": 1})
+
 

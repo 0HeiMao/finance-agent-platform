@@ -354,6 +354,137 @@ test('Agent 对话框：流断掉时显示错误并可重试，清空会话只�
   assert.equal(view.button('清空会话'), null)
 })
 
+// ------------------------------------------------------------------ 后台任务（⑩）
+
+const BATCH_ROW = {
+  batch: 'b'.repeat(64),
+  short: 'bbbbbbbbbbbb',
+  rows: 12,
+  first_date: '2026-01-01',
+  last_date: '2026-03-31',
+  periods: ['2026-01', '2026-02', '2026-03'],
+  imported_at: '2026-10-08 12:00:00'
+}
+
+function jobFixture(overrides = {}) {
+  return {
+    id: 77,
+    kind: 'batch.revert',
+    kind_label: '撤销导入批次',
+    status: 'failed',
+    actor: 'demo_analyst',
+    created_at: '2026-10-08T16:23:17',
+    started_at: '2026-10-08T16:23:18',
+    finished_at: '2026-10-08T16:23:19',
+    attempts: 3,
+    max_attempts: 3,
+    next_attempt_at: null,
+    error: '第 3 次尝试失败：批次不存在或已被撤销',
+    result: null,
+    ...overrides
+  }
+}
+
+function batchesRoutes(extra = []) {
+  return [
+    {
+      path: '/api/v1/auth/me',
+      response: () => jsonResponse({ username: 'demo_analyst', unrestricted: true, departments: [] })
+    },
+    ...extra,
+    { path: '/api/v1/admin/batches', response: () => jsonResponse({ data: [BATCH_ROW], total: 1 }) },
+    { path: '/api/v1/admin/jobs', response: () => jsonResponse({ data: [jobFixture()], total: 1 }) },
+    { path: '/api/v1/admin/jobs/77', response: () => jsonResponse(jobFixture({ status: 'queued' })) },
+    { path: '/api/v1/admin/jobs/91', response: () => jsonResponse(jobFixture({ id: 91, status: 'running' })) }
+  ]
+}
+
+async function mountBatches(routes) {
+  useRoutes(routes)
+  const router = makeRouter()
+  router.push('/admin')
+  await router.isReady()
+  const AdminBatches = (await import('../src/views/AdminBatches.vue')).default
+  const view = mount(AdminBatches, { global: { plugins: [router] } })
+  assert.ok(await waitFor(() => view.text().includes('#77')), `实际渲染：${view.text()}`)
+  return view
+}
+
+test('后台任务（⑩）：失败的任务显示「第 3/3 次」并能点「重试」，请求打到 /retry', async () => {
+  const view = await mountBatches(
+    batchesRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/jobs/77/retry',
+        response: () =>
+          jsonResponse(jobFixture({ status: 'queued', attempts: 3, max_attempts: 6, next_attempt_at: null }))
+      }
+    ])
+  )
+  // 失败不再等于「没救了」：界面必须看出已经用掉几次预算，否则人工重试无从判断
+  assert.match(view.text(), /第 3\/3 次/)
+  assert.match(view.text(), /第 3 次尝试失败：批次不存在或已被撤销/)
+
+  await view.click('重试')
+  assert.ok(
+    fetchImpl.calls.some((call) => call.method === 'POST' && call.path === '/api/v1/admin/jobs/77/retry'),
+    JSON.stringify(fetchImpl.calls)
+  )
+  // 点下去只是发出请求：提示要等响应回来才出现（所以要等，而不是立刻断言）
+  assert.ok(await waitFor(() => view.text().includes('已重新排队')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /已重新排队（第 4\/6 次尝试）/)
+  view.app.unmount() // 轮询定时器要停掉，否则 node --test 不退出
+})
+
+test('后台任务（⑩）：排队等退避时显示「第 N/M 次」，重刷到的成功结果说明「此前已被撤销」', async () => {
+  const view = await mountBatches(
+    batchesRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/jobs/77/retry',
+        response: () => jsonResponse(jobFixture({ status: 'queued', attempts: 3, max_attempts: 6 }))
+      },
+      {
+        path: '/api/v1/admin/jobs/77',
+        response: () =>
+          jsonResponse(
+            jobFixture({
+              status: 'succeeded',
+              attempts: 2,
+              max_attempts: 3,
+              started_at: '2026-10-08T16:23:18',
+              finished_at: '2026-10-08T16:23:21',
+              error: null,
+              result: { deleted_rows: 0, recalculated: [], cleared: [], already_reverted: true }
+            })
+          )
+      }
+    ])
+  )
+  // 首屏读到的是失败那条（mock 的 GET /admin/jobs 列表），点重试后轮询到的是 succeeded
+  assert.match(view.text(), /第 3\/3 次/)
+  await view.click('重试')
+  assert.ok(await waitFor(() => view.text().includes('已经被撤销过')), `实际渲染：${view.text()}`)
+  view.app.unmount()
+})
+
+test('后台任务（⑩）：同一批次重复提交被后端去重时，提示「没有重复提交」而不是「已提交」', async () => {
+  const view = await mountBatches(
+    batchesRoutes([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/jobs/batch-revert',
+        response: () => jsonResponse({ ...jobFixture({ id: 91, status: 'running' }), deduplicated: true })
+      }
+    ])
+  )
+  await view.click('撤销批次')
+  await view.click('确认撤销')
+  assert.ok(await waitFor(() => view.text().includes('已经在队列里')), `实际渲染：${view.text()}`)
+  assert.doesNotMatch(view.text(), /已提交后台任务/)
+  view.app.unmount()
+})
+
 test.after(() => {
   resetShims()
   clearCurrentUser()

@@ -12,6 +12,7 @@ import { test } from 'node:test'
 import {
   JOB_STATUS_LABELS,
   MAX_DEPARTMENTS,
+  attemptsText,
   departmentsText,
   describeResult,
   durationText,
@@ -19,6 +20,7 @@ import {
   parseDepartments,
   periodsText,
   resultText,
+  retryWaitText,
   statusLabel
 } from '../src/utils/format.js'
 
@@ -75,6 +77,38 @@ test('describeResult 把期间原文列出来，便于离开页面后回看', ()
     result: { deleted_rows: 1, recalculated: ['2026-10'], cleared: [] }
   })
   assert.equal(text, '后台任务 #20 已完成：删除 1 行明细；重算期间：2026-10。')
+})
+
+test('attemptsText 说清楚「第几次 / 共几次」，null 与 0 都不编造进度', () => {
+  assert.equal(attemptsText({ attempts: 2, max_attempts: 3 }), '第 2/3 次')
+  assert.equal(attemptsText({ attempts: 1, max_attempts: 1 }), '第 1/1 次')
+  // 一次都还没跑（刚提交）与字段缺失都不该显示「第 0/0 次」
+  assert.equal(attemptsText({ attempts: 0, max_attempts: 3 }), '未开始')
+  assert.equal(attemptsText({ attempts: null, max_attempts: null }), '未开始')
+  assert.equal(attemptsText(null), '—')
+  // 老任务（⑩ 之前落库的行）只有 attempts、没有 max_attempts：后端默认 3，界面也要跟后端一致
+  assert.equal(attemptsText({ attempts: 2 }), '第 2/3 次')
+})
+
+test('retryWaitText 只在「排队等退避」时给时间，别的状态不假装在等', () => {
+  assert.equal(
+    retryWaitText({ status: 'queued', next_attempt_at: '2026-10-08T16:23:25' }),
+    '约 2026-10-08 16:23:25 重试'
+  )
+  assert.equal(retryWaitText({ status: 'queued', next_attempt_at: null }), '—')
+  assert.equal(retryWaitText({ status: 'running', next_attempt_at: '2026-10-08T16:23:25' }), '—')
+  assert.equal(retryWaitText({ status: 'failed', next_attempt_at: null }), '—')
+  assert.equal(retryWaitText(null), '—')
+})
+
+test('重跑时上次已经删干净的结果（already_reverted）不当成失败，也不说成「删除 0 行」', () => {
+  const rereun = {
+    id: 31,
+    status: 'succeeded',
+    result: { deleted_rows: 0, recalculated: [], cleared: [], already_reverted: true }
+  }
+  assert.equal(resultText(rereun), '该批次此前已被撤销（本次 0 行）')
+  assert.equal(describeResult(rereun), '后台任务 #31 已完成：该批次此前已经被撤销过，本次没有行可删。')
 })
 
 test('periodsText 把连续期间压成区间，避免把操作列挤出视口', () => {

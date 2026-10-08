@@ -16,6 +16,27 @@ export function statusLabel(status) {
   return JOB_STATUS_LABELS[status] || status
 }
 
+/**
+ * 任务跑到第几次了。
+ *
+ * ⑩ 之后失败会自动重排（2/4/8…秒退避），所以「失败」不再等于「没救了」：
+ * 界面必须能看出「第 1/3 次」还是「第 3/3 次」，否则人工点「重试」时无从判断。
+ * 后端 `attempts` 从 0 开始计数，0 表示一次都还没跑。
+ */
+export function attemptsText(job) {
+  if (!job) return '—'
+  const attempts = Number(job.attempts ?? 0)
+  if (!attempts) return '未开始'
+  const max = Number(job.max_attempts ?? 0) || 3
+  return `第 ${attempts}/${max} 次`
+}
+
+/** 排队中且带着下次重试时间 → 这一行正在退避等待；其它情况没有额外信息可给。 */
+export function retryWaitText(job) {
+  if (!job || job.status !== 'queued' || !job.next_attempt_at) return '—'
+  return `约 ${formatTime(job.next_attempt_at)} 重试`
+}
+
 export function formatTime(value) {
   if (!value) return '—'
   const date = new Date(value)
@@ -41,6 +62,8 @@ export function resultText(job) {
   if (job.status === 'failed') return job.error || '失败原因未记录'
   if (job.status !== 'succeeded') return '—'
   const result = job.result || {}
+  // 重跑时上次已经删干净了（⑩）：说清楚"没有行可删"不是失败
+  if (result.already_reverted) return '该批次此前已被撤销（本次 0 行）'
   const parts = [`删除 ${result.deleted_rows ?? 0} 行`]
   if ((result.recalculated || []).length) parts.push(`重算 ${result.recalculated.length} 期`)
   if ((result.cleared || []).length) parts.push(`清空 ${result.cleared.length} 期`)
@@ -49,6 +72,9 @@ export function resultText(job) {
 
 export function describeResult(job) {
   const result = (job && job.result) || {}
+  if (result.already_reverted) {
+    return `后台任务 #${job.id} 已完成：该批次此前已经被撤销过，本次没有行可删。`
+  }
   const parts = [`后台任务 #${job.id} 已完成：删除 ${result.deleted_rows ?? 0} 行明细`]
   if ((result.recalculated || []).length) parts.push(`重算期间：${result.recalculated.join('、')}`)
   if ((result.cleared || []).length) parts.push(`清空期间：${result.cleared.join('、')}`)
