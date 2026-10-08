@@ -332,7 +332,9 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | DELETE | `/admin/knowledge?source=` | 按来源整份删除片段，并清理**没有别的来源再引用**的上传件（返回 `{"source","deleted_chunks","removed_files"}`；`stored_path` 落在 `rag_upload_dir` 之外的一律不删） |
 | GET | `/admin/alert-rules` | 预警规则一览（含 `comparators` 与可选指标的中文名 `metrics`）；首次访问会补齐默认两条 |
 | PUT | `/admin/alert-rules/{alert_type}` | 改规则：`{threshold_value, level, enabled, description}`，只传要改的字段 |
-| GET | `/admin/audit?action=&actor=&target_type=&limit=&offset=` | 审计日志（倒序、只读，返回 `data/total/limit/offset/actions/actors`） |
+| GET | `/admin/audit?action=&actor=&target_type=&ip=&since=&until=&limit=&offset=` | 审计日志（倒序，返回 `data/total/limit/offset/actions/actors/ips/retention_days/export_limit`） |
+| GET | `/admin/audit/export?action=&actor=&target_type=&ip=&since=&until=` | 导出审计 CSV（带 BOM，Excel 可直接打开） |
+| POST | `/admin/audit/purge` | 按保留期清理审计（默认 `dry_run` 只报数，真删留痕） |
 | POST | `/admin/jobs/batch-revert` | `{"batch":"…"}`，提交撤销批次的后台任务，立即 **202** 返回任务（`status="queued"`）；批次不存在 → 404 |
 | GET | `/admin/jobs?status=&kind=&limit=&offset=` | 后台任务列表（倒序，返回 `data/total/limit/offset/kinds/statuses`，`limit` 上限 200） |
 | GET | `/admin/jobs/{job_id}` | 单条任务（不存在 → 404） |
@@ -473,19 +475,64 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   ],
   "total": 5, "limit": 50, "offset": 0,
   "actions": [{"value": "user.login", "label": "登录成功"}],
-  "actors": ["demo_analyst"]
+  "actors": ["demo_analyst"],
+  "ips": ["127.0.0.1"],
+  "retention_days": 180,
+  "export_limit": 5000
 }
 ```
 
-- 登记的 15 个动作：`user.register`、`user.login`、`user.login_failed`、`user.login_blocked`、
+- 登记的 17 个动作：`user.register`、`user.login`、`user.login_failed`、`user.login_blocked`、
   `user.department_self`、`user.department_change`、`user.delete`、`data.import`、`data.export`、
   `metrics.calculate`、`batch.revert`、`knowledge.add`、`knowledge.delete`、`alert.review`、
-  `alert_rule.update`。写未登记的动作不会失败，但会在服务端打 warning。
-- `action` / `actor` / `target_type` 都是精确匹配；`limit` 默认 50，`offset` 用于翻页，`total` 不受
-  `limit` 影响（前端据此显示「第 x / y 页」）。
+  `alert_rule.update`、`audit.export`、`audit.purge`。写未登记的动作不会失败，但会在服务端打 warning。
+- `action` / `actor` / `target_type` 都是精确匹配；`ip` 是**前缀匹配**（前端下拉直接给整串，
+  手工传 `127` 这种前缀也能用）；`limit` 默认 50，`offset` 用于翻页，`total` 不受 `limit` 影响
+  （`total` 是筛选后的总行数，筛选发生在 count 与 limit 之前）。
+- `since` / `until` 是**日期**（`YYYY-MM-DD`，含首尾两天，按服务器本机日历日）：内部用
+  `astimezone()` 转成带时区的时刻再比，所以 UTC+8 机器上「今天 8 点前的记录」不会漏。
+  只给 `since` 表示「从那天的 00:00 起」。
+- `ips` 是最近出现过的来源 IP（空 IP 不进下拉），`retention_days` 是当前保留期，
+  `export_limit` 是导出的单次上限——三个字段都由后端给，前端不写死。
 - **detail 已脱敏**：键名含 `password`/`token`/`secret`/`authorization`/`api_key`/`apikey`/`hash` 的字段
   在任何嵌套深度都会被丢掉，字符串截断到 200 字，列表最多留 50 项。审计里**不会有**密码、令牌、
   文件内容与明细金额。
-- **接口只有 GET**：没有删除/清空/导出入口——审计日志能被管理员随手清掉就失去意义了（要归档请直接读库）。
+- **审计行没有改/删接口**（`GET` 只有这一个），唯一的删除路径是下面这节的保留期清理。
 - 非管理员 `403`，匿名 `401`。审计写入与业务写在同一个事务里，业务回滚时日志不落地；
   写日志自身失败只记 error，不会让业务接口失败。
+
+### 审计导出与保留期清理
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/admin/audit/export?action=&actor=&target_type=&ip=&since=&until=` | 按同一套条件导出 CSV（`text/csv; charset=utf-8`） |
+| POST | `/admin/audit/purge` | 按保留期清理，默认 `{"dry_run": true}` 只报数 |
+
+`GET /admin/audit/export` 的响应头：
+
+```
+Content-Type: text/csv; charset=utf-8
+Content-Disposition: attachment; filename="audit-20261008-090616.csv"
+X-Export-Rows: 75
+X-Export-Truncated: false
+```
+
+正文以 **UTF-8 BOM** 开头（Excel 靠它认编码，否则中文列名是乱码），列为
+`时间(UTC),操作人,部门,动作,动作标签,对象类型,对象ID,详情,IP`；`详情` 是压成一行的 JSON
+（`ensure_ascii=False`、键排序），时间用 ISO-8601 UTC——导出的表格是拿去对数、进底稿的，
+含混的本地时间比时区偏移更容易出错。一次最多 `export_limit`（5000）行，超出时
+`X-Export-Truncated: true`，按时间或动作分段再导。**导出会写一条 `audit.export`**，
+detail 里记导出条数与当时的筛选条件。
+
+`POST /admin/audit/purge` 的请求体与响应：
+
+```json
+{"keep_days": 180, "dry_run": true}
+{"dry_run": true, "keep_days": 180, "before": "2026-04-11T09:06:17+00:00", "deleted": 1, "total": 77, "sample_id": 3029}
+```
+
+- `keep_days` 省略时用 `AUDIT_RETENTION_DAYS`（默认 180）；范围 `1..3650`，`keep_days=0` → `422`
+  （**没有「保留 0 天」= 清空这条捷径**）。
+- `dry_run=true` 只统计不删除；`dry_run=false` 才真删，且**清理自己写一条 `audit.purge`**
+  （detail：`keep_days`/`before`/`deleted`）。清理动作本身必须可查，否则它就是审计的漏洞。
+- 非管理员 `403`。

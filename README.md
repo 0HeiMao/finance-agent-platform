@@ -133,7 +133,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 - **`core.hooksPath = .githooks`**：钩子放在 `.git/hooks/` 里不进版本库，换台机器就静默消失；
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法，几秒）：拦的正是「源文件被写成 mojibake/BOM」与语法错误
-  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 115 个用例与前端 15 个用例一起跑。
+  这类进库就难查的问题。`PRECOMMIT_FULL=1 git commit …` 会连后端 118 个用例与前端 15 个用例一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
   而钩子是 shell 脚本，行尾多一个 CR 会让 shebang 变成 `/bin/sh\r`，钩子直接报 bad interpreter。
@@ -230,13 +230,15 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **114** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/按路径耗时采样）、
+`tests/` 下三个文件共 **118** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/按路径耗时采样）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
 管理员看到的一直是全公司行→预警处理闭环（状态继承、误报必填原因、跨口径 403、规则可编辑且对重算生效）→
 **审计日志**：注册/登录/登录失败留痕且不含密码、七类写操作各一条、按动作与操作人过滤翻页、
-`_scrub` 脱敏单测、审计接口只有 GET→**分页与筛选**：`limit` 截断时 `total` 仍是筛选后的总行数、
+`_scrub` 脱敏单测、审计行没有改/删入口、按 IP 前缀与日期范围筛选（本地日历日、含首尾）、
+导出 CSV 带 BOM 且筛选在导出前生效、导出本身留一条 `audit.export`、清理默认只预览、
+真删只动过期行并留 `audit.purge`、`keep_days=0` 422→**分页与筛选**：`limit` 截断时 `total` 仍是筛选后的总行数、
 `offset` 真的换页、部门/是否受限与文档类型筛选、`status` 在服务端过滤、越界参数 422）→
 **后台任务**：提交后立刻 202 且明细还在（提交 ≠ 执行）、执行成功才删明细并重算、
 审计里带任务 id、不存在的批次 404 且不留任务记录、未注册的任务类型标记失败、
@@ -289,7 +291,7 @@ cd frontend; npm test        # 等价于 node --test tests/*.test.mjs
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
 | `/admin/departments` | 部门权限（账号绑部门、各部门数据规模） | `GET /admin/departments`、`PATCH /admin/users/{id}` |
 | `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述） | `GET /admin/alert-rules`、`PUT /admin/alert-rules/{alert_type}` |
-| `/admin/audit` | 审计日志（按动作/操作人筛选、翻页，只读） | `GET /admin/audit` |
+| `/admin/audit` | 审计日志（按动作/操作人/IP/日期范围筛选、翻页、导出 CSV、按保留期清理） | `GET /admin/audit`、`GET /admin/audit/export`、`POST /admin/audit/purge` |
 
 所有业务页面共用 `frontend/src/components/AppSidebar.vue` 侧边栏；页面统一有三态：加载（骨架屏或
 loading）、空数据（`.empty-state` + 去导入引导）、失败（`.error-state` + 重试按钮）。
@@ -441,12 +443,21 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   中文标签）、对象类型与 id、来源 IP、以及一小袋 detail（如改规则的前后阈值、撤销批次删了多少行）。
   **不记密码、令牌、文件内容与明细金额**：`_scrub()` 会把键名含 `password/token/secret/authorization/api_key/hash`
   的字段整条丢掉（任意嵌套深度都丢）、字符串截断到 200 字、列表只留前 50 项。
-- 15 个动作在 `ACTIONS` 里登记；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
+- 17 个动作在 `ACTIONS` 里登记；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
 - **审计失败不影响业务**：`record()` 内部兜住所有异常，写日志失败只记 error，不会把接口带崩。
 - detail 与业务写在**同一个事务**里（`record(..., commit=False)`），业务回滚时日志也不落地；
   只有登录失败/被限流这两条走 `commit=True`（那时没有业务事务可依附）。
-- 管理员在 `/admin/audit` 看（`GET /api/v1/admin/audit`），可按动作、操作人过滤并翻页。
-  **接口只提供 GET，没有删除/清空入口**：审计日志能被管理员随手清掉就失去意义了（要归档请直接读库）。
+- 管理员在 `/admin/audit` 看（`GET /api/v1/admin/audit`），可按**动作、操作人、来源 IP（前缀匹配）、
+  日期范围**四类条件筛选并翻页。日期是「本机日历日、含首尾两天」：`_audit_window()` 把日期转成
+  带时区的时刻再比，否则 UTC+8 机器上「今天 8 点前的记录」会查不到。
+- **导出**：`GET /api/v1/admin/audit/export` 按同一套筛选条件给 CSV（正文带 UTF-8 BOM，否则 Excel
+  打开中文是乱码；响应头 `X-Export-Rows`/`X-Export-Truncated` 说明条数与是否被 `AUDIT_EXPORT_LIMIT`
+  截断）。导出这件事自己也写一条 `audit.export`——「谁把审计捞走了」和「谁改了数据」同样要能查。
+- **只增不减，唯一的删除是按保留期清理**：`POST /api/v1/admin/audit/purge` 默认 `dry_run=true` 只报数，
+  确认后才删 `created_at` 早于 N 天（默认 `AUDIT_RETENTION_DAYS=180`，下限 1 天）的记录，并写一条
+  `audit.purge`（含截止时间与删除条数）。界面上是「预览 → 确认」两步。
+  审计行本身没有任何 PUT/DELETE 接口：能改的审计等于没有审计。
+  这是进程内的策略实现，**没有定时任务**——要不要清、什么时候清由管理员决定（详见「数据库迁移」一节的取舍口径）。
 
 `audit_logs` 是新建的表，而 `create_all()` 只建「已注册进 metadata」的表——注册靠导入。
 `backend/migrations.py` 因此显式 `from backend import models`：只 `from backend.migrations import ensure_schema`

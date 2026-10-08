@@ -1658,9 +1658,19 @@ async def test_audit_log_is_admin_only_and_read_only(anon_client, api_app, auth_
     async with truly_anon:
         assert (await truly_anon.get("/api/v1/admin/audit")).status_code == 401
 
-    # 只读：审计接口只有 GET，没有删除/清空入口（管理员也清不掉）
+    # 审计行本身没有修改与删除入口：能改的审计等于没有审计。
     methods = set(api_app.openapi()["paths"]["/api/v1/admin/audit"].keys())
     assert methods == {"get"}, methods
+    # 唯一的删除路径是按保留期清理，而且它自己也要留痕；导出是 GET（不改数据）。
+    assert set(api_app.openapi()["paths"]["/api/v1/admin/audit/purge"].keys()) == {"post"}
+    assert set(api_app.openapi()["paths"]["/api/v1/admin/audit/export"].keys()) == {"get"}
+    assert "audit.purge" in _audit_labels() and "audit.export" in _audit_labels()
+
+
+def _audit_labels() -> dict:
+    from backend import audit
+
+    return audit.ACTIONS
 
 
 def test_audit_scrub_drops_sensitive_keys():
@@ -1686,6 +1696,141 @@ def test_audit_scrub_drops_sensitive_keys():
     assert cleaned["nested"] == {}
     nested_kept = audit._scrub({"before": {"threshold_value": "0.0000", "token": "x"}})
     assert nested_kept["before"] == {"threshold_value": "0.0000"}
+
+
+# ---------------------------------------------------------------- 审计导出与清理
+
+async def test_audit_export_writes_csv_and_leaves_a_trail(anon_client, api_app, auth_headers):
+    """导出：CSV + BOM（Excel 中文不乱码）、筛选在导出前生效、导出这件事自己也留痕。"""
+    # 先造一条待筛的失败登录，导出的筛选才有东西可证
+    assert (await anon_client.post("/api/v1/auth/login", json={"username": "导出筛选用的人",
+                                                              "password": "whatever-2026"})).status_code == 401
+
+    exported = await anon_client.get("/api/v1/admin/audit/export?action=user.login_failed",
+                                     headers=auth_headers)
+    assert exported.status_code == 200, exported.text
+    assert exported.headers["content-type"].startswith("text/csv")
+    assert "attachment" in exported.headers["content-disposition"]
+    assert exported.headers["content-disposition"].endswith('.csv"')
+    assert exported.headers["x-export-truncated"] == "false"
+    rows = int(exported.headers["x-export-rows"])
+    assert rows >= 1
+
+    body = exported.content.decode("utf-8-sig")
+    # BOM 必须在字节层面存在（Excel 靠它认 UTF-8），而解析时要去掉
+    assert exported.content.startswith("\ufeff".encode("utf-8"))
+    lines = body.splitlines()
+    assert lines[0].split(",")[0] == "时间(UTC)"
+    assert len(lines) == rows + 1
+    assert all("user.login_failed" in line for line in lines[1:]), lines[:3]
+    # 别的用例也在同一个库里写过登录失败，所以只要求"这一个"在导出结果里
+    assert any("导出筛选用的人" in line for line in lines[1:]), lines[1:4]
+
+    # 导出自己进了审计（合规口径：谁把审计捞走和谁改了数据一样重要）
+    me = await anon_client.get("/api/v1/auth/me", headers=auth_headers)
+    trail = await _audit(anon_client, auth_headers, action="audit.export", limit=5)
+    assert trail["total"] >= 1
+    latest = trail["data"][0]
+    assert latest["detail"]["rows"] == rows
+    assert latest["detail"]["action"] == "user.login_failed"
+    assert latest["actor"] == me.json()["username"]
+
+    # 受限账号既不能看也不能导
+    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    try:
+        assert (await scoped.get("/api/v1/admin/audit/export", headers=headers)).status_code == 403
+        assert (await scoped.post("/api/v1/admin/audit/purge", json={}, headers=headers)).status_code == 403
+    finally:
+        await scoped.aclose()
+
+
+async def test_audit_purge_respects_retention_and_is_dry_run_first(anon_client, auth_headers, db_session):
+    """清理：默认只预览，真删只动过期行，且清理自己留一条 `audit.purge`。"""
+    from datetime import datetime, timedelta, timezone
+
+    from backend import audit
+    from backend.models import AuditLog
+
+    # 直接在库里造一条 400 天前的旧记录与一条今天的记录（接口不会产生"过去"的时间）
+    old = AuditLog(actor="purge-history", action="user.login", target_type="user", target_id="old",
+                   detail={"note": "老到该被清掉"}, ip="", created_at=datetime.now(timezone.utc) - timedelta(days=400))
+    fresh = AuditLog(actor="purge-today", action="user.login", target_type="user", target_id="new",
+                     detail={}, ip="", created_at=datetime.now(timezone.utc))
+    db_session.add_all([old, fresh])
+    db_session.commit()
+
+    listed = await _audit(anon_client, auth_headers, actor="purge-history")
+    assert listed["total"] == 1
+    assert listed["retention_days"] == 180
+    assert listed["export_limit"] == 5000
+
+    # 先预览：报出会删几条，但一条都不删
+    preview = await anon_client.post("/api/v1/admin/audit/purge", json={}, headers=auth_headers)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["dry_run"] is True and body["keep_days"] == 180
+    assert body["deleted"] >= 1
+    assert (await _audit(anon_client, auth_headers, actor="purge-history"))["total"] == 1
+
+    # 真删：老行没了、今天的还在、清理动作留痕
+    purged = await anon_client.post("/api/v1/admin/audit/purge",
+                                    json={"dry_run": False, "keep_days": 180}, headers=auth_headers)
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["dry_run"] is False
+    assert purged.json()["deleted"] == body["deleted"]
+    assert (await _audit(anon_client, auth_headers, actor="purge-history"))["total"] == 0
+    assert (await _audit(anon_client, auth_headers, actor="purge-today"))["total"] == 1
+    trail = await _audit(anon_client, auth_headers, action="audit.purge", limit=5)
+    assert trail["total"] >= 1
+    assert trail["data"][0]["detail"]["deleted"] == body["deleted"]
+    assert trail["data"][0]["detail"]["keep_days"] == 180
+
+    # 不能"保留 0 天"= 清空；超范围直接 422，而且这种请求不该留下 purge 痕迹
+    before = (await _audit(anon_client, auth_headers, action="audit.purge", limit=50))["total"]
+    for bad in ({"keep_days": 0}, {"keep_days": 40000}, {"keep_days": "很久"}):
+        rejected = await anon_client.post("/api/v1/admin/audit/purge", json=bad, headers=auth_headers)
+        assert rejected.status_code == 422, (bad, rejected.text)
+    assert (await _audit(anon_client, auth_headers, action="audit.purge", limit=50))["total"] == before
+
+    # 单测直接调底层：dry_run 纯计数、cutoff 是"days 天前"
+    cutoff = audit.retention_cutoff(180)
+    assert audit.count_older_than(db_session, cutoff) == 0
+    assert audit.purge(db_session, cutoff=cutoff, dry_run=True) == 0
+
+
+async def test_audit_log_filters_by_ip_and_date_range(anon_client, auth_headers, db_session):
+    """IP 前缀与日期范围筛选：日期是本地日历日（含首尾），不是"字符串比大小"。"""
+    from datetime import date, datetime, timedelta, timezone
+
+    from backend.models import AuditLog
+
+    today = date.today()
+    # 造一条"三天前"的记录：它必须在三天前的窗口里出现、在今天的窗口里消失
+    older = AuditLog(actor="range-history", action="user.login", target_type="user", target_id="old",
+                     detail={}, ip="198.51.100.7",
+                     created_at=datetime.now(timezone.utc) - timedelta(days=3))
+    db_session.add(older)
+    db_session.commit()
+
+    listed = await _audit(anon_client, auth_headers, limit=1)
+    assert isinstance(listed["ips"], list) and "198.51.100.7" in listed["ips"]
+
+    window = (today - timedelta(days=3)).isoformat()
+    assert (await _audit(anon_client, auth_headers, actor="range-history",
+                         since=window, until=window))["total"] == 1
+    assert (await _audit(anon_client, auth_headers, actor="range-history",
+                         since=today.isoformat(), until=today.isoformat()))["total"] == 0
+    # 久远的空窗口干脆返回 0，而不是把整表都当命中
+    assert (await _audit(anon_client, auth_headers, since="2000-01-01", until="2000-01-02"))["total"] == 0
+    # 只给 since：从那天起全部命中（含刚才那条三天前的）
+    assert (await _audit(anon_client, auth_headers, actor="range-history",
+                         since=window))["total"] == 1
+
+    # IP 前缀匹配（拿刚写进去的那个 IP 的前 3 位当前缀）
+    prefix = "198.51.100"
+    matched = await _audit(anon_client, auth_headers, ip=prefix, limit=50)
+    assert matched["data"] and all(row["ip"].startswith(prefix) for row in matched["data"])
+    assert (await _audit(anon_client, auth_headers, ip="203.0.113.250"))["total"] == 0
 
 
 # ---------------------------------------------------------------- 分页与筛选

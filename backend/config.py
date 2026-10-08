@@ -142,6 +142,8 @@ if BaseSettings is not None:
         # data/raw 按仓库约定只读（原始文件不得覆盖删除），上传落盘一律另放目录。
         upload_dir: str = "data/uploads"
         rag_upload_dir: str = "data/uploads/documents"
+        # 审计日志的保留天数：超过这个天数才算过期，只有 POST /admin/audit/purge 会删（并留痕）。
+        audit_retention_days: int = 180
         database_url: str = "postgresql+psycopg://finance:finance@localhost:5432/finance"
         deepseek_api_key: str = ""
         deepseek_base_url: str = "https://api.deepseek.com"
@@ -207,6 +209,7 @@ else:
         rag_candidate_k = int(os.getenv("RAG_CANDIDATE_K", "20"))
         upload_dir = os.getenv("UPLOAD_DIR", "data/uploads")
         rag_upload_dir = os.getenv("RAG_UPLOAD_DIR", "data/uploads/documents")
+        audit_retention_days = int(os.getenv("AUDIT_RETENTION_DAYS", "180"))
         database_url = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@localhost:5432/finance")
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

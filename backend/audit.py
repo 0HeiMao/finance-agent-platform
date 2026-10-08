@@ -12,11 +12,15 @@
    只有登录失败这种「业务本身就是失败」的场合才 `commit=True` 单独提交。
 3. **失败不拦业务**。`record` 内部不抛异常（列缺失、JSON 序列化失败都只记 warning），
    审计不能成为导入/撤销失败的原因。
+4. **只增不减，唯一的删除是「按保留期清理」**（`purge`），并且那次清理自己也要留一条痕
+   （动作 `audit.purge`，detail 里有截止时间与删除条数）。管理员没有任何「清空审计」的入口：
+   能随手清掉的审计等于没有审计，保留期是策略而不是后门。
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from backend.models import AuditLog, User
@@ -40,6 +44,8 @@ ACTIONS: dict[str, str] = {
     "knowledge.delete": "删除知识库来源",
     "alert.review": "处理预警",
     "alert_rule.update": "修改预警规则",
+    "audit.export": "导出审计日志",
+    "audit.purge": "清理过期审计",
 }
 
 # 这些键一旦出现就整条丢掉（大小写不敏感的前缀匹配）
@@ -132,8 +138,14 @@ def serialize(row: AuditLog) -> dict:
 
 
 def query(db: Session, *, action: str | None = None, actor: str | None = None,
-          target_type: str | None = None, limit: int = 50, offset: int = 0) -> tuple[list[AuditLog], int]:
-    """按动作/操作人/对象类型过滤，返回 (当页行, 命中总数)。"""
+          target_type: str | None = None, ip: str | None = None,
+          since: datetime | None = None, until: datetime | None = None,
+          limit: int = 50, offset: int = 0) -> tuple[list[AuditLog], int]:
+    """按动作/操作人/对象类型/IP/时间范围过滤，返回 (当页行, 命中总数)。
+
+    时间范围与筛选一律在分页之前生效（`total` 也按过滤后的条件数），否则「翻到第 2 页
+    数字突然变了」这类问题会让人不敢信这个页面。
+    """
     conditions = []
     if action:
         conditions.append(AuditLog.action == action)
@@ -141,6 +153,13 @@ def query(db: Session, *, action: str | None = None, actor: str | None = None,
         conditions.append(AuditLog.actor == actor)
     if target_type:
         conditions.append(AuditLog.target_type == target_type)
+    if ip:
+        # 前缀匹配：IPv6/代理链会带上端口或后续跳，写全就没法查了
+        conditions.append(AuditLog.ip.like(f"{ip}%"))
+    if since is not None:
+        conditions.append(AuditLog.created_at >= since)
+    if until is not None:
+        conditions.append(AuditLog.created_at <= until)
     total = db.scalar(select(func.count()).select_from(AuditLog).where(*conditions)) or 0
     rows = db.scalars(
         select(AuditLog).where(*conditions).order_by(AuditLog.id.desc()).limit(limit).offset(offset)
@@ -148,8 +167,48 @@ def query(db: Session, *, action: str | None = None, actor: str | None = None,
     return list(rows), int(total)
 
 
+def retention_cutoff(days: int, *, now: datetime | None = None) -> datetime:
+    """保留期边界：比它更早的记录才算过期（`days` 天以前的那个时刻）。"""
+    return (now or datetime.now(timezone.utc)) - timedelta(days=max(int(days), 1))
+
+
+def count_older_than(db: Session, cutoff: datetime) -> int:
+    return int(db.scalar(
+        select(func.count()).select_from(AuditLog).where(AuditLog.created_at < cutoff)
+    ) or 0)
+
+
+def purge(db: Session, *, cutoff: datetime, dry_run: bool = False) -> int:
+    """删掉 `created_at < cutoff` 的审计记录，返回删除条数；`dry_run` 只数不删。
+
+    这是全项目**唯一**会删审计的代码路径，调用方（`POST /admin/audit/purge`）必须自己
+    再写一条 `audit.purge` 留痕——清理动作本身也是要能查得到的动作。
+    """
+    if dry_run:
+        return count_older_than(db, cutoff)
+    return int(db.execute(delete(AuditLog).where(AuditLog.created_at < cutoff)).rowcount or 0)
+
+
 def action_options() -> list[dict]:
     return [{"value": value, "label": label} for value, label in ACTIONS.items()]
+
+
+# 导出 CSV 的列（与页面上的列一致，外加部门与 IP；详情压成一行 JSON 便于筛选）
+CSV_HEADER = ("时间(UTC)", "操作人", "部门", "动作", "动作标签", "对象类型", "对象ID", "详情", "IP")
+
+
+def csv_record(row: AuditLog) -> list[str]:
+    """把一行审计拍成 CSV 的字符串列表。
+
+    时间用 ISO-8601 UTC（接口给的都是 UTC，页面上由前端换算成本机时间）：导出的表格是要拿去
+    对数、进审计底稿的，含糊的本地时间比时区偏移更容易出错。详情里的非 ASCII 不转义
+    （`ensure_ascii=False`），配合导出时的 UTF-8 BOM，Excel 打开中文才不会是乱码。
+    """
+    item = serialize(row)
+    detail = item["detail"]
+    text = json.dumps(detail, ensure_ascii=False, sort_keys=True) if detail else ""
+    return [item["at"] or "", item["actor"], item["department"], item["action"],
+            item["action_label"], item["target_type"], item["target_id"], text, item["ip"]]
 
 
 def known_actors(db: Session, limit: int = 50) -> list[str]:
@@ -157,5 +216,19 @@ def known_actors(db: Session, limit: int = 50) -> list[str]:
     rows = db.execute(
         select(AuditLog.actor, func.max(AuditLog.id).label("last"))
         .group_by(AuditLog.actor).order_by(func.max(AuditLog.id).desc()).limit(limit)
+    ).all()
+    return [row[0] for row in rows]
+
+
+def known_ips(db: Session, limit: int = 50) -> list[str]:
+    """最近出现过的来源 IP，供前端下拉用。
+
+    和 `known_actors` 同理走审计表本身（不查 users），按最近一次出现排序；空 IP（脚本、
+    测试客户端）不进下拉——它们没有筛选价值，用户要的是「哪个来源干的」。
+    """
+    rows = db.execute(
+        select(AuditLog.ip, func.max(AuditLog.id).label("last"))
+        .where(AuditLog.ip.is_not(None), AuditLog.ip != "")
+        .group_by(AuditLog.ip).order_by(func.max(AuditLog.id).desc()).limit(limit)
     ).all()
     return [row[0] for row in rows]

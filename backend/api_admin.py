@@ -12,11 +12,14 @@
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -691,11 +694,45 @@ def update_alert_rule(alert_type: str, payload: AlertRuleUpdate, request: Reques
 
 # ------------------------------------------------------------------ 审计日志
 
+# 导出一次最多给这么多行：审计是留档用的，几万行的 CSV 在浏览器里拼字符串一样会卡死，
+# 需要更大范围就按时间/动作分段导出（分页与筛选都在导出前生效）。
+AUDIT_EXPORT_LIMIT = 5000
+
+
+class AuditPurgeRequest(BaseModel):
+    """按保留期清理审计。`dry_run` 默认 True：先看会删多少，再决定删不删。"""
+
+    keep_days: int | None = Field(default=None, ge=1, le=3650)
+    dry_run: bool = True
+
+
+def _audit_window(since: date | None, until: date | None) -> tuple[datetime | None, datetime | None]:
+    """把页面上的日期（含首含尾）转成时间窗：`since` 当天 00:00 起、`until` 次日 00:00 止。
+
+    用户填的是本机日历日，库里存的是带时区的 UTC 时刻，所以这里用 `astimezone()` 把
+    「本地某天的 00:00」变成带时区的时刻再比——直接拿裸日期比会整体差掉一个时区偏移，
+    在 UTC+8 的机器上表现为「今天早上 8 点前的记录查不到」。
+    """
+    start = datetime.combine(since, time.min).astimezone() if since else None
+    end = datetime.combine(until + timedelta(days=1), time.min).astimezone() if until else None
+    return start, end
+
+
+def _audit_filters(action: str | None, actor: str | None, target_type: str | None,
+                   ip: str | None, since: date | None, until: date | None) -> dict:
+    start, end = _audit_window(since, until)
+    return {"action": action, "actor": actor, "target_type": target_type, "ip": ip,
+            "since": start, "until": end}
+
+
 @router.get("/audit")
 def list_audit(
     action: str | None = Query(None, max_length=60),
     actor: str | None = Query(None, max_length=100),
     target_type: str | None = Query(None, max_length=40),
+    ip: str | None = Query(None, max_length=60),
+    since: date | None = Query(None),
+    until: date | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -703,10 +740,12 @@ def list_audit(
 ):
     """审计日志：谁在什么时候改了什么。
 
-    只读接口，不提供删除与导出——审计日志能被管理员随手清掉就失去意义了（要归档请直接读库）。
+    **这个接口只读**：没有 PUT/DELETE，唯一的删除路径是 `POST /admin/audit/purge`（按保留期清理，
+    而且那次清理自己也会留一条 `audit.purge`）——能被管理员随手清空的审计等于没有审计。
+    归档走 `GET /admin/audit/export`（CSV），筛选与分页在导出前同样生效。
     """
-    rows, total = audit.query(db, action=action, actor=actor, target_type=target_type,
-                              limit=limit, offset=offset)
+    rows, total = audit.query(db, limit=limit, offset=offset,
+                              **_audit_filters(action, actor, target_type, ip, since, until))
     return {
         "data": [audit.serialize(row) for row in rows],
         "total": total,
@@ -714,4 +753,73 @@ def list_audit(
         "offset": offset,
         "actions": audit.action_options(),
         "actors": audit.known_actors(db),
+        "ips": audit.known_ips(db),
+        "retention_days": get_settings().audit_retention_days,
+        "export_limit": AUDIT_EXPORT_LIMIT,
     }
+
+
+@router.get("/audit/export")
+def export_audit(
+    request: Request,
+    action: str | None = Query(None, max_length=60),
+    actor: str | None = Query(None, max_length=100),
+    target_type: str | None = Query(None, max_length=40),
+    ip: str | None = Query(None, max_length=60),
+    since: date | None = Query(None),
+    until: date | None = Query(None),
+    db: Session = Depends(get_db),
+    me: User = Depends(admin_user),
+):
+    """把（筛选后的）审计导出成 CSV。
+
+    两个细节是真踩过的：正文开头写 UTF-8 BOM，否则 Excel 打开中文列名是乱码；
+    导出这件事本身也要留痕（`audit.export`，detail 里记条数与筛选条件），
+    「谁把审计捞走了」在合规口径下和「谁改了数据」一样重要。
+    """
+    filters = _audit_filters(action, actor, target_type, ip, since, until)
+    rows, total = audit.query(db, limit=AUDIT_EXPORT_LIMIT, offset=0, **filters)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(audit.CSV_HEADER)
+    writer.writerows(audit.csv_record(row) for row in rows)
+    audit.record(db, me, "audit.export", target_type="audit",
+                 detail={"rows": len(rows), "total": total, "truncated": total > len(rows),
+                         "action": action or "", "actor": actor or "", "target_type": target_type or "",
+                         "ip": ip or "", "since": str(since or ""), "until": str(until or "")},
+                 request=request)
+    db.commit()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"audit-{stamp}.csv"
+    return Response(
+        content="\ufeff" + buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "X-Export-Rows": str(len(rows)),
+                 "X-Export-Truncated": "true" if total > len(rows) else "false"},
+    )
+
+
+@router.post("/audit/purge")
+def purge_audit(
+    payload: AuditPurgeRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    me: User = Depends(admin_user),
+):
+    """按保留期清理审计日志（默认 `dry_run=True`，只报数不删）。
+
+    刻意不做成「清空审计」：只能按天数往前删，且至少保留 1 天，删完自己写一条 `audit.purge`
+    记录（含截止时间与删除条数）——清理这个动作本身必须可查，否则它就是审计的漏洞。
+    """
+    days = payload.keep_days or get_settings().audit_retention_days
+    cutoff = audit.retention_cutoff(days)
+    deleted = audit.purge(db, cutoff=cutoff, dry_run=payload.dry_run)
+    if not payload.dry_run:
+        audit.record(db, me, "audit.purge", target_type="audit",
+                     detail={"keep_days": days, "before": cutoff.isoformat(), "deleted": deleted},
+                     request=request)
+    db.commit()
+    remaining, total = audit.query(db, limit=1, offset=0)
+    return {"dry_run": payload.dry_run, "keep_days": days, "before": cutoff.isoformat(),
+            "deleted": deleted, "total": total, "sample_id": remaining[0].id if remaining else None}
