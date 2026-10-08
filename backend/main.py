@@ -1,18 +1,19 @@
 import asyncio
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-from backend import observability
+from backend import metrics, observability
 from backend.api_admin import router as admin_router
 from backend.api_ai import router as ai_router
 from backend.api_analysis import router as analysis_router
@@ -36,10 +37,13 @@ from backend.http_headers import (
     request_is_https,
 )
 from backend.jobs import resume_interrupted_jobs
+from backend.logging_setup import configure_logging
 from backend.migrations import ensure_schema, missing_columns, missing_indexes
 from backend.observability import record_request, snapshot
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# 日志格式由 LOG_FORMAT 决定：默认仍是人读文本（本地开发与真机脚本都在 grep 它），
+# 采集侧打开 json 就是一行一个 JSON（见 backend/logging_setup.py）。
+LOG_FORMAT = configure_logging()
 logger = logging.getLogger("finance-api")
 
 
@@ -62,18 +66,37 @@ def check_startup_config() -> None:
 class ObservabilityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         started = time.perf_counter()
-        response = await call_next(request)
+        # 「正在处理中」在**进入**时就 +1：这是唯一在请求还没结束前就能看到的指标，
+        # 卡住时它一直是正数（P95 与计数都要等请求结束才有数，故障时正好什么都看不到）。
+        metrics.request_started()
+        try:
+            response = await call_next(request)
+        finally:
+            metrics.request_finished()
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        # 标签用**路由模板**而不是原始路径：`/financial/transactions/123` 会记成
+        # `/api/v1/financial/transactions/{row_id}`，否则一个 id 一条时间序列（见 backend/metrics.py）。
+        route = metrics.route_label(request)
+        request_id = request_id_of(request)
         # 请求 id 由最外层的 RequestContextMiddleware 定好：日志里有它，
         # 用户报「我这次操作有问题」时才能把那一行捞出来，而不是按时间去猜。
+        # 字段同时用 `extra=` 给结构化日志（LOG_FORMAT=json 时一行 JSON 里就是这些键）。
         logger.info("request request_id=%s path=%s method=%s status=%s duration_ms=%s",
-                    request_id_of(request), request.url.path, request.method,
-                    response.status_code, elapsed_ms)
+                    request_id, request.url.path, request.method,
+                    response.status_code, elapsed_ms,
+                    extra={"request_id": request_id, "path": request.url.path,
+                           "route": route, "method": request.method,
+                           "status": response.status_code, "duration_ms": elapsed_ms})
         record_request(request.url.path, response.status_code, elapsed_ms)
+        metrics.observe_request(method=request.method, route=route,
+                                status_code=response.status_code, duration_ms=elapsed_ms)
         response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
         return response
 
 app = FastAPI(title="智能财务分析平台 API", version="1.0.0")
+# 指标里的应用信息（版本/环境）在进程启动时就定下来：`finance_app_info` 恒为 1，
+# 作用是让仪表盘能一眼看出「这批数据是哪个版本、哪个环境发出来的」。
+metrics.init_app_info(app.version, get_settings().app_env)
 # 中间件是「后 add 的在外层」，所以这里的顺序从里到外是 GZip → 观测 → CORS → 请求 id + 安全头。
 # GZip 贴着应用：它只管应用真正吐出来的字节，流式响应（SSE）与已经是 zip 的格式都在排除表里。
 app.add_middleware(
@@ -103,7 +126,8 @@ async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse
     安全头与请求 id 得在这里自己补一遍（`apply_security_headers` 是同一份口径）。
     """
     request_id = request_id_of(request)
-    logger.error("未处理异常 request_id=%s path=%s", request_id, request.url.path, exc_info=exc)
+    logger.error("未处理异常 request_id=%s path=%s", request_id, request.url.path, exc_info=exc,
+                 extra={"request_id": request_id, "path": request.url.path})
     response = JSONResponse(status_code=500,
                             content={"detail": "服务器内部错误", "request_id": request_id})
     https = request_is_https(request.url.scheme, request.headers.get("X-Forwarded-Proto"))
@@ -189,6 +213,27 @@ def health():
 def observability_metrics():
     """返回当前进程的基础请求指标，生产环境可由 Prometheus 采集。"""
     return snapshot()
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics(request: Request):
+    """Prometheus 文本格式指标（⑬）。
+
+    刻意**不进 OpenAPI**（`include_in_schema=False`）：它不是给业务调用方用的 JSON 接口，
+    而是给爬取侧用的文本端点，混进接口契约会让「契约漂移」的比对多出一条永远在变的噪音。
+
+    鉴权按 `METRICS_TOKEN` 分两档：没配就是开放的（爬取侧一般没法走 JWT 登录，生产环境
+    应在反代/内网层面限制来源），配了就认 `Authorization: Bearer <token>`。
+    `METRICS_ENABLED=false` 时直接 404 —— 什么都不暴露比暴露一个没人看的端点更干净。
+    """
+    settings = get_settings()
+    if not settings.metrics_enabled:
+        raise HTTPException(status_code=404, detail="指标端点已关闭")
+    token = (settings.metrics_token or "").strip()
+    if token and not secrets.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {token}"):
+        raise HTTPException(status_code=401, detail="指标端点需要 Bearer Token")
+    return PlainTextResponse(metrics.collect(), media_type=metrics.CONTENT_TYPE)
 
 
 @app.post("/api/chat", response_model=ChatResponse)

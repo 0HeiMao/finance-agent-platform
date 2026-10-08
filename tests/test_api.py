@@ -3881,3 +3881,56 @@ async def test_unhandled_error_carries_request_id_and_security_headers(api_app):
     assert "default-src 'none'" in response.headers["Content-Security-Policy"]
 
 
+async def test_metrics_endpoint_serves_prometheus_text(anon_client, api_app):
+    """⑬ `/metrics`：Prometheus 文本格式（HELP/TYPE + 直方图累计桶），且**不进接口契约**。
+
+    不进 OpenAPI 是刻意的：它是给爬取侧用的文本端点，混进契约会让「契约漂移」比对
+    多出一条永远在变的噪音。
+    """
+    from backend import metrics
+
+    metrics.reset()
+    response = await anon_client.get("/metrics")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["Content-Type"].startswith("text/plain; version=0.0.4")
+    body = response.text
+    assert "# HELP finance_http_requests_total" in body
+    assert "# TYPE finance_http_requests_total counter" in body
+    assert "# TYPE finance_http_request_duration_seconds histogram" in body
+    assert 'finance_app_info{version="1.0.0",environment=' in body
+    assert "finance_process_start_time_seconds " in body
+    # 在途请求数在**响应渲染时**就该是 1（这条请求自己）：卡住时它是唯一还能看的指标。
+    assert "finance_http_requests_in_flight 1" in body
+    assert "/metrics" not in api_app.openapi()["paths"]
+
+
+async def test_metrics_labels_use_route_templates(anon_client):
+    """按原始路径记标签会让一个 id 一条时间序列；未匹配的路径一律归 `unmatched`。"""
+    from backend import metrics
+
+    metrics.reset()
+    await anon_client.get("/api/v1/health")
+    await anon_client.get("/api/v1/financial/transactions/123")
+    await anon_client.get("/no/such/path/xyz")
+    body = (await anon_client.get("/metrics")).text
+
+    assert 'finance_http_requests_total{method="GET",route="/api/v1/health",status="200"} 1' in body
+    assert 'route="/api/v1/financial/transactions/{row_id}"' in body
+    assert 'finance_http_requests_total{method="GET",route="unmatched",status="404"} 1' in body
+    assert "/123" not in body
+
+
+async def test_metrics_token_and_kill_switch(anon_client, monkeypatch):
+    """没配 `METRICS_TOKEN` 就开放（爬取侧没法走 JWT 登录）；配了就认 Bearer；`METRICS_ENABLED=false` 直接 404。"""
+    monkeypatch.setattr("backend.main.get_settings",
+                        lambda: SimpleNamespace(metrics_enabled=True, metrics_token="s3cret"))
+    assert (await anon_client.get("/metrics")).status_code == 401
+    allowed = await anon_client.get("/metrics", headers={"Authorization": "Bearer s3cret"})
+    assert allowed.status_code == 200, allowed.text
+
+    monkeypatch.setattr("backend.main.get_settings",
+                        lambda: SimpleNamespace(metrics_enabled=False, metrics_token="s3cret"))
+    assert (await anon_client.get("/metrics")).status_code == 404
+
+

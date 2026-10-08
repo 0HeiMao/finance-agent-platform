@@ -131,6 +131,9 @@ if BaseSettings is not None:
     class Settings(BaseSettings):
         app_env: str = "development"
         log_level: str = "INFO"
+        # 日志格式：text = 人读的一行文本（默认，本地开发与几个真机脚本都在 grep 它）；
+        # json = 一行一个 JSON，采集侧可直接索引字段（见 backend/logging_setup.py）。
+        log_format: str = "text"
         api_prefix: str = "/api/v1"
         cors_origins: str = "http://localhost:5173"
         model_provider: str = ""
@@ -176,6 +179,11 @@ if BaseSettings is not None:
         slow_path_ms: int = 1000
         slow_path_overrides: str = ""
         slow_path_log_seconds: int = 60
+        # Prometheus 指标端点（`/metrics`，文本格式，见 backend/metrics.py）：
+        # METRICS_ENABLED=false 时直接 404；METRICS_TOKEN 非空时要求 `Authorization: Bearer <token>`
+        # ——爬取侧通常没法走 JWT 登录，所以默认不鉴权，生产环境应在反代/内网层面限制来源。
+        metrics_enabled: bool = True
+        metrics_token: str = ""
         # 出口配额（每分钟、按账号）：导出一次能把整库拉走，问答一次要花模型的钱，
         # 两个都必须是"脚本打不动、人用不着"的量级——回归脚本一次要连问 28 个问题，
         # 所以默认给到 60，不是 10 那种会误伤自己的数字。
@@ -237,6 +245,7 @@ else:
     class Settings:
         app_env = os.getenv("APP_ENV", "development")
         log_level = os.getenv("LOG_LEVEL", "INFO")
+        log_format = os.getenv("LOG_FORMAT", "text")
         api_prefix = "/api/v1"
         cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173")
         model_provider = os.getenv("MODEL_PROVIDER", "")
@@ -263,6 +272,8 @@ else:
         slow_path_ms = int(os.getenv("SLOW_PATH_MS", "1000"))
         slow_path_overrides = os.getenv("SLOW_PATH_OVERRIDES", "")
         slow_path_log_seconds = int(os.getenv("SLOW_PATH_LOG_SECONDS", "60"))
+        metrics_enabled = os.getenv("METRICS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        metrics_token = os.getenv("METRICS_TOKEN", "")
         export_max_per_minute = int(os.getenv("EXPORT_MAX_PER_MINUTE", "30"))
         ai_max_per_minute = int(os.getenv("AI_MAX_PER_MINUTE", "60"))
         database_url = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@localhost:5432/finance")

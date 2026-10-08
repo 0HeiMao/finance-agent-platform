@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十五个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十六个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下十六个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第十七个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -110,6 +110,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
 | `verify_backup_restore.py` | 备份与恢复 29 项：真库打一份归档（9 张表 9928 行 + 上传件）→ `verify` 只对着归档自检（每张表一个 `COPY` 成员、sha256 一个个重算、`.env`/`data/models`/`data/index` 都不在里面且排除理由写在 manifest 里）→ **恢复进临时库 `finance_restore_check`**（先用不带 `--yes` 的一次预演确认「预演之后临时库仍然不存在」，再真恢复）→ 逐表 `count(*)` 与活库对平、`vector` 列 5 行全非空且维度 384、序列已推到 `max(id)` 之后、恢复出的表能真查 → 上传件往返（写探针 → 备份 → 删 → 恢复到 `output/_restore_uploads` → 字节级一致，且**没有**写回真实 `data/uploads`）→ 三个负例该红的都红（改一个数据字节 → `verify` 点名 sha256；清单里多一列 → 恢复拒绝并点名这一列；清单 sha256 改坏 → 恢复拒绝）→ 同一个归档可反复恢复 → 跑完删临时库、探针文件与探针归档，**全程不动演示库 `finance`** |
 | `verify_security_headers.py` | 安全响应头 + GZip + 请求 id 29 项：正常响应与 404 都带四个静态头与严格 CSP、请求 id 合规则原样回传（128 位边界）而超长/带空格/带分号一律换成 32 位、**响应里那个 id 能在后端日志里 grep 到**（每次跑换新 id，否则上一轮那条会让这项假绿）、`/docs`/`/redoc`/`/openapi.json` 换成文档 CSP、HSTS 只在 `X-Forwarded-Proto: https`（或 `https, http`）时出现、`/openapi.json` 与 CSV 导出**真被压**且解压后与 `Accept-Encoding: identity` 那份 JSON 相等（用 `iter_raw()` 数网线上真实字节，`content` 是解压后的）、同样 8909 行的 xlsx 导出**不压**、SSE 没被压且仍按 chunked 传（带不带 gzip 收到的字节一致）、500 也带请求 id 与安全头（它绕过所有中间件，是处理器自己补的）。静态头期望值**写死在脚本里**、不从 `backend.http_headers` import —— 否则常量被改错时脚本跟着一起错。跑一次消耗 3 次导出配额 |
+| `verify_metrics_logs.py` | Prometheus 指标与结构化日志 31 项：`/metrics` 匿名 200 且是 Prometheus 文本（桶单调不减、`le="+Inf"` 恒等于 `_count`、指标名全带 `finance_` 前缀）、**与活库对账**（`finance_background_jobs` 总数 == `/admin/jobs` 的 `total`、`finance_alerts` == `/admin/overview` 的 `counts.alert_rows`、`finance_db_up` = 1）、计数真跟流量走（连点三次 `/health` 正好 +3；两个不同 id 只长一条 `{row_id}` 序列且 body 里没有 `/123` 这种字面量；404 归 `unmatched`）、**`/metrics` 不在 `/openapi.json` 的 paths 里**（`include_in_schema=False`，否则加一个指标契约就飘）、gzip 网线字节 11360 → 1228 且**摘掉 `/metrics` 自己那条自增序列**之后与 `identity` 逐字节相等、`X-Request-ID` 回显且后端文本日志里那一次请求同时带 path/method/status/duration_ms；另起两个短命 uvicorn 验配置面：`LOG_FORMAT=json` + `METRICS_TOKEN` + `SLOW_PATH_MS=1`（无 token 401、带 token 200、每条日志都是合法单行 JSON、慢接口告警也是 JSON 且字段真在 JSON 里）与 `METRICS_ENABLED=false`（`/metrics` 404 而 `/api/v1/health` 仍 200）。两个只在这台机器上才有的坑写进了脚本注释：日志编码要**按 BOM 判**（`\| Tee-Object` 写 UTF-16、脚本自己 `Popen` 写 UTF-8，而任意偶数长度的 UTF-8 用 `utf-16` 解码不报错只出乱码），而 `\| Tee-Object` 会按控制台 120 列把长行**硬折**（`duration_ms=` 可能正好被折点切开），所以比对前要把空白整体去掉 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -167,7 +168,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 215 项、前端 41 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 226 项、前端 41 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -340,7 +341,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **215** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**）、
+`tests/` 下三个文件共 **226** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**）、
 `test_config.py`（占位密钥与 CORS 校验、启动 strict 语义）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -453,7 +454,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 
 | 范围 | 实测水位 | 门槛 | 口径 |
 | --- | --- | --- | --- |
-| 后端（`--cov=backend --cov-branch`） | 语句 88.26%、分支 87.79% | **87.0% / 86.0%** | 全量 215 项跑完后的 TOTAL 行 |
+| 后端（`--cov=backend --cov-branch`） | 语句 88.80%、分支 88.16% | **87.0% / 86.0%** | 全量 226 项跑完后的 TOTAL 行 |
 | 前端（node `--experimental-test-coverage`） | 平均语句 95.82%、平均分支 88.85% | **95.0% / 86.0%** | 12 个固定模块的平均值 |
 
 两侧都还有一条比百分比更要紧的检查：
@@ -545,7 +546,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 215 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 226 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 41 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -770,6 +771,80 @@ body 只回 `{"detail": "服务器内部错误", "request_id": …}`，不回栈
 `X-Forwarded-Proto: https` 时出现、大 JSON 与 CSV 真被压且解压后与 `Accept-Encoding: identity`
 那份字节一致（用 `iter_raw()` 数网线字节，`content` 是解压后的）、xlsx 不压、SSE 没被压且仍是
 chunked（带不带 gzip 收到的字节一致）、500 也带 id 与安全头。
+
+## Prometheus 指标与结构化日志
+
+`GET /metrics`（**根路径**，不在 `/api/v1` 下面）输出 Prometheus 文本格式
+（`text/plain; version=0.0.4`），八个指标族：
+
+| 指标 | 类型 | 标签 | 含义 |
+| --- | --- | --- | --- |
+| `finance_http_requests_total` | counter | `method`、`route`、`status` | 请求数 |
+| `finance_http_request_duration_seconds` | histogram | `method`、`route` | 耗时（秒），桶 0.005 / 0.01 / 0.025 / 0.05 / 0.1 / 0.25 / 0.5 / 1 / 2.5 / 5 / 10 |
+| `finance_http_requests_in_flight` | gauge | — | 正在处理的请求数（渲染 `/metrics` 时含它自己） |
+| `finance_app_info` | gauge | `version`、`environment` | 恒为 1，用来在 Grafana 上按版本打标 |
+| `finance_process_start_time_seconds` | gauge | — | 进程启动时刻（Unix 秒） |
+| `finance_db_up` | gauge | — | 这次采集能不能读到库（1/0） |
+| `finance_background_jobs` | gauge | `status` | 后台任务按状态计数 |
+| `finance_alerts` | gauge | `review_status` | 预警按处理状态计数 |
+
+**标签一律用路由模板。** `route` 取 `scope["route"].path`，也就是
+`/api/v1/financial/transactions/{row_id}` 而不是 `…/transactions/123`；没匹配上路由的 404 记
+`unmatched`。这不是洁癖：按真实路径打标签，一个 id 一条时间序列，几百次分页请求就能把
+Prometheus 的基数撑爆，而被撑死的是监控不是接口。真机验证里专门有一项断言响应体里不出现字面量 `/123`。
+
+**没引 `prometheus_client`。** 只需要计数器、直方图、仪表三样，格式规则少到能逐行单测
+（`tests/test_units.py` 直接断言渲染出来的文本），为这三样多拉一个依赖不划算。`backend/metrics.py`
+里的直方图**内部只记「落在哪个桶」**，渲染时才累加成累计值 —— 这个坑真踩过：一开始 `observe()`
+把所有「装得下」的桶都 +1，于是观测三次 `le="0.025"` 会显示 4。`le="+Inf"` 永远等于 `_count`，
+比所有上界都大的观测值只进 `_count`/`_sum`。
+
+**读库失败不让端点崩。** 采集 `finance_background_jobs`/`finance_alerts` 时任何异常都只把
+`finance_db_up` 置 0 并把这两族清空 —— 旧数字比没有数字更危险（运维看到 6 个任务在跑，其实库早就
+连不上了）。
+
+**为什么留着 `/api/v1/observability/metrics` 那份 JSON。** 那份是给管理页看的，字段可以自由演进；
+`/metrics` 是给 Prometheus 的**契约**，改口径等于改别人的仪表盘，所以两边各留一份、不互相兼任。
+
+开关与令牌（都在 `.env`）：
+
+- `METRICS_ENABLED=false` → `/metrics` 返回 404（端点整个不暴露）；
+- `METRICS_TOKEN` 非空 → 要 `Authorization: Bearer <token>`，不带或不对返回 401；比较用
+  `secrets.compare_digest`（常量时间，避免按字节计时的猜测）；
+- `curl -s http://127.0.0.1:8000/metrics | head` 就能看。
+
+`docker-compose.yml` **没动** —— `LOG_FORMAT`/`METRICS_*` 都从 `.env` 走（compose 的 backend 段就是
+`env_file: .env`），本机跑不起来 compose 也就不去改一份验不了的文件。
+
+### 结构化日志
+
+`LOG_FORMAT=text`（默认）是给人看的：
+
+```
+2026-05-12 03:11:07,418 INFO request request_id=verify-metrics-02bacfb9 path=/api/v1/health method=GET status=200 duration_ms=0.61
+```
+
+`LOG_FORMAT=json` 则一行一条 JSON：
+
+```json
+{"ts":"2026-05-12T03:11:07.418Z","level":"INFO","logger":"finance-api.access","message":"request","request_id":"verify-metrics-02bacfb9","path":"/api/v1/health","route":"/api/v1/health","method":"GET","status":200,"duration_ms":0.61}
+```
+
+**只吐白名单字段**（`request_id`、`path`、`route`、`method`、`status`、`duration_ms`、`threshold_ms`、
+`exceeded`、`suppressed`、`worst_ms`），不是「`extra` 里有什么就吐什么」：日志是给别人看的，某天有人
+往 `extra` 里塞了口令或者地址，白名单是最后一道闸。异常栈进同一个 `exception` 字段
+（`formatException()`），不会把一行拆成多行。`configure_logging()` 只更新/安装自己带标记的 handler，
+**不摘**别人挂的（pytest 的 `caplog`、uvicorn 自己的 `uvicorn.error`/`uvicorn.access` 都还在，后者仍是
+文本）—— 所以想要一份访问日志就加 `--no-access-log`：应用日志里已经带了 method/path/status/duration_ms，
+两份只会让人对不上。
+
+慢接口告警（见「慢接口告警」一节）也走同一个 formatter，并且把 `path`/`duration_ms`/`threshold_ms`/
+`exceeded`/`suppressed` 放进了 `extra` —— 正文一个字没改（⑩ 的验证脚本与单测仍按正文断言），但采集侧
+不用再从正文里抠正则。
+
+真机验证是 `scripts/verify_metrics_logs.py`（31 项）：指标文本与开关/令牌、**与活库对账**、计数跟流量走、
+契约不飘、gzip 与请求 id，以及另起两个短命 uvicorn 分别验 `LOG_FORMAT=json` 与 `METRICS_ENABLED=false`
+（细节见上面的脚本表）。
 
 ## 页面
 

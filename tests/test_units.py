@@ -1224,4 +1224,180 @@ def test_security_headers_log_reader_survives_utf16_logs(tmp_path):
     assert gate.last_request_line(tmp_path / "missing.log") == "(日志里一条 request_id= 都没有)"
 
 
+# ---------------------------------------------------------------------------
+# Prometheus 指标与结构化日志（⑬）
+# ---------------------------------------------------------------------------
+
+def test_metrics_counter_and_gauge_render_prometheus_text():
+    """计数器只加不覆盖；仪表能正负调，但不会掉到 0 以下（负的「在途请求数」会让人以为指标坏了）。"""
+    from backend import metrics
+
+    counter = metrics.Counter("pytest_total", "计数", ("code",))
+    counter.inc({"code": "200"})
+    counter.inc({"code": "200"}, 2)
+    assert counter.value({"code": "200"}) == 3
+    assert counter.header() == ["# HELP pytest_total 计数", "# TYPE pytest_total counter"]
+    assert 'pytest_total{code="200"} 3' in counter.render()
+
+    gauge = metrics.Gauge("pytest_gauge", "仪表")
+    gauge.set(5)
+    gauge.change(-2)
+    assert gauge.value() == 3
+    gauge.change(-10)
+    assert gauge.value() == 0
+
+
+def test_metrics_histogram_buckets_are_cumulative():
+    """桶是**累计**的：观测 0.003/0.02/0.4 之后 `le="0.01"` 是 1 而不是 2。
+
+    这条是真机踩出来的：内部每命中一个「装得下它的上界」都 +1，渲染时又累加一遍，
+    `le="0.025"` 于是从 2 变成 4。内部只记落桶、累计交给渲染，两个口径才对得上。
+    """
+    from backend import metrics
+
+    histogram = metrics.Histogram("pytest_seconds", "耗时", ("route",))
+    for value in (0.003, 0.02, 0.4):
+        histogram.observe(value, {"route": "/a"})
+    lines = histogram.samples()
+    assert 'pytest_seconds_bucket{route="/a",le="0.005"} 1' in lines
+    assert 'pytest_seconds_bucket{route="/a",le="0.01"} 1' in lines
+    assert 'pytest_seconds_bucket{route="/a",le="0.025"} 2' in lines
+    assert 'pytest_seconds_bucket{route="/a",le="0.5"} 3' in lines
+    assert 'pytest_seconds_bucket{route="/a",le="+Inf"} 3' in lines
+    assert 'pytest_seconds_count{route="/a"} 3' in lines
+    assert 'pytest_seconds_sum{route="/a"} 0.423' in lines
+    assert histogram.count({"route": "/a"}) == 3
+
+    # 比所有上界都大：只进 `+Inf` 与 `_count`，有限桶一个都不动。
+    histogram.observe(99.0, {"route": "/a"})
+    assert 'pytest_seconds_bucket{route="/a",le="10"} 3' in histogram.samples()
+    assert 'pytest_seconds_bucket{route="/a",le="+Inf"} 4' in histogram.samples()
+
+
+def test_metrics_escape_label_values_and_reject_label_mismatch():
+    """标签值里的引号/反斜杠/换行必须转义，否则一行文本会被撑成两行、指标直接读不出来。"""
+    from backend import metrics
+
+    gauge = metrics.Gauge("pytest_path_gauge", "按路径", ("path",))
+    gauge.set(1, {"path": 'a"b\\c\nd'})
+    assert 'pytest_path_gauge{path="a\\"b\\\\c\\nd"} 1' in gauge.render()
+    assert metrics.format_number(1.0) == "1"
+    assert metrics.format_number(0.005) == "0.005"
+
+    # 多一个/少一个标签都是代码写错，宁可当场炸掉也不要静默记成另一个序列。
+    with pytest.raises(ValueError):
+        gauge.set(1, {"path": "/a", "extra": "x"})
+    with pytest.raises(ValueError):
+        gauge.set(1, {})
+
+
+def test_metrics_route_label_uses_route_template():
+    """标签用路由模板：`/financial/transactions/123` 不该各占一条时间序列，404 一律归 `unmatched`。"""
+    from backend import metrics
+
+    matched = SimpleNamespace(
+        scope={"route": SimpleNamespace(path="/api/v1/financial/transactions/{row_id}")})
+    assert metrics.route_label(matched) == "/api/v1/financial/transactions/{row_id}"
+    assert metrics.route_label(SimpleNamespace(scope={})) == metrics.UNMATCHED_ROUTE
+
+
+def test_metrics_runtime_refresh_never_breaks_the_endpoint(monkeypatch):
+    """库炸了的时候监控正好瞎掉是最糟的结果：采集失败只记 `finance_db_up=0` 并清空按状态的仪表。"""
+    from backend import metrics
+
+    metrics.DB_UP.set(1)
+    metrics.JOBS.set(3, {"status": "running"})
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("库连不上")
+
+    monkeypatch.setattr("backend.db.SessionLocal", boom)
+    metrics.refresh_runtime()
+
+    assert metrics.DB_UP.value() == 0
+    assert metrics.JOBS.samples() == []  # 留着上一次的数字等于拿旧数据骗告警
+    assert "finance_db_up 0" in metrics.render_prometheus()
+
+
+def test_json_log_formatter_keeps_only_whitelisted_extras():
+    """`extra=` 里塞什么都往 JSON 里吐，会把内网地址、令牌这类意外字段一起带出去，所以只收白名单。"""
+    import logging
+
+    from backend.logging_setup import JsonFormatter
+
+    record = logging.LogRecord("finance-api", logging.INFO, "p", 1, "请求完成 %s", ("ok",), None)
+    record.request_id = "trace-1"
+    record.status = 200
+    record.secret_token = "不该出现在日志里"
+    text = JsonFormatter().format(record)
+
+    assert "\n" not in text  # 一行一条：栈信息也塞进同一个字段，不会被切成多行
+    payload = json.loads(text)
+    assert payload["message"] == "请求完成 ok"
+    assert payload["level"] == "INFO"
+    assert payload["request_id"] == "trace-1"
+    assert payload["status"] == 200
+    assert "secret_token" not in payload
+    assert payload["ts"].endswith("+00:00")
+
+
+def test_slow_path_alert_carries_structured_fields(caplog):
+    """慢接口告警也要**结构化**：`LOG_FORMAT=json` 时字段得是真的 JSON 键，不能只拼在正文里。
+
+    告警走的是另一个日志器（`finance-api.slow`），它是「全项目日志一个 formatter」的试金石：
+    只要它漏了 `extra=`，采集侧就只能靠正则从正文里抠 `threshold_ms`，改一个字就崩。
+    """
+    import logging
+
+    from backend import observability
+    from backend.logging_setup import JsonFormatter
+
+    observability.reset()
+    observability.set_thresholds(default_ms=1, log_seconds=0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="finance-api.slow"):
+            observability.record_request("/api/v1/unit-slow", 200, 12.5)
+        record = next(row for row in caplog.records if "慢接口告警" in row.getMessage())
+        payload = json.loads(JsonFormatter().format(record))
+
+        assert payload["level"] == "WARNING"
+        assert payload["logger"] == "finance-api.slow"
+        assert payload["path"] == "/api/v1/unit-slow"
+        assert payload["duration_ms"] == 12.5
+        assert payload["threshold_ms"] == 1
+        assert payload["exceeded"] == 1
+        assert payload["suppressed"] == 0
+    finally:
+        observability.reset()
+
+
+def test_configure_logging_keeps_foreign_handlers():
+    """只认自己装的 handler：pytest 的 `caplog` 与 uvicorn 都挂在根日志器上，摘掉它们会让日志断言静默失效。"""
+    import logging
+
+    from backend import logging_setup
+
+    root = logging.getLogger()
+    level_before = root.level
+    foreign = logging.NullHandler()
+    root.addHandler(foreign)
+    try:
+        assert logging_setup.normalise_format("STRUCTURED") == "json"
+        assert logging_setup.normalise_format("weird") == "text"
+        assert logging_setup.resolve_level("nonsense") == logging.INFO
+        assert logging_setup.configure_logging(
+            SimpleNamespace(log_format="json", log_level="DEBUG")) == "json"
+        assert foreign in root.handlers
+        ours = [h for h in root.handlers if getattr(h, logging_setup._HANDLER_MARKER, False)]
+        assert len(ours) == 1  # 反复调用是幂等的，不会越挂越多
+
+        assert logging_setup.configure_logging(
+            SimpleNamespace(log_format="text", log_level="INFO")) == "text"
+        assert len([h for h in root.handlers
+                    if getattr(h, logging_setup._HANDLER_MARKER, False)]) == 1
+    finally:
+        root.removeHandler(foreign)
+        root.setLevel(level_before)
+
+
 

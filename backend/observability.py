@@ -129,10 +129,19 @@ def record_request(path: str, status_code: int, duration_ms: float) -> None:
                 entry["suppressed"] += 1
 
     if alert is not None:
+        # 结构化日志（`LOG_FORMAT=json`）要的是**字段**，不只是拼进正文的数字：这些名字
+        # 都在 `backend/logging_setup.py` 的白名单里，正文一个字没改，文本格式的日志不受影响。
         logger.warning(
             "慢接口告警 path=%s duration_ms=%s threshold_ms=%s 累计超阈值=%s 次%s",
             alert[0], alert[1], alert[2], alert[3],
             f"（期间另有 {alert[4]} 次被限流未逐条上报）" if alert[4] else "",
+            extra={
+                "path": alert[0],
+                "duration_ms": alert[1],
+                "threshold_ms": alert[2],
+                "exceeded": alert[3],
+                "suppressed": alert[4],
+            },
         )
 
 
