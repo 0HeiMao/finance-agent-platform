@@ -2323,5 +2323,66 @@ def test_usage_stats_window_is_business_days(db_session):
     assert sum(item["answers"] for item in series) == 1        # 刚写下的这条落在业务「今天」
 
 
+# ---------------------------------------------------------------- 导出标记与粒度（⑲）
+
+def test_export_grain_and_period_helpers_refuse_mismatched_arguments():
+    """导出的参数校验与冲销三态都写在纯函数里，不用起 HTTP 就能盯住。"""
+    from fastapi import HTTPException
+
+    from backend import api_export, periods
+
+    assert api_export._grain(None) == periods.MONTH             # 省略 = 月口径（与页面默认一致）
+    assert api_export._grain("") == periods.MONTH               # `?grain=` 空串与省略等价
+    assert api_export._grain(" QUARTER ") == periods.QUARTER    # 大小写与空白不该让用户看到 422
+    for bad in ("week", "months", " ", "日"):
+        with pytest.raises(HTTPException) as excinfo:
+            api_export._grain(bad)
+        assert excinfo.value.status_code == 422
+        assert "month、quarter 或 year" in excinfo.value.detail
+
+    assert api_export._grain_period(None, periods.MONTH, "period_from") is None
+    assert api_export._grain_period("2098-04", periods.MONTH, "period_from") == "2098-04"
+    assert api_export._grain_period("2098-Q2", periods.QUARTER, "period_to") == "2098-Q2"
+    # 月串配 grain=quarter 必须当场报错：放过去只会拿 "2098-04" 去比 "2098-Q2"（字符串比较一行都匹配不上），
+    # 用户看到的是「导出是空的」而不是「参数写错了」，报错文案里要带该粒度的样例。
+    with pytest.raises(HTTPException) as excinfo:
+        api_export._grain_period("2098-04", periods.QUARTER, "period_from")
+    assert excinfo.value.status_code == 422
+    assert "period_from 要和 grain=quarter 同粒度" in excinfo.value.detail
+    assert "2026-Q3" in excinfo.value.detail
+    assert api_export._grain_period("2098", periods.YEAR, "period_to") == "2098"
+    with pytest.raises(HTTPException):                    # 季度串配年口径同样要挡，不能当成年份前缀
+        api_export._grain_period("2098-Q2", periods.YEAR, "period_to")
+
+    def row(**values):
+        values.setdefault("reversal_of_id", None)
+        values.setdefault("reversed_at", None)
+        return SimpleNamespace(**values)
+
+    reversed_at = datetime(2026, 10, 9, 3, 0)
+    assert api_export._reversal_state(row()) == ""
+    assert api_export._reversal_state(row(reversed_at=reversed_at)) == "已冲销"
+    assert api_export._reversal_state(row(reversal_of_id=12)) == "冲销行"
+    # 冲销行不可能同时是「已冲销」（`transactions.reverse` 不允许冲销一条冲销行）；真出现时以「冲销行」为准
+    assert api_export._reversal_state(row(reversal_of_id=12, reversed_at=reversed_at)) == "冲销行"
+
+
+def test_export_period_patterns_accept_month_quarter_year_but_not_half_written():
+    """明细导出认月/季/年（与 `GET /financial/transactions` 同语义），预警导出仍只认月。"""
+    import re
+
+    from backend import api_export
+
+    detail = re.compile(api_export.PERIOD_RANGE_PATTERN)
+    for good in ("2097-01", "2097-12", "2097-Q1", "2097-Q4", "2097"):
+        assert detail.match(good), good
+    for bad in ("2097-13", "2097-Q5", "2097-Q0", "2097-1", "2097-Q", "2097-", "97-01", "全部期间"):
+        assert not detail.match(bad), bad
+
+    alert = re.compile(api_export.PERIOD_PATTERN)
+    assert alert.match("2097-12")
+    assert not alert.match("2097-Q4") and not alert.match("2097")
+
+
 
 

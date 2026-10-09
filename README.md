@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下二十一个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第二十二个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下二十二个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第二十三个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -108,6 +108,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_session_revocation.py` | 会话版本号与强制下线 22 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、部门受限账号 403、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
 | `verify_job_retry.py` | 后台任务幂等与重试 31 项，**分两阶段跑**（「重启之后会怎样」没法在一个进程里验，所以第一阶段埋现场后要重启后端，再跑 `--phase 2`）：无键去重复用队列里那条且 `payload.ip` 不参与指纹、`Idempotency-Key` 提交/同键重放拿回同一条（**成功过的任务重放仍回那条**，批次已被删也不是 404）、换个键拿 404、201 字符的键 422、真库部分唯一索引的 `indexdef` 与「直接插第二条同键」抛 `UniqueViolation`、失败任务第 4 次尝试要等 16 秒退避才回队列且 `next_attempt_at` 真在将来、`job.retry` 审计带 `previous_error`、重试未知任务 404 / 重试非失败状态 409、重启日志里的「启动接续」与埋下的 `running` 残骸被接续跑完（`attempts` 1→2、批次那 3 行真被删），跑完清掉探针批次与验证产生的任务行 |
 | `verify_job_claim.py` | 后台任务跨进程执行权 23 项（⑱）：任务锁 key 稳定/不撞号/在 bigint 内且与接续锁、期间锁三族互不撞、起始干净（`worker_id` 列已建好、0 条残留 advisory 锁）、**两个真 Python 子进程（`--worker` 自调用，都走生产路径 `run_job(job_id)`）同时抢同一条 `queued` 任务 → 处理函数只跑了 1 遍**（计数文件 1 行，一个 `ran` 一个 `skipped`）、任务收在 `succeeded` 且 `attempts` 只加了 1、`worker_id` 又清空、`result.ran_by` 就是赢的那个进程、running 的任务 `claim` 返回 `None` 且 `attempts` 不变（`run_job(db=…)` 再走一遍也不重复执行）、`claim(不存在的 id)` 返回 `None`、**真有人持执行权锁的那条进 `still_running` 原样不动，只有锁是空的（进程已死）才被重排并清空 `worker_id`/`started_at`**、锁的连接一关（进程真的没了）那条才被重排、**池化连接 `close()` 之后锁还在**（所以执行权只能显式解锁，不能靠关连接——本脚本首跑就是栽在这个池子假象上，4 个 FAIL 全是它）、别人正在接续时本进程 `skipped=True` 一个字都不改、接续锁释放后同一个函数立刻能干活（不是被永久锁死）、真机 HTTP：`GET /admin/jobs` 每行都带 `worker_id`、导入 2097 小批次 → `POST /admin/jobs/batch-revert` 202 → 轮询看到 `running` 那一刻写着执行它的进程、最终 `succeeded` 且 `worker_id` 清空，跑完 0 条残留 advisory 锁且演示明细 8909 行一行没动 |
+| `verify_exports.py` | 导出契约 36 项（⑲）：起始基线干净 → 导入 2097 探针批次 → 更正一行（`corrections=1`）与冲销一行（负数行 + `reversal_of_id`，重复冲销 409）→ 明细 CSV **17 列表头** / 5 行 / BOM / `X-Export-Rows=5`，三列标记（`冲销状态` 空/`已冲销`/`冲销行`、`冲销时间` 与 `冲销操作人` 只写在被冲销的原行上、`更正次数`）逐格核对 → 期间 `2097`（年）/`2097-Q4`（季）/`2097-12`（月）都收到 5 行而 `2097-11` 收到 0 行、坏期间 `2097-13`/`2097-Q5`/`2097-4`/`全部期间` 全 422 → `?batch=`/`?query=` 与页面**同源**且多条件是「且」→ XLSX 同表头同行数 + 文件名 → 指标月口径（097 收入 650.00 = 150+300-300+500）、季/年口径读 `financial_rollups`（2097-Q4 全公司 1350.00、`包含月份=2097-12`、`是否完整=否`、文件名 `metrics-quarter-…`）并与 `GET /admin/rollups` 逐值一致 → 演示数据 2026-Q2~Q4 只有 3 行全公司行、2026-Q3 全公司 12191391796.83、年度 2026 一行且「否」+ 7 个月 → 四种粒度/区间错误全 422（粒度不匹配的提示里带 `2026-Q3`）→ 临时账号绑 097 后受限明细只 4 行（无别的部门）、季导出只有「部门 097」、`?department=018` 403 → 预警仍按月（季度 422）、月度 10 列表头 → `/export/scope` 上限 20000 → 审计 `data.export` 逐条字段齐且 `truncated` 全 False → **导出配额 429 真发生**（打满 `Retry-After` 是 1..60 的数字、等过窗口同一个请求又 200，即「拦得住脚本也放得出来」；本脚本自己靠 `Retry-After` 排队重试，`QUOTA_HITS` 记下每次拦截）→ `POST /admin/jobs/batch-revert` 收尾（202 → `succeeded`、`deleted_rows=5`），跑完残留全 0 且五项基线行数与起始完全一致 |
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
 | `verify_backup_restore.py` | 备份与恢复 29 项：真库打一份归档（9 张表 9928 行 + 上传件）→ `verify` 只对着归档自检（每张表一个 `COPY` 成员、sha256 一个个重算、`.env`/`data/models`/`data/index` 都不在里面且排除理由写在 manifest 里）→ **恢复进临时库 `finance_restore_check`**（先用不带 `--yes` 的一次预演确认「预演之后临时库仍然不存在」，再真恢复）→ 逐表 `count(*)` 与活库对平、`vector` 列 5 行全非空且维度 384、序列已推到 `max(id)` 之后、恢复出的表能真查 → 上传件往返（写探针 → 备份 → 删 → 恢复到 `output/_restore_uploads` → 字节级一致，且**没有**写回真实 `data/uploads`）→ 三个负例该红的都红（改一个数据字节 → `verify` 点名 sha256；清单里多一列 → 恢复拒绝并点名这一列；清单 sha256 改坏 → 恢复拒绝）→ 同一个归档可反复恢复 → 跑完删临时库、探针文件与探针归档，**全程不动演示库 `finance`** |
 | `verify_security_headers.py` | 安全响应头 + GZip + 请求 id 29 项：正常响应与 404 都带四个静态头与严格 CSP、请求 id 合规则原样回传（128 位边界）而超长/带空格/带分号一律换成 32 位、**响应里那个 id 能在后端日志里 grep 到**（每次跑换新 id，否则上一轮那条会让这项假绿）、`/docs`/`/redoc`/`/openapi.json` 换成文档 CSP、HSTS 只在 `X-Forwarded-Proto: https`（或 `https, http`）时出现、`/openapi.json` 与 CSV 导出**真被压**且解压后与 `Accept-Encoding: identity` 那份 JSON 相等（用 `iter_raw()` 数网线上真实字节，`content` 是解压后的）、同样 8909 行的 xlsx 导出**不压**、SSE 没被压且仍按 chunked 传（带不带 gzip 收到的字节一致）、500 也带请求 id 与安全头（它绕过所有中间件，是处理器自己补的）。静态头期望值**写死在脚本里**、不从 `backend.http_headers` import —— 否则常量被改错时脚本跟着一起错。跑一次消耗 3 次导出配额 |
@@ -176,7 +177,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 284 项、前端 51 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 291 项、前端 53 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -360,7 +361,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **284** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+`tests/` 下三个文件共 **291** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
 **多轮上下文（⑰）**：`history_for` 只收写完的成对问答（`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问整对丢掉）、超预算从最老的一整对开始丢（宁可少一轮不给半轮）、任一预算为 0 即关掉多轮、`truncated` 只表示「有更早的没带上」；`_messages` 的顺序是 system → 历史 → 本轮，历史里混进的 `system`/非法 role/空正文被丢掉且本轮的证据紧挨本轮提问；`stream` 透传 history 而位置参数不变（旧调用照旧）**、`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**、**`AGENT_HISTORY_MAX_TURNS` 默认 6、`AGENT_HISTORY_MAX_TOKENS` 默认 1500、两项为 0 是合法配置（= 关掉多轮）、负数进 `config_problems`**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -405,6 +406,13 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 （`cleared`）、冲销不删原行而是新增一条金额取负的冲销行（两行合计为 0、`import_batch` 沿用原批次，
 否则撤销批次只收得回一半）、重复冲销/冲销冲销行/更正已冲销行都是 409、非法金额与带时区的日期 422、
 未知字段被 `extra="forbid"` 在业务代码之前拦下、改完留 `transaction.update`/`transaction.reverse` 审计）→
+**导出契约（⑲）**：`_grain` 把省略与空串都当 `month`、非法粒度 422 且提示里给三种粒度的样例；
+`_grain_period` 要求区间端点与 `grain` 同粒度（`grain=quarter&period_from=2026-04` 422 且点名 `2026-Q3`）；
+明细期间的形状收月/季/年而拒半成品（`2097-13`/`2097-Q5`/`2097-1`/`97-01`/全部期间）；冲销三态由
+`_reversal_state` 判定且「冲销行压过已冲销」；**截断不再恒为 false**——把 `EXPORT_LIMIT` 压到 1 时真出现
+`X-Export-Truncated: true` 且 `/export/scope` 跟着报同一个上限，调回 100 就没有这个头；
+**导出与页面共用筛选**：`?batch=` 只出该批次、`?query=` 只出命中的行、两个叠起来是「且」（导出的行数必须
+等于页面列表的 `total`，这条是防「导出比页面多几行少几行」的）→
 **并发重算互斥（期间锁）**：`/analysis/calculate` 先锁「月 + 季 + 年」再删旧指标（抓真发出的 SQL 断言顺序）、
 更正会在**改行之前**同时锁新旧期间、导入在插行之前一次性锁全部月份（多出来的 advisory key 正好是那把
 文件哈希去重锁）、`/admin/rollups/rebuild` 锁它要重写的季）→
@@ -449,7 +457,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
-51 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
+53 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
@@ -460,7 +468,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
-- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（23 项）：
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（25 项）：
   `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
   `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
   `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
@@ -482,7 +490,10 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
   运行中的后台任务要写出「运行进程：…」而队列中的不许写（⑱）、
   预警外发页点「测试」打的是 `POST /admin/alert-channels/{id}/test` 并把失败原因写回「最近结果」、
   「补发通知」用 `{"period": ""}` 触发台账重读、台账筛选带 `status=` 且行内「重发」打到
-  `POST /admin/alert-deliveries/{id}/retry`。
+  `POST /admin/alert-deliveries/{id}/retry`、
+  **导出按钮组（⑲）**：指标导出的季度/年度两个按钮靠标签前缀区分、点击后请求里真的带上 `grain=quarter|year`，
+  以及**页面自带口径时不再叠加全局口径**（`department=` 在查询串里只出现一次且是页面上那个值，
+  全局那个 018 一个字都不出现，`period`/`batch`/`query` 跟着页面上的筛选一起走）。
   这套测试当场抓到一个真 bug：`AgentChat.vue` 的「重试」按钮读的是发送后已被清空的输入框，
   等于点了没点——修法是记住 `lastQuestion`。
 
@@ -598,8 +609,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 284 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 51 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 291 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 53 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -907,12 +918,12 @@ Prometheus 的基数撑爆，而被撑死的是监控不是接口。真机验证
 | `/analysis/alerts` | 预警监控（期间/状态筛选、各状态计数、确认/误报/已处理/备注、服务端分页） | `GET /analysis/alerts/all`、`GET /analysis/alerts/stats`、`PATCH /analysis/alerts/{id}` |
 | `/alerts/:id` | 预警明细（最多 200 行） | `GET /analysis/alerts/{id}/transactions` |
 | `/financial/import` | 数据导入（两步：预览校验 → 确认导入） | 财务导入接口 |
-| `/financial/transactions` | 明细更正（按期间/部门口径/关键字/批次筛选、翻页、行内更正、两步冲销） | `GET /financial/transactions`、`PATCH /financial/transactions/{id}`、`POST /financial/transactions/{id}/reverse` |
+| `/financial/transactions` | 明细更正（按期间/部门口径/关键字/批次筛选、翻页、行内更正、两步冲销、**导出明细**——带上页面上这套筛选） | `GET /financial/transactions`、`PATCH /financial/transactions/{id}`、`POST /financial/transactions/{id}/reverse`、`GET /export/transactions` |
 | `/reports` | 报告导出（Word `.docx` + Markdown 月报，可复制 / 打印导出 PDF / 下载 `.md`） | `GET /reports/docx`、`GET /reports/monthly?period=YYYY-MM` |
 | `/reports/pptx` | PPT 报告（先看逐页大纲，再下载 `.pptx`） | `GET /reports/pptx/outline`、`GET /reports/pptx` |
 | `/settings` | System 设置（我的部门 + 运行态与配置体检） | `GET /system/status`、`PATCH /auth/me` |
 | `/agent` | 财务分析 Agent 工作台（示例问题 + 流式问答 + 依据） | `POST /ai/agent/chat/stream`（SSE） |
-| `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild` |
+| `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、季/年**导出**、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild`、`GET /export/metrics?grain=` |
 | `/admin/users` | 用户管理（按用户名/部门/是否受限筛选、分页、改部门、删除） | `GET/PATCH/DELETE /admin/users[/{id}]` |
 | `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务：第几次尝试、**谁在跑**（⑱ 运行中显示 `worker_id`）、失败可**重试**） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs`、`POST /admin/jobs/{job_id}/retry` |
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
@@ -1106,6 +1117,23 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   前端不自己数一遍——否则「被上限截断」这件事会被悄悄掩盖。
 - CSV 带 BOM 且**一切皆文本**（避免 Excel 把 `2026-10` 认成日期、把部门号 `097` 变成 `97`）；
   XLSX 里数字列是真数字，能直接求和。
+- **指标导出可以按粒度导（⑲）**：`grain=month|quarter|year`。季/年**不重算，直接读 `financial_rollups`**
+  （⑧ 的落库表，与 `/admin/rollups` 同一份数据），并多出「包含月份」与「是否完整」两列：
+  `complete=False` 的期间写「否」，年度合计不假装是全年。粒度与区间端点不一致（`grain=quarter&period_from=2026-04`）
+  是 **422 并给出样例**，而不是安静地返回空表。
+- **明细导出的期间不再被当月份字符串（⑲）**：`?period=2026-Q3` 与 `?period=2026` 都认（区间比较），
+  另加 `?batch=`（导入批次精确）与 `?query=`（科目编码/名称/摘要模糊）。这三个条件与
+  `/financial/transactions` 列表**共用 `backend/transactions.py::apply_filters`** —— 页面筛出几行，导出就是几行，
+  多条件是「且」。以前两边各写一套，迟早会出现「页面 12 行、导出 15 行」这种没人能解释的差。
+- **明细表尾三列解释 ⑨ 的更正与冲销**：`冲销状态`（空 / `已冲销` / `冲销行`）、
+  `原始行 id` + `冲销时间` + `冲销操作人`（后两列只写在被冲销的原行上，记的是**冲销那一刻**）、`更正次数`。
+  导出的合计与页面看到的净额一致（冲销行是负数行，原行保留）。
+- `X-Export-Truncated` 由「实际行数 > 上限」判定（三个端点统一），**没截断时这个头不出现**，
+  前端据此区分「导全了」与「被切了一刀」。
+- 界面上三个入口各管一段：`/financial/transactions` 的「导出明细」带上页面上看得见的期间/部门/批次/关键字
+  （页面自带口径时**不再叠加**全局口径，否则同名的 `department` 会出现两次、谁生效看解析顺序）；
+  `/admin` 概览落库卡上的「导出季度」/「导出年度」；`/analysis/revenue` 的导出改成本页指标
+  （以前是明细，和屏幕上那些指标卡不是一回事）。
 
 ### 预警处理闭环
 
@@ -1617,7 +1645,7 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 
 季/年合计不现算，而是落进独立表 `financial_rollups`（`backend/rollups.py`）。为什么不给
 `financial_metrics` 加一列「粒度」：那张表被十几个读点按「一行 = 一个月」使用（预测趋势线按
-`period` 排序读全部行、导出把 `period` 当月份、期间下拉来自 `distinct(period)`），混入季/年行以后
+`period` 排序读全部行、导出按 `grain` 换表、期间下拉来自 `distinct(period)`），混入季/年行以后
 「这一行是不是月行」就成了每个读点都要记得判断的隐式约定，漏一处就出假数（把 `2026` 当成第 13 个月
 画进趋势线）。单独一张表把语义固定下来，读的人不需要猜。
 
@@ -1644,14 +1672,20 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 - **管理端**：`GET /admin/rollups?grain=quarter|year` 列出落库行 + 覆盖清单；`POST /admin/rollups/rebuild`
   （body `{"grains": [...], "periods": [...]}`）用于老库回填与修数，写审计 `rollups.rebuild`。
   `grains` 只能是 `quarter`/`year`，把月口径塞进 `periods` 会 **422** 而不是静默什么都不算。
-  `/admin/overview` 返回 `rollups` 覆盖块，「季度/年度落库」卡片把它渲染成计数 + 缺月清单 + 重算按钮。
+  `/admin/overview` 返回 `rollups` 覆盖块，「季度/年度落库」卡片把它渲染成计数 + 缺月清单 + 重算按钮，
+  外加「导出季度」/「导出年度」两个按钮（⑲，屏幕上就是季/年合计，导出也必须能按季/年导，
+  「是否完整」列会把 `complete=False` 标出来）。
 - **缺月清单必须说清是哪一行缺月**：同一个季度里全公司行齐全、某个部门只落了其中一个月是常事。
   清单项带 `department` / `department_label`，全公司行排在同期的部门行前面，页面上显示
   「2026 年度」或「2026 年度 · 部门 097」。这是真机冒烟抓到的：早先只按 `(粒度, 期间)` 去重，
   页面上出现过「2026 年度缺 11 个月」，而全公司那一行其实只缺 5 个月。
+- **导出也读这张表（⑲）**：`/export/metrics?grain=quarter|year` 直接取落库行（与 `/admin/rollups` 同一份），
+  不再拿月行现算，并把「包含月份」与「是否完整」两列一起交给下游——导出表里出现 `2026` 年度合计时，
+  旁边就写着它只含 7 个月。
 - 真机验证 `scripts/verify_rollups.py`（24 项）：重算后季度 `source=stored` 且金额等于三个月的月指标
   之和、比率按合计重算、年度 `complete=false` 且点名 5 个月、受限账号只读到本部门落库行、读管理端 403、
   三个 422、重算某个月后季度数字幂等不变、没落库的期间现算兜底且读路径不写库、审计留痕。
+  导出侧另有 `scripts/verify_exports.py`（36 项，⑲）断言同一期间从两个入口读到的金额逐值相等。
 
 ## 明细更正与冲销
 
@@ -1677,8 +1711,13 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
   自己部门（`scope_transactions`），拿别人的行 id 去改是 **403**（`该明细不在当前账号的数据范围内`）。
   `GET /financial/transactions?department=X` 里的 `department` 是**口径切换**，越界同样 403。
 - **这一页不做删除**：要整批收回请到「导入批次」撤销批次（它会连指标、预警、季年落库一起重算）。
+- **导出要带着解释走（⑲）**：明细导出的最后三列就是上面这套语义——`冲销状态`（空 / `已冲销` / `冲销行`）、
+  `原始行 id` + `冲销时间` + `冲销操作人`、`更正次数`。`冲销时间`/`冲销操作人` 只写在**被冲销的原行**上
+  （记的是冲销那一刻，不是这行的交易日期），冲销行靠 `原始行 id` 指回原行。导出的负数行与页面上的
+  净额一致，收下 CSV 的人不需要再去问「这 -300 是什么」。
 - 真机验证 `scripts/verify_transactions.py`（45 项）与界面冒烟 `scripts/ui_transactions_smoke.py`（20 项，
-  在真浏览器里点「筛选 → 更正 → 冲销」并核对表格变化）。
+  在真浏览器里点「筛选 → 更正 → 冲销」并核对表格变化）；导出的三列标记由 `scripts/verify_exports.py`（36 项）
+  逐格核对。
 
 ## 并发重算互斥（期间锁）
 

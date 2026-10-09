@@ -175,6 +175,47 @@ test('导出按钮组：没有 X-Export-Rows 时不编造行数；失败时给�
   assert.match(String(message.props.class), /bad/) // 失败要变红，不是成功那行的绿色
 })
 
+test('导出按钮组（⑲）：指标导出带上粒度，季度/年度两个按钮靠前缀区分', async () => {
+  setActiveScope('')
+  useRoutes([{ path: '/api/v1/export/metrics', response: () => blobResponse('期间,粒度\n2026-Q3,季\n') }])
+  const view = mount(ExportMenu, {
+    props: { kind: 'metrics', grain: 'quarter', label: '导出季度' }
+  })
+  assert.match(view.text(), /导出季度 CSV/)
+  assert.match(view.text(), /导出季度 Excel/)
+  await view.click('导出季度 CSV')
+  await waitFor(() => view.text().includes('已保存'))
+  const request = fetchImpl.calls.at(-1)
+  assert.match(request.path, /^\/api\/v1\/export\/metrics\?format=csv&grain=quarter$/)
+  assert.doesNotMatch(request.path, /department=/) // 没选口径就不该凭空带一个
+})
+
+test('导出按钮组（⑲）：页面自带口径时不叠加全局口径，关键字与批次跟着带上', async () => {
+  setActiveScope('018') // 全局口径是销售部，但明细页的口径下拉选了研发部
+  useRoutes([{ path: '/api/v1/export/transactions', response: () => blobResponse('a\n1\n') }])
+  const view = mount(ExportMenu, {
+    props: {
+      kind: 'transactions',
+      label: '导出明细',
+      period: '2026-Q4',
+      department: '097',
+      batch: 'abc123',
+      keyword: '科目甲'
+    }
+  })
+  await view.click('导出明细 CSV')
+  await waitFor(() => view.text().includes('已保存'))
+  const request = fetchImpl.calls.at(-1)
+  // 两个 department 同名参数谁生效取决于解析顺序——页面上看得见的那个说了算，所以只能有一个
+  assert.equal(request.path.split('department=').length - 1, 1)
+  assert.match(request.path, /department=097/)
+  assert.match(request.path, /period=2026-Q4/)
+  assert.match(request.path, /batch=abc123/)
+  assert.match(request.path, /query=/)
+  assert.doesNotMatch(request.path, /department=018/)
+  setActiveScope('')
+})
+
 // ------------------------------------------------------------------ 侧边栏
 
 function makeRouter() {

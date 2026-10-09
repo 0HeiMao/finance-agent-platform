@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
+import ExportMenu from '../components/ExportMenu.vue'
 
 const sidebarOpen = ref(false)
 const data = ref(null)
@@ -220,6 +221,10 @@ onMounted(reload)
             <button class="btn" :disabled="rebuilding" @click="rebuildRollups">
               {{ rebuilding ? '重算中…' : '重算季/年落库' }}
             </button>
+            <!-- 屏幕上就是季/年合计，导出也必须能按季/年导（原来只导得出月行）；「是否完整」那一列
+                 会把 `complete=False` 的期间标出来，「年度合计看起来像全年」就不会骗到人（⑲） -->
+            <ExportMenu kind="metrics" grain="quarter" label="导出季度" />
+            <ExportMenu kind="metrics" grain="year" label="导出年度" />
             <small v-if="rebuildNotice" class="quality-hint">{{ rebuildNotice }}</small>
             <small v-else class="quality-hint"
               >重算指标、导入、撤销批次都会自动刷新对应的季与年；这里用于老库回填。</small

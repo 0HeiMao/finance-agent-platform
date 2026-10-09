@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
+import re
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -1334,6 +1336,29 @@ async def test_multi_department_account_can_narrow_its_own_scope(anon_client, ap
 
 # ---------------------------------------------------------------- 数据导出
 
+# 明细导出表头（⑲）：新增「明细 id」与冲销/更正标记四列——界面上看得到的状态，导出必须看得到。
+EXPORT_TX_HEADER = ["明细 id", "交易日期", "科目编码", "科目名称", "部门", "摘要", "收入金额", "成本金额",
+                    "费用金额", "现金流入", "现金流出", "导入批次", "冲销状态", "原始行 id", "冲销时间",
+                    "冲销操作人", "更正次数"]
+# 指标导出表头（⑲）：加「粒度 / 包含月份 / 是否完整」，月行与季/年行共用一套列。
+EXPORT_METRIC_HEADER = ["期间", "粒度", "口径", "包含月份", "是否完整", "收入金额", "成本金额", "费用金额",
+                        "毛利金额", "净利润", "毛利率", "净利率"]
+# 导出用例自己的期间（2097 年不属于演示数据的 2026，与其他用例互不打扰）。
+EXPORT_TX_PERIOD = "2097-11"
+
+
+def _csv_rows(content: bytes) -> tuple[list[str], list[dict]]:
+    """把导出内容读成「表头 + 按列名取值的行」，断言时不用数第几列。"""
+    reader = csv.reader(io.StringIO(content.decode("utf-8-sig")))
+    header = next(reader)
+    return header, [dict(zip(header, row, strict=True)) for row in reader]
+
+
+def _amounts(row: dict, *names: str) -> dict:
+    """金额列按 Decimal 比：导出写的是原样的 `str(x.amount)`，`0` 与 `0.00` 是同一个数。"""
+    return {name: Decimal(row[name]) for name in names}
+
+
 async def test_export_transactions_csv_and_xlsx(anon_client, auth_headers, db_session):
     """CSV 带 BOM 且列名固定；XLSX 是真表格、数字列写成数字、部门号保持文本。"""
     _seed_scoped_period(db_session, SCOPE_PERIOD)
@@ -1345,7 +1370,7 @@ async def test_export_transactions_csv_and_xlsx(anon_client, auth_headers, db_se
     assert int(csv_response.headers["X-Export-Rows"]) == 2
     text = csv_response.content.decode("utf-8-sig")
     lines = [line for line in text.strip().splitlines() if line]
-    assert lines[0].startswith("交易日期,科目编码,科目名称,部门,摘要")
+    assert lines[0].split(",") == EXPORT_TX_HEADER
     assert len(lines) == 3
     assert csv_response.content.startswith(b"\xef\xbb\xbf")
 
@@ -1357,7 +1382,7 @@ async def test_export_transactions_csv_and_xlsx(anon_client, auth_headers, db_se
     openpyxl = pytest.importorskip("openpyxl")
     sheet = openpyxl.load_workbook(io.BytesIO(xlsx_response.content)).active
     header = [cell.value for cell in sheet[1]]
-    assert header[0] == "交易日期" and "导入批次" in header
+    assert header == EXPORT_TX_HEADER
     assert sheet.max_row == 3
     revenue_column = header.index("收入金额") + 1
     revenues = [sheet.cell(row=row, column=revenue_column).value for row in range(2, sheet.max_row + 1)]
@@ -1366,11 +1391,123 @@ async def test_export_transactions_csv_and_xlsx(anon_client, auth_headers, db_se
     department_column = header.index("部门") + 1
     departments = {sheet.cell(row=row, column=department_column).value for row in range(2, sheet.max_row + 1)}
     assert departments == {"部门A", "部门B"}
+    # 明细 id 与更正次数是数字列（Excel 里能直接筛/排），冲销状态是文本
+    detail_id_column = header.index("明细 id") + 1
+    assert all(isinstance(sheet.cell(row=row, column=detail_id_column).value, (int, float))
+               for row in range(2, sheet.max_row + 1))
+    assert all(sheet.cell(row=row, column=header.index("冲销状态") + 1).value in (None, "")
+               for row in range(2, sheet.max_row + 1)), "没冲销过的行不该有状态"
+
+
+async def test_export_transactions_marks_reversal_and_correction(anon_client, auth_headers, db_session):
+    """冲销行在导出里必须看得出来：一条 -300 的负数行没有解释就是脏数据。
+
+    界面上「已冲销 / 冲销行 / 更正 N 次」是三态（`transactions.reverse()` 不许冲销一条冲销行），
+    导出后这几列是线下复核唯一的线索；`明细 id` 也在同一批新增列里，用来对「原始行 id」。
+    """
+    corrected = _seed_row(db_session, period=EXPORT_TX_PERIOD, day=6, department="部门-097",
+                          revenue="100.00", expense="20.00", account_name="导出更正科目")
+    reversed_row = _seed_row(db_session, period=EXPORT_TX_PERIOD, day=7, department="部门-097",
+                             revenue="300.00", expense="30.00", account_name="导出冲销科目")
+
+    fixed = await anon_client.patch(f"/api/v1/financial/transactions/{corrected.id}", headers=auth_headers,
+                                    json={"revenue_amount": "150.00"})
+    assert fixed.status_code == 200, fixed.text
+    reversal = await anon_client.post(f"/api/v1/financial/transactions/{reversed_row.id}/reverse",
+                                      headers=auth_headers, json={"reason": "凭证重复"})
+    assert reversal.status_code == 200, reversal.text
+    reversal_row = reversal.json()["reversal"]
+    actor = (await anon_client.get("/api/v1/auth/me", headers=auth_headers)).json()["username"]
+
+    response = await anon_client.get(f"/api/v1/export/transactions?period={EXPORT_TX_PERIOD}&format=csv",
+                                     headers=auth_headers)
+    assert response.status_code == 200, response.text
+    header, rows = _csv_rows(response.content)
+    assert header == EXPORT_TX_HEADER
+    by_id = {int(row["明细 id"]): row for row in rows}
+    assert set(by_id) == {corrected.id, reversed_row.id, reversal_row["id"]}
+
+    assert by_id[corrected.id]["冲销状态"] == "" and by_id[corrected.id]["更正次数"] == "1"
+    assert by_id[corrected.id]["收入金额"] == "150.00"  # 导出的是更正之后的值
+
+    original = by_id[reversed_row.id]
+    assert original["冲销状态"] == "已冲销"
+    assert original["冲销操作人"] == actor
+    # 冲销时间是「什么时候冲的」（业务时区的此刻），不是这条明细的期间
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", original["冲销时间"]), original["冲销时间"]
+    assert original["原始行 id"] == "" and original["更正次数"] == "0"
+
+    reversal_out = by_id[reversal_row["id"]]
+    assert reversal_out["冲销状态"] == "冲销行"
+    assert reversal_out["原始行 id"] == str(reversed_row.id)
+    assert reversal_out["收入金额"] == "-300.00" and reversal_out["费用金额"] == "-30.00"
+    assert reversal_out["冲销时间"] == "" and reversal_out["冲销操作人"] == ""
+
+    # 更正与冲销都会重算期间，更正次数不会因为导出而变
+    again = await anon_client.get(f"/api/v1/export/transactions?period={EXPORT_TX_PERIOD}&format=csv",
+                                  headers=auth_headers)
+    assert _csv_rows(again.content)[1] == rows
+
+
+async def test_export_transactions_period_accepts_quarter_and_year(anon_client, auth_headers, db_session):
+    """明细导出的 period 与明细列表同语义：月 / 季 / 年都认，而且都用同一套区间比较。"""
+    _seed_row(db_session, period="2097-10", day=3, department="部门-097", account_name="十月科目")
+    _seed_row(db_session, period="2097-11", day=4, department="部门-097", account_name="十一月科目")
+
+    for period, expected in (("2097-10", {"十月科目"}), ("2097-Q4", {"十月科目", "十一月科目"}),
+                             ("2097", {"十月科目", "十一月科目"})):
+        response = await anon_client.get(f"/api/v1/export/transactions?period={period}&format=csv",
+                                         headers=auth_headers)
+        assert response.status_code == 200, response.text
+        _, rows = _csv_rows(response.content)
+        assert {row["科目名称"] for row in rows} == expected, period
+        assert all(row["交易日期"].startswith("2097-1") for row in rows)
+    # 文件名也要带上用户实际选的期间，否则导出目录里分不出这一份是哪个季度
+    quarter = await anon_client.get("/api/v1/export/transactions?period=2097-Q4&format=csv",
+                                    headers=auth_headers)
+    assert "transactions-2097-Q4-" in quarter.headers["content-disposition"]
+
+    for bad in ("2097-13", "2097-Q5", "2097-4", "2097-Q"):
+        assert (await anon_client.get(f"/api/v1/export/transactions?period={bad}&format=csv",
+                                      headers=auth_headers)).status_code == 422, bad
+
+
+async def test_export_transactions_honours_the_same_filters_as_the_page(anon_client, auth_headers, db_session):
+    """明细页筛了批次/关键字再点导出，导出的必须就是屏幕上那一批。
+
+    列表与导出共用 `transactions.apply_filters`：各写一遍的话，导出「多一行少一行」没人看得出来。
+    """
+    mark = "⑲导出筛选"
+    _seed_row(db_session, period=EXPORT_TX_PERIOD, batch="pytest-batch-a",
+              account_name=f"{mark}甲", description="甲")
+    _seed_row(db_session, period=EXPORT_TX_PERIOD, day=2, batch="pytest-batch-b",
+              account_name=f"{mark}乙", description="乙")
+
+    batch = await anon_client.get(f"/api/v1/export/transactions?period={EXPORT_TX_PERIOD}"
+                                  "&batch=pytest-batch-a&format=csv", headers=auth_headers)
+    assert batch.status_code == 200, batch.text
+    _, rows = _csv_rows(batch.content)
+    assert [row["导入批次"] for row in rows] == ["pytest-batch-a"]
+
+    keyword = await anon_client.get(f"/api/v1/export/transactions?query={mark}乙&format=csv",
+                                    headers=auth_headers)
+    assert keyword.status_code == 200, keyword.text
+    assert [row["科目名称"] for row in _csv_rows(keyword.content)[1]] == [f"{mark}乙"]
+
+    # 两个筛选叠起来是「且」不是「或」：批次 A 里没有「乙」
+    both = await anon_client.get(f"/api/v1/export/transactions?batch=pytest-batch-a&query={mark}乙"
+                                 "&format=csv", headers=auth_headers)
+    assert both.status_code == 200 and int(both.headers["X-Export-Rows"]) == 0
 
 
 async def test_export_only_contains_callers_scope(anon_client, api_app, auth_headers, db_session):
     """导出是最容易漏权限的出口：受限账号导出的明细里不能出现别的部门。"""
     _seed_scoped_period(db_session, SCOPE_PERIOD)
+    # 季/年口径走另一张表（financial_rollups），所以口径守卫要在这张表上单独验一遍：
+    # 落库行不会因为换了张表就自动带上部门过滤。
+    rebuild = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
+                                     json={"periods": ["2097-Q3"]})
+    assert rebuild.status_code == 200, rebuild.text
     headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
     try:
         response = await scoped.get("/api/v1/export/transactions?format=csv", headers=headers)
@@ -1381,6 +1518,14 @@ async def test_export_only_contains_callers_scope(anon_client, api_app, auth_hea
         metric_text = metrics.content.decode("utf-8-sig")
         assert "部门 部门A" in metric_text and "全公司" not in metric_text
         assert "1000.00" not in metric_text  # 全公司口径的收入不能出现在部门导出里
+
+        quarter = await scoped.get("/api/v1/export/metrics?grain=quarter&format=csv", headers=headers)
+        assert quarter.status_code == 200, quarter.text
+        quarter_header, quarter_rows = _csv_rows(quarter.content)
+        assert quarter_header == EXPORT_METRIC_HEADER
+        assert {row["口径"] for row in quarter_rows} == {"部门 部门A"}
+        assert {row["期间"] for row in quarter_rows} == {"2097-Q3"}
+        assert "1000.00" not in quarter.content.decode("utf-8-sig")
     finally:
         await scoped.aclose()
 
@@ -1403,6 +1548,105 @@ async def test_export_metrics_does_not_add_department_rows_together(anon_client,
     assert len(scoped_matching) == 1 and "700.00" in scoped_matching[0]
 
 
+async def test_export_metrics_grain_reads_rollups_and_flags_incomplete_periods(anon_client, auth_headers,
+                                                                              db_session):
+    """季/年指标导出读的是落库表，并且必须如实写出「这个合计只覆盖哪几个月」。
+
+    `financial_rollups.complete=False` 的期间只有部分月落库——年度合计看起来像全年，
+    这是 ⑧ 自己警告过的坑，导出是它最容易骗到人的地方（Excel 里没人会去点开看）。
+    """
+    _drop_rollups(db_session)
+    for month in (*ROLLUP_MONTHS, *INCOMPLETE_MONTHS):
+        _seed_company_rows(db_session, month, [("1000.00", "0.00", "200.00")])
+    for month in (*ROLLUP_MONTHS, *INCOMPLETE_MONTHS):
+        calculated = await anon_client.post(f"/api/v1/analysis/calculate?period={month}", headers=auth_headers)
+        assert calculated.status_code == 200, calculated.text
+
+    # 默认 grain=month 与加 grain 之前完全一样，只是多了粒度/包含月份/是否完整三列
+    months = await anon_client.get(f"/api/v1/export/metrics?period_from={ROLLUP_MONTHS[0]}"
+                                   f"&period_to={ROLLUP_MONTHS[0]}&format=csv", headers=auth_headers)
+    assert months.status_code == 200, months.text
+    header, rows = _csv_rows(months.content)
+    assert header == EXPORT_METRIC_HEADER
+    assert len(rows) == 1
+    assert {key: rows[0][key] for key in ("期间", "粒度", "口径", "包含月份", "是否完整")} == {
+        "期间": ROLLUP_MONTHS[0], "粒度": "月", "口径": "全公司", "包含月份": ROLLUP_MONTHS[0], "是否完整": "是"}
+    assert _amounts(rows[0], "收入金额", "成本金额", "费用金额", "毛利金额", "净利润") == {
+        "收入金额": Decimal("1000.00"), "成本金额": Decimal("0"), "费用金额": Decimal("200.00"),
+        "毛利金额": Decimal("1000.00"), "净利润": Decimal("800.00")}
+
+    quarter = await anon_client.get("/api/v1/export/metrics?grain=quarter&format=csv",
+                                    headers=auth_headers)
+    assert quarter.status_code == 200, quarter.text
+    assert "metrics-quarter-" in quarter.headers["content-disposition"]
+    _, quarter_rows = _csv_rows(quarter.content)
+    complete = next(row for row in quarter_rows if row["期间"] == ROLLUP_QUARTER)
+    assert {key: complete[key] for key in ("粒度", "口径", "包含月份", "是否完整")} == {
+        "粒度": "季", "口径": "全公司", "包含月份": "、".join(ROLLUP_MONTHS), "是否完整": "是"}
+    assert _amounts(complete, "收入金额", "费用金额", "净利润") == {
+        "收入金额": Decimal("3000.00"), "费用金额": Decimal("600.00"), "净利润": Decimal("2400.00")}
+    incomplete = next(row for row in quarter_rows if row["期间"] == INCOMPLETE_QUARTER)
+    assert incomplete["是否完整"] == "否"
+    assert incomplete["包含月份"] == "、".join(INCOMPLETE_MONTHS)
+    assert _amounts(incomplete, "收入金额")["收入金额"] == Decimal("2000.00")
+
+    year = await anon_client.get(f"/api/v1/export/metrics?grain=year&period_from={ROLLUP_TEST_YEAR}"
+                                 f"&period_to={ROLLUP_TEST_YEAR}&format=xlsx", headers=auth_headers)
+    assert year.status_code == 200, year.text
+    openpyxl = pytest.importorskip("openpyxl")
+    sheet = openpyxl.load_workbook(io.BytesIO(year.content)).active
+    assert [cell.value for cell in sheet[1]] == EXPORT_METRIC_HEADER
+    year_row = {name: sheet.cell(row=2, column=index).value
+                for index, name in enumerate(EXPORT_METRIC_HEADER, start=1)}
+    # 年度期间串是纯数字（"2098"），按 `_cell` 的既有规则在 XLSX 里写成数字而不是文本
+    assert int(year_row["期间"]) == int(ROLLUP_TEST_YEAR) and year_row["粒度"] == "年"
+    assert year_row["包含月份"] == "、".join((*ROLLUP_MONTHS, *INCOMPLETE_MONTHS))
+    assert year_row["是否完整"] == "否" and year_row["收入金额"] == 5000
+    assert sheet.max_row == 2, "只导这一年，不该把别的期间的落库行带上"
+
+    # grain 与区间端点必须同粒度，且端点顺序要挡：把 "2026-07" 拿去比落库表只会一行都匹配不上
+    assert (await anon_client.get("/api/v1/export/metrics?grain=week", headers=auth_headers)).status_code == 422
+    bad_grain = await anon_client.get("/api/v1/export/metrics?grain=week", headers=auth_headers)
+    assert "grain 只支持" in bad_grain.json()["detail"]
+    mixed = await anon_client.get(f"/api/v1/export/metrics?grain=quarter&period_from={ROLLUP_MONTHS[0]}",
+                                  headers=auth_headers)
+    assert mixed.status_code == 422 and "同粒度" in mixed.json()["detail"]
+    assert "2026-Q3" in mixed.json()["detail"]
+    backwards = await anon_client.get("/api/v1/export/metrics?grain=quarter&period_from=2098-Q4"
+                                      "&period_to=2098-Q2", headers=auth_headers)
+    assert backwards.status_code == 422 and "不能晚于" in backwards.json()["detail"]
+    none = await anon_client.get("/api/v1/export/metrics?grain=quarter&period_from=2099-Q1"
+                                 "&period_to=2099-Q2&format=csv", headers=auth_headers)
+    assert none.status_code == 200 and int(none.headers["X-Export-Rows"]) == 0
+    assert "X-Export-Truncated" not in none.headers
+
+
+async def test_export_metrics_reports_truncation_instead_of_always_false(anon_client, auth_headers, db_session,
+                                                                        monkeypatch):
+    """指标导出原来把 `truncated` 写死成 False（连上限都没有）：导了半张表却告诉用户「没问题」。
+
+    真跑到 20000 行太慢，这里把上限压成 1 行——验的是「按上限截断 + 如实上报 + 辅助接口报同一个上限」这条链路。
+    """
+    _seed_scoped_period(db_session, SCOPE_PERIOD)
+    monkeypatch.setattr("backend.api_export.EXPORT_LIMIT", 1)
+
+    cut = await anon_client.get("/api/v1/export/metrics?format=csv", headers=auth_headers)
+    assert cut.status_code == 200, cut.text
+    assert cut.headers["X-Export-Rows"] == "1"
+    assert cut.headers["X-Export-Truncated"] == "true"
+    assert len(_csv_rows(cut.content)[1]) == 1
+    # 辅助接口报的上限要与真正生效的一致，否则「为什么只给我一行」无从解释
+    helper = await anon_client.get("/api/v1/export/scope", headers=auth_headers)
+    assert helper.json()["limit"] == 1
+
+    # 没被截断时**不带**这个头：前端据「有没有这个头」提示，而不是去读它的值
+    monkeypatch.setattr("backend.api_export.EXPORT_LIMIT", 100)
+    whole = await anon_client.get("/api/v1/export/metrics?format=csv", headers=auth_headers)
+    assert whole.status_code == 200
+    assert "X-Export-Truncated" not in whole.headers
+    assert int(whole.headers["X-Export-Rows"]) == len(_csv_rows(whole.content)[1]) > 0
+
+
 async def test_export_alerts_and_scope_helper_require_token(anon_client, auth_headers, db_session):
     _seed_scoped_period(db_session, SCOPE_PERIOD)
     alerts = await anon_client.get(f"/api/v1/export/alerts?period={SCOPE_PERIOD}&format=csv",
@@ -1412,6 +1656,9 @@ async def test_export_alerts_and_scope_helper_require_token(anon_client, auth_he
     assert text.startswith("期间,口径,预警类型")
     assert "需人工复核" in text.splitlines()[0]
     assert "全公司口径测试预警" in text and "部门B口径测试预警" not in text
+    # 预警行本身就是月口径（`financial_alerts.period` 存 "2026-10"），季/年不该被安静地当成空结果
+    quarter = await anon_client.get("/api/v1/export/alerts?period=2097-Q3&format=csv", headers=auth_headers)
+    assert quarter.status_code == 422
 
     helper = await anon_client.get("/api/v1/export/scope", headers=auth_headers)
     assert helper.status_code == 200

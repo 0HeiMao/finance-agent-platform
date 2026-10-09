@@ -229,16 +229,16 @@ def serialize(row: FinancialTransaction) -> dict:
     return data
 
 
-def list_rows(db: Session, scope: Scope, *, period: str | None = None, department: str | None = None,
-              batch: str | None = None, query: str | None = None,
-              limit: int = 50, offset: int = 0) -> tuple[list[FinancialTransaction], int]:
-    """范围 + 筛选后的明细分页。`total` 是**筛选后**的总数（与 /admin/* 的分页口径一致）。"""
-    statement = scope_transactions(select(FinancialTransaction), scope)
+def apply_filters(statement, *, period: str | None = None, batch: str | None = None,
+                  query: str | None = None):
+    """明细列表与明细导出共用的一套筛选。
+
+    两边各写一遍早晚会分家，而导出「比页面多几行/少几行」是没人看得出来的那类错：
+    用户在页面上筛了批次再点导出，拿到的是全部行，还以为自己导的就是屏幕上那批。
+    """
     if period:
         statement = statement.where(
             period_mod.period_range(FinancialTransaction.transaction_date, period))
-    if department:
-        statement = statement.where(FinancialTransaction.department == department)
     if batch:
         statement = statement.where(FinancialTransaction.import_batch == batch)
     if query:
@@ -246,6 +246,17 @@ def list_rows(db: Session, scope: Scope, *, period: str | None = None, departmen
         statement = statement.where(or_(FinancialTransaction.account_name.ilike(like),
                                         FinancialTransaction.account_code.ilike(like),
                                         FinancialTransaction.description.ilike(like)))
+    return statement
+
+
+def list_rows(db: Session, scope: Scope, *, period: str | None = None, department: str | None = None,
+              batch: str | None = None, query: str | None = None,
+              limit: int = 50, offset: int = 0) -> tuple[list[FinancialTransaction], int]:
+    """范围 + 筛选后的明细分页。`total` 是**筛选后**的总数（与 /admin/* 的分页口径一致）。"""
+    statement = scope_transactions(select(FinancialTransaction), scope)
+    if department:
+        statement = statement.where(FinancialTransaction.department == department)
+    statement = apply_filters(statement, period=period, batch=batch, query=query)
     total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     rows = db.scalars(
         statement.order_by(FinancialTransaction.transaction_date.desc(),

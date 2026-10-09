@@ -4691,9 +4691,26 @@
     },
     "/api/v1/export/metrics": {
       "get": {
-        "description": "期间指标导出：导出的是该账号口径的那些行（全公司行或该部门行），不会把两套混在一起。",
+        "description": "期间指标导出：导出的是该账号口径的那些行（全公司行或该部门行），不会把两套混在一起。\n\n月口径与季/年口径是两张表（`financial_metrics` / `financial_rollups`），所以 `grain` 在这里换表，\n而不是假装一张表里什么粒度都有。季/年行额外带上「包含月份」与「是否完整」：\n`financial_rollups.complete=False` 的期间只有部分月落了库，年度合计看起来像全年，必须写清楚。",
         "operationId": "export_metrics_api_v1_export_metrics_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "grain",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 20,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Grain"
+            }
+          },
           {
             "in": "query",
             "name": "period_from",
@@ -4701,7 +4718,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^\\d{4}-(0[1-9]|1[0-2])$",
+                  "maxLength": 20,
                   "type": "string"
                 },
                 {
@@ -4718,7 +4735,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^\\d{4}-(0[1-9]|1[0-2])$",
+                  "maxLength": 20,
                   "type": "string"
                 },
                 {
@@ -4814,7 +4831,7 @@
     },
     "/api/v1/export/transactions": {
       "get": {
-        "description": "明细导出。period 省略表示导出该账号范围内的全部期间。",
+        "description": "明细导出。period 省略表示导出该账号范围内的全部期间。\n\n表尾带冲销与更正标记：界面上看得到「已冲销 / 冲销行 / 更正 N 次」，导出也必须看得到——\n否则冲销产生的负数行在表里毫无解释（同一批里一条 +69.5 和一条 -69.5 并排，谁知道是冲销）。\n\n`batch`/`query` 与明细页面的同名筛选是同一套（`transactions.apply_filters`）：页面上筛完再导出，\n导出的必须就是屏幕上那一批，否则「我明明只导出这个批次」是个查不出来的错。",
         "operationId": "export_transactions_api_v1_export_transactions_get",
         "parameters": [
           {
@@ -4824,7 +4841,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^\\d{4}-(0[1-9]|1[0-2])$",
+                  "pattern": "^\\d{4}(?:-Q[1-4]|-0[1-9]|-1[0-2])?$",
                   "type": "string"
                 },
                 {
@@ -4866,6 +4883,40 @@
                 }
               ],
               "title": "Account"
+            }
+          },
+          {
+            "in": "query",
+            "name": "batch",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Batch"
+            }
+          },
+          {
+            "in": "query",
+            "name": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Query"
             }
           },
           {

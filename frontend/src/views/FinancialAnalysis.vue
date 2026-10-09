@@ -82,7 +82,8 @@ watch(activeScope, load)
         <div class="actions">
           <ScopeSwitcher />
           <input v-model="period" type="month" class="select" @change="load" />
-          <ExportMenu kind="transactions" :period="period" />
+          <!-- 页面上是这一期的指标卡，导出就导同一期同一口径的指标（原来导的是明细，两边对不上） -->
+          <ExportMenu kind="metrics" :period-from="period" :period-to="period" />
           <button class="btn" :disabled="loading" @click="load">{{ loading ? '加载中…' : '↻ 刷新' }}</button>
           <button class="btn" @click="router.push('/dashboard')">返回看板</button>
         </div>

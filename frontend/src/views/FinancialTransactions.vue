@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
+import ExportMenu from '../components/ExportMenu.vue'
 import PagePager from '../components/PagePager.vue'
 
 const PAGE_SIZE = 50
@@ -248,6 +249,16 @@ onMounted(() => {
           />
         </label>
         <button class="btn primary" @click="applyFilters">筛选</button>
+        <!-- 导出的筛选条件与上面这几个下拉**同源**（批次/关键字也一起带上），页面上看到哪些就导出哪些；
+             冲销与更正标记在表尾几列，导出的负数行因此有了解释（⑲） -->
+        <ExportMenu
+          kind="transactions"
+          label="导出明细"
+          :period="periodFilter"
+          :department="departmentFilter"
+          :batch="batchFilter"
+          :keyword="queryFilter"
+        />
       </section>
 
       <p v-if="loading && !rows.length" class="muted">正在读取明细…</p>

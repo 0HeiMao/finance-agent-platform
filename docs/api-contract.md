@@ -332,12 +332,24 @@ GET /dashboard?period=month|quarter|year
 
 | 方法 | 路径 | 参数 | 列 |
 | --- | --- | --- | --- |
-| GET | `/export/transactions` | `period?`（省略=全部期间）、`account?`（科目名模糊匹配）、`department?`、`format` | 交易日期,科目编码,科目名称,部门,摘要,收入金额,成本金额,费用金额,现金流入,现金流出,导入批次 |
-| GET | `/export/metrics` | `period_from?`、`period_to?`、`department?`、`format` | 期间,口径,收入金额,成本金额,费用金额,毛利金额,净利润,毛利率,净利率 |
+| GET | `/export/transactions` | `period?`（省略=全部期间；月 `2026-07`、季 `2026-Q3`、年 `2026` 都认）、`batch?`（导入批次精确匹配）、`query?`（科目编码/名称/摘要模糊匹配）、`account?`（科目名模糊匹配）、`department?`、`format` | 明细 id,交易日期,科目编码,科目名称,部门,摘要,收入金额,成本金额,费用金额,现金流入,现金流出,导入批次,冲销状态,原始行 id,冲销时间,冲销操作人,更正次数 |
+| GET | `/export/metrics` | `grain?`（`month`（默认）/`quarter`/`year`）、`period_from?`、`period_to?`（**必须与 `grain` 同粒度**）、`department?`、`format` | 期间,粒度,口径,包含月份,是否完整,收入金额,成本金额,费用金额,毛利金额,净利润,毛利率,净利率 |
 | GET | `/export/alerts` | `period?`（单期）或 `period_from?`/`period_to?`（区间，看板按「本年」展示时用）、`level?`、`department?`、`format` | 期间,口径,预警类型,描述,级别,指标,当前值,阈值,需人工复核,预警 id |
 | GET | `/export/scope` | 无 | 给前端按钮用的口径说明：`{scope,formats:["csv","xlsx"],limit,generated_at,timezone}`；`timezone` 是业务时区的可读文案（如 `Asia/Shanghai (UTC+08:00)`），`generated_at` 带该偏移——下游别去猜机房在哪 |
 
 - `format` 只接受 `csv`（默认）或 `xlsx`，其他值 **422**。
+- **明细导出的筛选与页面同源**：`period`/`batch`/`query` 走的是 `backend/transactions.py::apply_filters`，
+  与 `/financial/transactions` 列表**同一个函数**，避免出现「页面上筛出来 12 行、导出 15 行」。
+  多个筛选条件之间是**且**（批次 + 关键字只出同时满足的行）。
+- **指标的季/年不重算，读的是 `financial_rollups`**（⑧ 的落库表）：`grain=quarter|year` 返回落库行，
+  `period` 形如 `2026-Q3`/`2026`，与 `/admin/rollups`（管理概览那张卡）**同一份数据**。
+  两列专门解释「这个合计到底含了几个月」：`包含月份` 是实际落库的月份（顿号分隔），
+  `是否完整` 在 `complete=False` 时写 `否`——月表只有 7 个月时，年度行**不会假装是全年**。
+- `grain` 与端点写错、粒度不匹配（如 `grain=quarter&period_from=2026-04`）、区间倒过来
+  （`period_from` 晚于 `period_to`）都返回 **422**，并在提示里给出样例（`2026-Q3`），
+  而不是安静地返回空表。
+- **预警导出保持月口径**：预警行本身就是月粒度的，`?period=2026-Q3` 会 **422**（不静默当成空结果）。
+- `grain=month` 走 `financial_metrics`（单月），此时 `period_from`/`period_to` 必须是月。
 - 响应头告诉调用方结果规模，前端据此提示，避免「以为导全了其实被截断」：
 
 ```http
@@ -347,14 +359,23 @@ X-Export-Truncated: true
 Access-Control-Expose-Headers: X-Export-Rows, X-Export-Truncated, Content-Disposition
 ```
 
-  上限 `EXPORT_LIMIT = 20000` 行，超过时置 `X-Export-Truncated: true`。
+  上限 `EXPORT_LIMIT = 20000` 行，超过时置 `X-Export-Truncated: true`（三个导出端点都用
+  「实际行数 > 上限」判定，不是写死的常量）。没有截断时**不出现这个头**——前端据此区分
+  「导全了」与「被切了」。
   中文文件名走 RFC 5987 的 `filename*`（HTTP 头只能是 latin-1），`filename=` 是同名 ASCII 兜底。
-  文件名里的期间标记与筛选一致（`transactions-2026-07-097.csv`、`alerts-2026-04~2026-10-all.csv`），
-  不要出现「写着全部期间、实际只导了一段区间」这种情况。
+  文件名里的期间标记与筛选一致（`transactions-2026-07-097.csv`、`metrics-quarter-2026-Q3-all.csv`、
+  `alerts-2026-04~2026-10-all.csv`），不要出现「写着全部期间、实际只导了一段区间」这种情况。
 - CSV 是 `utf-8-sig`（带 BOM，Excel 直接双击不乱码）；**CSV 里一切皆文本**，避免 Excel 把 `2026-10`
   认成日期、把部门号 `097` 变成 `97`；**XLSX 里数字列是真数字**（能直接求和），文本列仍是文本。
+  唯一的例外是纯数字的期间串：XLSX 会把年度期间 `2026` 写成数字单元格，读回来是 `2026`（int）而不是
+  `"2026"`——按文本比对期间的下游要注意这一点。
 - 导出永远只包含调用者口径的数据：受限账号导出不会出现别的部门，管理员导出的是全公司行，
   不会把 `department IS NULL` 与各部门行加总（这是这套两套行模型最容易悄悄出错的地方，回归脚本专门断言）。
+- **明细导出的三列冲销/更正标记**（⑨ 的更正与冲销在导出里必须有解释）：
+  `冲销状态` 空 = 正常行、`已冲销` = 被冲销的原行（此时 `冲销时间`/`冲销操作人` 记的是**冲销那一刻**的
+  业务时间与账号，不是这一行的交易日期）、`冲销行` = 冲销产生的负数行（`原始行 id` 指回被冲销的行，
+  摘要以 `冲销：` 开头）；`更正次数` 是这一行被就地更正过几次（0 表示没改过）。
+  负数行的金额就是负的，导出的合计与页面看到的净额一致。
 
 ## 预测与报告
 
