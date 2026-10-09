@@ -771,6 +771,7 @@ test('Agent 会话（⑮）：开始事件把会话 id 抛回上层，追问带�
   assert.equal(saved.length, 1)
   assert.match(view.text(), /依据：财务汇总表 2026-07/)
   assert.doesNotMatch(view.text(), /按字数估算/)
+  assert.doesNotMatch(view.text(), /已带上前/) // ⑰：第一轮没有历史，就不该出现这句话
 
   // 第二问接着同一个会话：路径要带上落库后的 id，否则每次提问都另起一个会话
   useRoutes([
@@ -782,7 +783,8 @@ test('Agent 会话（⑮）：开始事件把会话 id 抛回上层，追问带�
           'event: start\ndata: {"session_id":9,"message_id":33,"title":"本月收支差额是多少"}\n\n',
           'event: delta\ndata: {"text":"被停在这里"}\n\n',
           'event: done\ndata: {"session_id":9,"message_id":33,"status":"stopped","sources":[],' +
-            '"tokens":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40,"usage_source":"estimated"}}\n\n'
+            '"tokens":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40,"usage_source":"estimated"},' +
+            '"history_turns":1,"history_messages":2,"history_tokens":57,"history_truncated":true}\n\n'
         ])
     }
   ])
@@ -795,6 +797,8 @@ test('Agent 会话（⑮）：开始事件把会话 id 抛回上层，追问带�
   assert.equal(fetchImpl.calls.at(-1).path, '/api/v1/ai/agent/chat/stream?session_id=9')
   assert.deepEqual(JSON.parse(fetchImpl.calls.at(-1).body), { question: '那 7 月呢？' })
   assert.match(view.text(), /本回答 40 tokens（按字数估算）/)
+  // ⑰：模型这一轮究竟带上了几轮历史，要写在回答下面（预算截断也要说清楚）
+  assert.match(view.text(), /已带上前 1 轮对话（更早的已省略）/)
   // 被停止的回答要说明「只保留已生成的部分」，否则看着像答案不完整
   assert.match(view.text(), /（这条回答被停止，只保留已生成的部分）/)
   assert.equal(saved.length, 2)

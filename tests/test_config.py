@@ -135,3 +135,20 @@ def test_config_timezone_check_and_biztime_agree_on_valid_names():
         assert _valid_timezone(name) is biztime.is_valid(name), name
     # 唯一的有意分歧：空串在 config 里算「写错了」，在 biztime 里算「用默认值」（避免请求 500）
     assert _valid_timezone("") is False and biztime.is_valid("") is True
+
+
+# ---------------------------------------------------------------- 多轮上下文（⑰）
+
+def test_agent_history_budgets_default_and_accept_zero():
+    assert _prod_settings().agent_history_max_turns == 6
+    assert _prod_settings().agent_history_max_tokens == 1500
+    assert _prod_settings().validate() == []
+    # 0 是「关掉多轮」，不是写错：两个都设 0 也该是干净配置
+    assert _prod_settings(agent_history_max_turns=0, agent_history_max_tokens=0).validate() == []
+
+
+@pytest.mark.parametrize("overrides", [{"agent_history_max_turns": -1}, {"agent_history_max_tokens": -1}])
+def test_negative_agent_history_budget_is_reported(overrides):
+    """负数没有含义（0 已经是关掉），与其在运行期当 0 用，不如在启动体检里点名。"""
+    problems = _prod_settings(**overrides).validate()
+    assert any("AGENT_HISTORY" in problem for problem in problems), problems

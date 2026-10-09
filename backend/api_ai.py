@@ -11,6 +11,7 @@ from backend import agent_sessions
 from backend.ai_service import rag_answer
 from backend.api_rag import ChunkScope, retrieve_for_user, user_department_of
 from backend.auth import current_user
+from backend.config import get_settings
 from backend.db import get_db
 from backend.limits import ai_quota
 from backend.llm import get_llm
@@ -112,6 +113,14 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
     # 必须在这里提交：生成器用的是另一条连接，看不到未提交的占位行
     db.commit()
 
+    # ⑰ 多轮上下文：把同一会话里前面写完的问答按预算挑出来（本轮刚落库的提问与占位回答排除在外）。
+    # 关掉或超预算时 history["messages"] 是空的，行为与⑯之前一致——一轮的证据仍然照常带。
+    settings = get_settings()
+    history = agent_sessions.history_for(
+        db, session.id, exclude_ids=(user_message.id, assistant.id),
+        max_turns=settings.agent_history_max_turns, max_tokens=settings.agent_history_max_tokens)
+    history_text = "\n".join(f"{item['role']}：{item['content']}" for item in history["messages"])
+
     event = agent_sessions.register(assistant.id)
     assistant_id = assistant.id
 
@@ -128,7 +137,11 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
         error_text: str | None = None
         outcome: dict = {}
         yield sse("start", {"session_id": session.id, "message_id": assistant_id,
-                            "question_message_id": user_message.id, "title": session.title})
+                            "question_message_id": user_message.id, "title": session.title,
+                            "history_turns": history["turns"],
+                            "history_messages": len(history["messages"]),
+                            "history_tokens": history["tokens"],
+                            "history_truncated": history["truncated"]})
         try:
             db2 = agent_sessions.open_session()
             try:
@@ -154,7 +167,8 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
                     parts.append(part)
                     yield sse("delta", {"text": part})
             else:
-                for part in get_llm().stream(payload.question, evidence, usage):
+                for part in get_llm().stream(payload.question, evidence, usage,
+                                             history=history["messages"]):
                     # 每块一次检查：用户点了"停止"就立刻收尾，而不是等模型把剩下的 token 烧完
                     if event.is_set():
                         status = "stopped"
@@ -173,7 +187,8 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
             agent_sessions.release(assistant_id)
             outcome.update(_persist(assistant_id, content="".join(parts), status=status, sources=sources,
                                     period=period, knowledge_chunks=knowledge_chunks, usage=usage,
-                                    prompt_text=f"{payload.question}\n{evidence}", count_estimate=count_estimate,
+                                    prompt_text=f"{history_text}\n{payload.question}\n{evidence}",
+                                    count_estimate=count_estimate,
                                     duration_ms=int((time.monotonic() - started) * 1000),
                                     error=error_text))
         if error_text is None:
@@ -183,5 +198,9 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
                                "matched_period": period, "knowledge_chunks": knowledge_chunks,
                                "scope": scope_payload(financial_scope, requested=explicit),
                                "tokens": outcome.get("tokens", {}),
+                               "history_turns": history["turns"],
+                               "history_messages": len(history["messages"]),
+                               "history_tokens": history["tokens"],
+                               "history_truncated": history["truncated"],
                                "duration_ms": int((time.monotonic() - started) * 1000)})
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})

@@ -48,17 +48,28 @@ class DeepSeekClient:
         # 让网关在最后一个 chunk 里带上本次用量（⑮ 的 token 统计靠它）
         self.include_usage = bool(getattr(settings, "llm_include_usage", True))
 
-    def _messages(self, question: str, context: str) -> list[dict]:
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"问题：{question}\n\n检索证据：\n{context or '无有效证据'}"},
-        ]
+    def _messages(self, question: str, context: str, history: list[dict] | None = None) -> list[dict]:
+        """系统提示 + 历史问答（⑰）+ 本轮提问与证据。
 
-    def answer(self, question: str, context: str, usage: dict | None = None) -> str:
+        顺序是刻意的：系统提示里的"只依据证据、不得编造"不能被历史里模型自己上一轮的话冲掉，
+        所以历史夹在中间；本轮的检索证据必须紧挨着本轮提问，否则模型会把上一轮的证据
+        当成本轮的（两轮证据长的很像，只差一个期间）。
+        """
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for item in history or []:
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": f"问题：{question}\n\n检索证据：\n{context or '无有效证据'}"})
+        return messages
+
+    def answer(self, question: str, context: str, usage: dict | None = None,
+               history: list[dict] | None = None) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             temperature=0.1,
-            messages=self._messages(question, context),
+            messages=self._messages(question, context, history),
         )
         reported = usage_of(getattr(response, "usage", None))
         if usage is not None and reported:
@@ -76,14 +87,17 @@ class DeepSeekClient:
             text = chunk.choices[0].delta.content if getattr(chunk, "choices", None) else None
             yield text, reported
 
-    def stream(self, question: str, context: str, usage: dict | None = None):
+    def stream(self, question: str, context: str, usage: dict | None = None,
+               history: list[dict] | None = None):
         """逐块吐字，`usage` 传字典就把这次调用的用量写进去。
+
+        `history` 是同一个会话里前面的问答（⑰ 的预算由调用方裁好再传进来，这里不做截断）。
 
         `stream_options={"include_usage": True}` 并非所有 OpenAI 兼容网关都认：有的直接报错。
         所以只有「一个字都还没吐出去」的时候才允许不带该参数重试一次——已经吐过再重试，
         用户会看到重复正文。真拿不到用量时上层会退回按字数估算（usage_source="estimated"）。
         """
-        messages = self._messages(question, context)
+        messages = self._messages(question, context, history)
         produced = False
         try:
             for text, reported in self._chunks(messages, include_usage=self.include_usage):

@@ -228,6 +228,11 @@ if BaseSettings is not None:
         # 默认开：不认这个参数的兼容网关会直接报错，backend/llm.py 会在"一个字都没吐出去"
         # 时自动不带该参数重试一次；想彻底不冒这个险就把它设成 false（用量退回按字数估算）。
         llm_include_usage: bool = True
+        # 多轮上下文（⑰，见 backend/agent_sessions.py 的 history_for）：同一个会话里带最近的
+        # 几轮问答给模型，才答得了「那上个月呢？」。两个都是成本旋钮——历史每轮都要重新计费，
+        # 不设上限等于让会话越聊越贵。任一为 0 就关掉多轮（行为回到只带本轮证据）。
+        agent_history_max_turns: int = 6
+        agent_history_max_tokens: int = 1500
         # 业务时区（⑯，见 backend/biztime.py）：库里存 UTC，但「今天/本月」这类日历日口径
         # 必须有唯一答案。默认 Asia/Shanghai；写成不存在的时区名会进 config_problems
         # （STRICT_CONFIG=1 时直接拒绝启动），而不是悄悄退回默认值。
@@ -281,6 +286,12 @@ if BaseSettings is not None:
                     f"BUSINESS_TIMEZONE={self.business_timezone!r} 不是合法的 IANA 时区名"
                     "（例如 Asia/Shanghai、America/New_York）；Windows 上还需要 tzdata 包"
                 )
+            if self.agent_history_max_turns < 0 or self.agent_history_max_tokens < 0:
+                problems.append(
+                    f"AGENT_HISTORY_MAX_TURNS={self.agent_history_max_turns} / "
+                    f"AGENT_HISTORY_MAX_TOKENS={self.agent_history_max_tokens} 不能是负数"
+                    "（0 表示不带历史对话，只带本轮的财务证据）"
+                )
             return problems
 
 else:
@@ -333,6 +344,8 @@ else:
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
         llm_include_usage = os.getenv("LLM_INCLUDE_USAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
+        agent_history_max_turns = int(os.getenv("AGENT_HISTORY_MAX_TURNS", "6"))
+        agent_history_max_tokens = int(os.getenv("AGENT_HISTORY_MAX_TOKENS", "1500"))
         business_timezone = os.getenv("BUSINESS_TIMEZONE", "Asia/Shanghai")
 
         @property
@@ -363,6 +376,11 @@ else:
                 problems.append("CORS_ORIGINS 含通配 '*'")
             if not _valid_timezone(self.business_timezone):
                 problems.append(f"BUSINESS_TIMEZONE={self.business_timezone!r} 不是合法的 IANA 时区名")
+            if self.agent_history_max_turns < 0 or self.agent_history_max_tokens < 0:
+                problems.append(
+                    f"AGENT_HISTORY_MAX_TURNS={self.agent_history_max_turns} / "
+                    f"AGENT_HISTORY_MAX_TOKENS={self.agent_history_max_tokens} 不能是负数"
+                )
             return problems
 
 @lru_cache

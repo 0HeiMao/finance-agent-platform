@@ -108,6 +108,9 @@ async function ask(text) {
         onDone: (payload) => {
           answer.sources = payload?.sources || []
           answer.tokens = payload?.tokens || null
+          // ⑰：这一轮到底带上了几轮历史——界面要说出来，否则用户以为模型「应该」记得
+          answer.historyTurns = payload?.history_turns || 0
+          answer.historyTruncated = payload?.history_truncated === true
           answer.stopped = payload?.status === 'stopped'
           answer.loading = false
           emit('saved')
@@ -211,6 +214,13 @@ function clearSession() {
             本回答 {{ message.tokens.total_tokens }} tokens{{
               message.tokens.usage_source === 'estimated' ? '（按字数估算）' : ''
             }}
+          </div>
+          <!--
+            ⑰：带上了几轮历史要说出来——「模型记不记得上一轮」是用户最关心的一件事，
+            而它取决于预算（条数/字数）与上一轮有没有写完，界面上猜不出来。
+          -->
+          <div v-if="message.historyTurns" class="muted usage-note">
+            已带上前 {{ message.historyTurns }} 轮对话{{ message.historyTruncated ? '（更早的已省略）' : '' }}
           </div>
         </div>
       </div>

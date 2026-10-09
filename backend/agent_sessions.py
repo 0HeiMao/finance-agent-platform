@@ -15,6 +15,9 @@
 3. **token 统计。** 模型报的用量记 `usage_source="api"`，按字数估的记 `"estimated"`，
    没调用模型（错误、或"没有证据"的固定文案）记 `None` 并把 token 记 0。
    把估算和账单混在一起报账等于自欺，界面上也分开显示。
+4. **多轮上下文（⑰）。** 落库的消息同时是这个会话的"记忆"：`history_for` 按预算挑出最近
+   几轮写完的问答，交给模型才答得了「那上个月呢？」。挑法（只带成对写完的、从最近往回、
+   整对进整对出）与那两个成本旋钮见 `history_for` 的 docstring。
 """
 
 from __future__ import annotations
@@ -328,6 +331,65 @@ def messages_of(db, session_id: int, *, limit: int = 400) -> list[AgentMessage]:
         .limit(limit)
     ).scalars().all()
     return list(rows)
+
+
+def history_for(db, session_id: int, *, exclude_ids=(), max_turns: int, max_tokens: int,
+                limit: int = 400) -> dict:
+    """挑出这个会话里能当上下文用的历史问答（⑰）——「那上个月呢？」能不能答，全看这里。
+
+    三条规则，都是为了让「多带一点上下文」不变成「把成本带飞」：
+
+    1. **只带写完的成对问答。** `error`/`interrupted`/还在 `streaming` 的回答不进上下文，
+       空正文同样跳过：它们是"没说完的话"，带上去只会让模型顺着半句话往下编。
+       缺了回答的提问（用户问了但那一轮失败了）也整对丢掉，不给模型半轮对话。
+    2. **从最近往回挑，整对进整对出。** 超预算就从**最老的一整对**开始丢——宁可少一轮，
+       也不给半轮。`max_turns` 按问答对数算，`max_tokens` 按 `estimate_tokens` 估算。
+    3. **任一为 0 就等于关掉多轮**（行为回到⑯之前：只带本轮的检索证据）。
+
+    `exclude_ids` 是本轮刚落库的提问与占位回答：占位回答正文是空的，本来就进不了上下文，
+    但显式排除能让"这一轮"与"历史"的边界由调用方说了算，而不是靠正文非空这个副作用。
+    返回值里的 `truncated` 只表示"有更早的对话没带上"，不区分是被预算截断还是被关掉。
+    """
+    rows = messages_of(db, session_id, limit=limit)
+    excluded = {int(item) for item in exclude_ids}
+    pairs: list[list[AgentMessage]] = []
+    pending: AgentMessage | None = None
+    for row in rows:
+        if row.id in excluded:
+            continue
+        if row.role == "user":
+            pending = row
+            continue
+        if row.role != "assistant" or pending is None:
+            continue
+        content = (row.content or "").strip()
+        if row.status not in ("ok", "stopped") or not content or not (pending.content or "").strip():
+            pending = None  # 这一轮没写完（或提问是空的）：整对丢掉，不给模型半轮对话
+            continue
+        pairs.append([pending, row])
+        pending = None
+
+    turns_budget = max(0, int(max_turns or 0))
+    token_budget = max(0, int(max_tokens or 0))
+    chosen: list[list[AgentMessage]] = []
+    used = 0
+    if turns_budget and token_budget:
+        for pair in reversed(pairs):
+            cost = estimate_tokens(pair[0].content, pair[1].content)
+            if len(chosen) >= turns_budget or used + cost > token_budget:
+                break
+            chosen.append(pair)
+            used += cost
+        chosen.reverse()
+    messages = [{"role": row.role, "content": (row.content or "").strip()}
+                for pair in chosen for row in pair]
+    return {
+        "messages": messages,
+        "turns": len(chosen),
+        "tokens": used,
+        "truncated": len(chosen) < len(pairs),
+        "available_turns": len(pairs),
+    }
 
 
 def streaming_message(db, session_id: int) -> AgentMessage | None:

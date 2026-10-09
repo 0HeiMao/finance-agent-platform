@@ -115,6 +115,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_alerts_outbound.py` | 预警外发通道 41 项：真库建 Webhook 通道（201 且响应与列表都只有 `has_secret`、重名 409、`ftp://` 与带用户名口令的 URL 422、非法 `min_level`/`kind` 422、邮件收件人里的多余空格被规范化）、`POST …/test` 成功与失败**都回 200** 且**不写投递台账**、真导入一个探针期间后 4 条投递全部 `sent`（`attempts=1`、`response_status=200`）且本地 sink 收到的正文与 `sha256=<timestamp>.<body>` 签名 **4/4 对得上**、把 sink 切成一直失败后同一批按 2/4/8 秒退避真的重发（sink 三轮共收到 12 次）而 `attempts` 停在 `ALERT_MAX_ATTEMPTS`=3、同一期间再点补发 `created=0`（内容寻址去重的目的正在于此：重算不会把同一件事再通知一遍）、人工重发一次即 `sent`/`attempts=1`/`status=200`、通道计数 `{pending,sent,failed}` 与 `last_result`/`last_error` 如实、六个动作的审计逐条留痕，跑完撤销探针批次、删临时通道并断言该期 0 条 pending |
 
 | `verify_agent_sessions.py` | Agent 会话与用量 39 项（**每次跑两次真模型调用**：一次完整回答、一次生成中就停止）：显式建会话 201 且显示「未命名会话」、空会话详情带 `status_labels`、没有正在生成的回答时停止 409、匿名 401、`start`→`delta`→`done` 事件齐全且 `start` 带 `session_id`/`message_id`/`question_message_id`/`title`、**落库正文与流式正文一字不差**（实测 1883 字、19 秒）、`usage_source=api` 且 prompt+completion=total 与 done 一致、**第一块 delta 时占位行就已经在库里且 `status=streaming`**、停止请求在流结束前被受理（`stopped=true`）且下一块就收尾成 `done.status=stopped`、被停回答只留已生成的部分并按字数估算记账（`estimated`）、停止之后再停止 409、`days=1` 的 `series` 就是今天这一天（**这条曾抓到「跑着的后端还是旧进程」**）、`api/estimated/free` 三个计数相加等于回答数、`days=0`/`days=400`/`limit=0` 422、`/admin/agent-usage` 的 `by_user`（未受限账号显示「不受限」）/`by_status`、别人的会话读写都 404、部门受限账号看不到管理员会话但能看自己的用量（管理端点 403）、删会话回报 `deleted_messages` 并留 `agent_session.delete` 审计，跑完删临时会话与临时账号 |
+| `verify_agent_memory.py` | 多轮上下文 15 项（**真模型连问 8 轮 + 1 次生成中停止**，用临时不受限账号）：第一轮的 start/done 都带会话 id 且历史全 0（0 轮/0 条/0 tokens/未截断）、第一轮真调了模型（正文非空且 token>0）、第二轮历史变成 1 轮 2 条且 **★ 第一轮埋的随机口令原样出现在第二轮回答里**（这条才是"历史真送到上游"的证据，假模型会照抄、真模型不会）、逐轮历史轮数 `[0,1,2,3,4,5,6,6]` 单调递增、**第 7 轮刚攒满 6 对时 `truncated` 仍是 false、第 8 轮再多一对就翻成 true 且轮数停在 6**（`truncated` 的含义是"有更早的没带上"，不是"到上限了"）、每轮 `messages = turns × 2` 且估算 tokens ≤ 1500、8 轮问答全部落库且都是终态 `ok`、生成中停止被受理（200）后**被停的回答照样进下一轮上下文**（半截但写完了）、跑完临时会话与临时账号都清干净 |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -174,7 +175,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 272 项、前端 49 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 279 项、前端 49 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -358,8 +359,8 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **272** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
-`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**）、`test_api.py`（受保护接口匿名 401、
+`tests/` 下三个文件共 **279** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+**多轮上下文（⑰）**：`history_for` 只收写完的成对问答（`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问整对丢掉）、超预算从最老的一整对开始丢（宁可少一轮不给半轮）、任一预算为 0 即关掉多轮、`truncated` 只表示「有更早的没带上」；`_messages` 的顺序是 system → 历史 → 本轮，历史里混进的 `system`/非法 role/空正文被丢掉且本轮的证据紧挨本轮提问；`stream` 透传 history 而位置参数不变（旧调用照旧）**、`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**、**`AGENT_HISTORY_MAX_TURNS` 默认 6、`AGENT_HISTORY_MAX_TOKENS` 默认 1500、两项为 0 是合法配置（= 关掉多轮）、负数进 `config_problems`**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
 管理员看到的一直是全公司行→**多部门账号**：绑定两个部门后看板/汇总/报告都是并集（金额相加、比率按合计
@@ -421,7 +422,9 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 （`answers` 从 1 到 2、tokens 相加）且不覆盖已有标题、未知 `session_id` 404、
 生成期间占位行确实是 `streaming` 时停止请求被受理并在收尾时变成 `stopped`（正文只留已生成部分）、
 没有正在生成的回答时再停止是 409、四个会话/用量端点匿名 401 而部门受限账号看管理端点 403、看自己的用量照常
-（`days=0` → 422）→**业务时区**：`/system/status` 的 `app.business_timezone` 五字段齐全且 `today` 等于按 IANA 规则算出的那一天、
+（`days=0` → 422）→**多轮上下文（⑰）**：第一轮 `history_*` 全 0 且没截断、第二轮
+`history_turns=1` / `history_messages=2` / `history_tokens>0` 且模型假件收到的 `history` 正是第一轮那对问答、
+第三轮改用估算口径时 `prompt_tokens` 把历史一起算进去（≥30，只算本轮问题会是个位数）→**业务时区**：`/system/status` 的 `app.business_timezone` 五字段齐全且 `today` 等于按 IANA 规则算出的那一天、
 看板 `updated_at` 带业务时区偏移、`/export/scope` 回报 `timezone` 文案、
 **审计的日期窗口按业务时区切**（真库插三行 UTC 16:00Z / 16:30Z / 15:30Z，前两行落在业务 `2026-10-09` 的窗口里、第三行落在业务 `2026-10-08`——
 那一刻按服务器本机 UTC 算还停在昨天，所以这条用例真的能抓到「照旧读本机时区」）。
@@ -587,7 +590,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 272 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 279 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 49 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -959,17 +962,28 @@ loading）、空数据（`.empty-state` + 去导入引导）、失败（`.error-
 - **用量是向网关「要」来的，所以有一个开关**：`LLM_INCLUDE_USAGE`（默认 `true`，见 `.env.example`）让最后一个
   流式 chunk 带上 `usage`。不认这个参数的兼容网关会直接报错——后端只在**一个字都还没吐出去**时**去掉该参数
   重试一次**（已经吐过字的流不能重来，重来就是重复计费），把开关关掉最坏也只是全体退化成按字数估算。
-- **窗口是「含今天的 N 个自然日」，起点对齐到那一天的 00:00（UTC）**，`daily_series` 把没问的日子补 0。
-  这里踩过两个坑：起点若按「此刻」算，① 图上的今天会消失（`by_day` 与 `series` 从不同的天开始铺）；
+- **窗口是「含今天的 N 个自然日」，起点对齐到那一天的 00:00（业务时区，⑯）**，`daily_series` 把没问的
+  日子补 0。这里踩过两个坑：起点若按「此刻」算，① 图上的今天会消失（`by_day` 与 `series` 从不同的天开始铺）；
   ② `agent_messages.created_at` 用的是数据库的 `now()`（事务开始时刻，可能早于 Python 这边的「此刻」），
   同一个事务里刚写下的行会被 `created_at >= start` 自己筛掉。
+- **追问时模型看得见前几轮（⑰）**：同一个会话里最近 6 轮「写完的成对问答」会按
+  `system → 历史 → 本轮（问题 + 证据）` 的顺序交给模型，所以「那上个月呢？」知道「那」指什么。
+  三条规则都在 `backend/agent_sessions.py` 的 `history_for()` 里：① 只带 `ok`/`stopped` 且正文非空的
+  问答——`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问**整对丢掉**（它们是
+  "没说完的话"，带上去模型会顺着半句话编）；② 超预算就从**最老的一整对**开始丢，宁可少一轮也不给半轮；
+  ③ `AGENT_HISTORY_MAX_TURNS`（默认 6）与 `AGENT_HISTORY_MAX_TOKENS`（默认 1500，按
+  `CHARS_PER_TOKEN = 1.5` 估）任一为 0 就等于关掉多轮。`start` 与 `done` 事件都带
+  `history_turns` / `history_messages` / `history_tokens` / `history_truncated`，回答下面显示
+  「已带上前 N 轮对话（更早的已省略）」；**这些数字不落库**（`agent_messages` 没这列），刷新页面后
+  回答照旧可读，只是不再显示这句话。估算口径也跟着变：没用量上报时 `prompt_tokens` 把历史一起算进去。
 - **显式建会话**（`POST /api/v1/ai/agent/sessions`，201）让前端先拿到 id 再开始流式——这样第一条回答
   一开始就能被停止；不显式建（看板卡片、直接问）时后端在 `start` 事件里建会话并把 id 交回去，
   前端后续追问自动带上 `?session_id=`。
 - **工作台 `/agent` 左侧是会话列表**（标题 + `N 问 · M tokens`、删除、近 7 天用量），回答下面挂
   `本回答 N tokens`；管理概览页多了一张 **Agent 用量卡**（`GET /api/v1/admin/agent-usage?days=7`，
   按用户列 token、逐日列出），它有自己的错误状态——**用量统计挂了不该把整页概览变成错误页**。
-- 真机验证是 `scripts/verify_agent_sessions.py`（39 项，见上表）；单测在 `tests/test_units.py`
+- 真机验证是 `scripts/verify_agent_sessions.py`（39 项）与 `scripts/verify_agent_memory.py`（⑰，15 项，
+  见上表）；单测在 `tests/test_units.py`
   （用量口径、估算与账单三种记账、状态归一、停止注册表）与 `tests/test_api.py`（真库整链路：
   `tests/test_api.py` 里两个流式用例走**真库 + 真会话**，因为流式落库在 Starlette 的线程池里另开会话，
   外层事务的 savepoint 里未提交的占位行它看不见）。踩过的坑：agent 端点的完整前缀是

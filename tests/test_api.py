@@ -414,7 +414,7 @@ async def test_rag_search_rejects_mismatched_embedding_model(anon_client, auth_h
 
 
 async def test_agent_stream_requires_token_and_streams_sse(anon_client, auth_headers, stub_retrieval, monkeypatch):
-    def fake_stream(question, context, usage=None):
+    def fake_stream(question, context, usage=None, history=None):
         yield "依据"
         yield "证据"
 
@@ -4357,8 +4357,14 @@ def _agent_text(events: list[tuple[str, dict]]) -> str:
 
 
 def _agent_llm(chunks=("依据", "证据"), tokens=(12, 5), before_second=None) -> SimpleNamespace:
-    """假的模型：块内容与用量可指定；`before_second` 用来在第二块之前挂住（测停止）。"""
-    def stream(question, context, usage=None):
+    """假的模型：块内容与用量可指定；`before_second` 用来在第二块之前挂住（测停止）。
+
+    `calls` 记下每轮收到的 `history`（⑰：用来断言模型真的看得见上一轮问答）。
+    """
+    calls: list = []
+
+    def stream(question, context, usage=None, history=None):
+        calls.append({"question": question, "history": list(history or [])})
         if usage is not None and tokens:
             usage.update({"prompt_tokens": tokens[0], "completion_tokens": tokens[1]})
         for index, chunk in enumerate(chunks):
@@ -4366,7 +4372,7 @@ def _agent_llm(chunks=("依据", "证据"), tokens=(12, 5), before_second=None) 
                 before_second()
             yield chunk
 
-    return SimpleNamespace(stream=stream)
+    return SimpleNamespace(stream=stream, calls=calls)
 
 
 class _RealAgentDatabase:
@@ -4470,7 +4476,8 @@ async def test_agent_sessions_crud_ownership_and_audit(anon_client, api_app, aut
 async def test_agent_stream_persists_session_tokens_and_usage(anon_client, api_app,
                                                               stub_retrieval, monkeypatch):
     """一次真流式问答：会话/提问/回答/token 全部落库，done 事件里的数字与库里一致。"""
-    monkeypatch.setattr("backend.api_ai.get_llm", lambda: _agent_llm())
+    llm = _agent_llm()
+    monkeypatch.setattr("backend.api_ai.get_llm", lambda: llm)
     async with _RealAgentDatabase(api_app) as real:
         headers = await real.login(anon_client)
         async with anon_client.stream("POST", "/api/v1/ai/agent/chat/stream", headers=headers,
@@ -4487,6 +4494,9 @@ async def test_agent_stream_persists_session_tokens_and_usage(anon_client, api_a
         assert done["tokens"] == {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17,
                                   "usage_source": "api"}
         assert _agent_text(events) == "依据证据"
+        assert start["history_turns"] == 0 and start["history_messages"] == 0
+        assert done["history_tokens"] == 0 and done["history_truncated"] is False
+        assert llm.calls[0]["history"] == []                    # 第一轮没有历史可带
         session_id = start["session_id"]
 
         detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
@@ -4509,10 +4519,27 @@ async def test_agent_stream_persists_session_tokens_and_usage(anon_client, api_a
             again = _agent_events("".join([chunk async for chunk in response.aiter_text()]))
         assert again[0][1]["session_id"] == session_id
         assert again[0][1]["title"] == start["title"]          # 已有标题不覆盖
+        # ⑰：第二轮把上一轮问答当历史交给模型，条数/字数都是可观测的
+        assert again[0][1]["history_turns"] == 1 and again[0][1]["history_messages"] == 2
+        assert again[0][1]["history_tokens"] > 0
+        assert again[0][1]["history_truncated"] is False
+        assert llm.calls[1]["history"] == [{"role": "user", "content": "差旅费标准是多少？"},
+                                           {"role": "assistant", "content": "依据证据"}]
         detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
                                         headers=headers)).json()
         assert len(detail["messages"]) == 4 and detail["data"]["answers"] == 2
         assert detail["data"]["total_tokens"] == 34
+
+        # 估算口径也把历史算进 prompt（没开用量上报时，字数估算要反映真实上下文）
+        estimated = _agent_llm(chunks=("答",), tokens=())
+        monkeypatch.setattr("backend.api_ai.get_llm", lambda: estimated)
+        async with anon_client.stream("POST", f"/api/v1/ai/agent/chat/stream?session_id={session_id}",
+                                      headers=headers, json={"question": "再核对一遍"}) as response:
+            third = _agent_events("".join([chunk async for chunk in response.aiter_text()]))
+        assert third[-1][1]["tokens"]["usage_source"] == "estimated"
+        # 估算是按"历史 + 本轮问题 + 证据"的字数来的：只算本轮问题的话这里会是个位数
+        assert third[-1][1]["tokens"]["prompt_tokens"] >= 30
+        assert len(estimated.calls[0]["history"]) == 4          # 前两轮问答（4 条消息）都在
 
         missing = await anon_client.post("/api/v1/ai/agent/chat/stream?session_id=999999999",
                                          headers=headers, json={"question": "还在吗？"})

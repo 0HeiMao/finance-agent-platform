@@ -497,9 +497,9 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 流式响应为 `text/event-stream`：
 
 ```text
-event: start\ndata: {"session_id":12,"message_id":34,"question_message_id":33,"title":"本月收入"}\n\n
+event: start\ndata: {"session_id":12,"message_id":34,"question_message_id":33,"title":"本月收入","history_turns":1,"history_messages":2,"history_tokens":57,"history_truncated":false}\n\n
 event: delta\ndata: {"text":"本月"}\n\n
-event: done\ndata: {"session_id":12,"message_id":34,"status":"ok","stopped":false,"sources":[{"name":"财务汇总表 2026-07","kind":"financial_metric"}],"has_financial_data":true,"matched_period":"2026-07","knowledge_chunks":3,"scope":{"departments":[]},"tokens":{"prompt_tokens":2223,"completion_tokens":1100,"total_tokens":3323,"usage_source":"api"},"duration_ms":19063}\n\n
+event: done\ndata: {"session_id":12,"message_id":34,"status":"ok","stopped":false,"sources":[{"name":"财务汇总表 2026-07","kind":"financial_metric"}],"has_financial_data":true,"matched_period":"2026-07","knowledge_chunks":3,"scope":{"departments":[]},"tokens":{"prompt_tokens":2223,"completion_tokens":1100,"total_tokens":3323,"usage_source":"api"},"history_turns":1,"history_messages":2,"history_tokens":57,"history_truncated":false,"duration_ms":19063}\n\n
 event: error\ndata: {"message":"模型暂时不可用"}\n\n
 ```
 
@@ -534,6 +534,28 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   跨用户的用量只在管理员端点 `GET /admin/agent-usage` 看汇总。
 - 令牌与 `X-User-Department` 的口径与其它接口一致：会话的 `scope` 记的是提问时的口径快照。
 - 完整前缀是 `/api/v1/ai/agent/...`（`backend/api_agent.py` 的 `prefix="/api/v1/ai"`），漏掉 `/ai` 会 404。
+
+### 多轮上下文（追问时模型看得见前几轮）
+
+`start` 与 `done` 两个事件都带 `history_turns` / `history_messages` / `history_tokens` /
+`history_truncated`：**这一轮到底把几轮历史交给了模型**（`history_messages` 恒等于
+`history_turns × 2`）。前端 `AgentChat.vue` 把它们渲染成回答下方的「已带上前 N 轮对话」，不显示就是 0。
+
+- **只带写完的成对问答**（`backend/agent_sessions.py` 的 `history_for()`）：回答是 `ok` 或 `stopped`
+  且正文非空才算一轮；`error` / `interrupted` / 还在 `streaming` 的，以及没有回答的孤零零提问，
+  **整对丢掉**——它们是"没说完的话"，带上去只会让模型顺着半句话往下编。
+- **预算是配置项**：`AGENT_HISTORY_MAX_TURNS`（默认 6，按问答对数）与 `AGENT_HISTORY_MAX_TOKENS`
+  （默认 1500，按 `CHARS_PER_TOKEN = 1.5` 估算）。超预算时从**最老的一整对**开始丢，
+  宁可少一轮也不给半轮；任一为 0 就等于关掉多轮。`history_truncated: true` 只表示"有更早的对话没带上"，
+  不区分是被预算截断还是被关掉。
+- **消息顺序是 system → 历史 → 本轮（问题 + 证据）**：系统提示不能被历史里模型自己上一轮的话冲掉，
+  而本轮的检索证据必须紧挨着本轮提问（两轮证据长得很像，只差一个期间）。
+- **估算口径跟着变**：没有用量上报时，按字数估算的 `prompt_tokens` 把历史一起算进去
+  （`prompt_text` 里含历史的角色与正文），所以关掉多轮会直接看到这个数字变小。
+- 落库的回答里**不记录**这一轮带了哪些历史（`agent_messages` 没这列）：这些数字只在事件里给，
+  刷新页面后回答本身照旧可读，只是不再显示「带上了前 N 轮」。
+- 真机验证：`scripts/verify_agent_memory.py`（临时账号连问 7 轮，第一轮埋一个随机口令、
+  第二轮只问口令，回答里出现口令才算真送到了上游；另验预算封顶、被停止的回答照样进上下文）。
 
 ## 管理员
 
