@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from backend import biztime
+from backend import biztime, ratelimit
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
@@ -84,6 +84,29 @@ def _upload_dir(kind: str, configured: str) -> dict:
     return result
 
 
+def _rate_limits() -> dict:
+    """限流与配额的口径（㉑）：三组配额的上限/窗口，以及**计数存在哪**。
+
+    ㉑ 之前这里的答案只能是「内存里，每个 worker 各算一份、重启清零」；
+    现在计数在 `rate_limit_hits` 里，所以这个段位能如实说「共享、跨重启」，
+    并给出当前桶数 —— 桶数只增不减就是窗口裁剪失效了，这是最省事的报警。
+    刻意只给**聚合**的桶数：分桶键里有用户名与来源 IP，而普通账号也能看这个接口，
+    不该把别人正在被限流的摊位摆出来（真要排障用 `ratelimit.snapshot()`）。
+    """
+    payload: dict = {
+        "store": "postgres:rate_limit_hits",
+        "shared_across_processes": True,
+        "survives_restart": True,
+        "quotas": ratelimit.all_quotas(),
+    }
+    try:
+        payload["buckets"] = ratelimit.tracked_buckets()
+    except Exception as exc:  # 库有问题时状态页要能显示成「异常」而不是白屏
+        payload["buckets"] = -1
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    return payload
+
+
 @router.get("/status")
 def system_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
     settings = get_settings()
@@ -120,6 +143,7 @@ def system_status(db: Session = Depends(get_db), user: User = Depends(current_us
             "rerank_model": settings.rerank_model or "",
         },
         "database": _database(db),
+        "rate_limits": _rate_limits(),
         "embedding": _embedding(),
         "rag": {
             "max_distance": settings.rag_max_distance,

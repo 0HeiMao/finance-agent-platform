@@ -402,3 +402,31 @@ class AgentMessage(Base):
     usage_source: Mapped[str | None] = mapped_column(String(20))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RateLimitHit(Base):
+    """一次被限流器记下的尝试（㉑）：限流与配额的计数**落库**，不再各进程一份。
+
+    为什么要有这张表：⑰ 之前 `backend/ratelimit.py` 的滑动窗口是进程内的 `deque`，
+    于是「10 次 / 300 秒」这条登录闸门在多 worker 下变成「每个 worker 各 10 次」、
+    重启一次就清零，而 README 只能把这两条写成已知边界。计数换成库里的一行行尝试之后，
+    多副本与重启共享同一本账 —— 与 ⑱ 把「后台任务执行权」落到库里是同一个方向：
+    **进程里的状态只是缓存，事实要在库里**。
+
+    刻意不做成「一个桶一行 + 计数列」：滑动窗口要的是「最近 N 秒内有哪些尝试」，
+    丢了时间戳就只能退化成固定窗口（跨窗口边界的突发会放过一倍）。一行一次尝试换来的是
+    语义与原来完全一致，代价由 `hit_at` 上的索引与同桶裁剪（`ratelimit._prune`）兜住。
+
+    `bucket` 的形状是 `配额名:分桶键`（如 `login:张三@10.0.0.9`、`export:张三`），
+    原样存字符串是为了排障时能直接看懂是谁的桶。
+    """
+    __tablename__ = "rate_limit_hits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bucket: Mapped[str] = mapped_column(String(300), nullable=False)
+    hit_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                             server_default=func.now())
+
+    __table_args__ = (
+        # 复合索引的两列顺序就是查询形状：先按桶定位，再按时间裁窗口（同桶裁剪与取最早那条）。
+        Index("ix_rate_limit_hits_bucket_hit_at", "bucket", "hit_at"),
+    )

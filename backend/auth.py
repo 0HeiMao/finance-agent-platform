@@ -9,11 +9,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend import audit, lockout, passwords, scope
+from backend import audit, lockout, passwords, ratelimit, scope
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import User
-from backend.ratelimit import get_login_limiter
 from backend.scope import departments_of
 
 SECRET_KEY = get_settings().auth_secret_key
@@ -115,16 +114,17 @@ def register(payload: Credentials, request: Request, db: Session = Depends(get_d
 
 @router.post("/login")
 def login(payload: Credentials, request: Request, db: Session = Depends(get_db)):
-    """登录。两道闸：按「用户名 + 来源」的进程内限流（见 backend/ratelimit.py），
+    """登录。两道闸：按「用户名 + 来源」的**出口限流**（落库共享，见 backend/ratelimit.py），
     以及按**账号**的失败锁定 + 指数退避（落库，见 backend/lockout.py）。
 
     两道闸的 429 文案**故意一模一样**，且不回显「账号存在但被锁了」：否则拿 401 与 429 的
     差别就能问出哪些账号存在，这个接口就顺带成了用户名枚举接口。
     """
-    limiter = get_login_limiter()
     client = request.client.host if request.client else "unknown"
     key = f"{payload.username.strip().lower()}@{client}"
-    decision = limiter.check(key)
+    # 计数走自己的会话并立即提交（默认 db=None），不挂在请求的只读事务上：
+    # 否则审计写完之后若请求回滚，这次尝试就像没发生过，闸门永远攒不满。
+    decision = ratelimit.consume("login", key)
     if not decision.allowed:
         audit.record(db, payload.username, "user.login_blocked", target_type="user",
                      detail={"retry_after": decision.retry_after, "reason": "限流"},
@@ -170,7 +170,7 @@ def login(payload: Credentials, request: Request, db: Session = Depends(get_db))
                                  "locked_until": detail["locked_until"]},
                          request=request, commit=True)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
-    limiter.reset(key)
+    ratelimit.reset("login", key)
     cleared = lockout.clear_failures(user)
     db.add(user)
     audit.record(db, user, "user.login", target_type="user", target_id=user.id,

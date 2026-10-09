@@ -9,7 +9,9 @@
 - **锁上之后口令正确也进不来**（429 而不是 401），且 `Retry-After` 给得出还能等几秒；
 - 两道闸的 429 文案**一模一样**：拿它区分不出「账号被锁了」还是「你打太快了」——
   这正是防用户名枚举的那条设计，脚本里两种 429 都造出来对比；
-- 锁定**落库**，所以换一个来源 IP、或者重启后端都绕不过去（限流是进程内的，那才是绕得过的那个）；
+- 锁定**落库**，所以换一个来源 IP、或者重启后端都绕不过去；
+  （㉑ 之前这句只对「账号锁定」成立 —— 那一道闸是按「用户名 + 来源」计数的进程内窗口，
+  重启就清零、多 worker 各算一份；㉑ 把计数也搬进了 `rate_limit_hits`，这句现在两闸都成立。）
 - 静默期之后从 0 重新数（不是「一辈子攒着」），以及解锁之后口令不用改就能立刻登录。
 
 刻意不碰演示账号 `demo_analyst`：本脚本只在自己注册的临时账号（`verify_lockout_*`）上试错，
@@ -33,10 +35,9 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import text  # noqa: E402
 
-from backend import lockout  # noqa: E402
+from backend import lockout, ratelimit  # noqa: E402
 from backend.config import get_settings  # noqa: E402
 from backend.db import engine  # noqa: E402
-from backend.ratelimit import reset_login_limiter  # noqa: E402
 
 BASE = "http://127.0.0.1:8000/api/v1"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -110,8 +111,10 @@ def sweep() -> None:
     """清掉上次崩溃留下的临时账号（直接删库行；它们留下的审计行属于历史，不动）。"""
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM users WHERE username LIKE :p"), {"p": f"{PREFIX}%"})
-    # 顺手把限流桶清空，免得上一轮跑剩下的尝试次数影响这一轮
-    reset_login_limiter()
+    # 顺手把限流桶清空：㉑ 之后计数在库里，而这个脚本跑在**另一个进程**里，
+    # 只能这样清掉正在跑的那个后端进程攒下的尝试次数（以前那种进程内 reset 是清不掉的）。
+    removed = ratelimit.purge(bucket_prefix="login:")
+    print(f"      （清理限流桶：删除 {removed} 条登录尝试记录）", flush=True)
 
 
 def main() -> int:
@@ -229,7 +232,8 @@ def main() -> int:
           f"entry={unlocked[0] if unlocked else None}")
 
     # ---------------------------------------------------------- 静默期：过了就重新数
-    # 用一个干净的临时账号，免得跟上面那批尝试挤同一个限流桶（限流也是 10 次/5 分钟）
+    # 用一个干净的临时账号，免得跟上面那批尝试挤同一个限流桶（限流是按「用户名 + 来源」分桶的，
+    # 10 次 / 5 分钟；换个用户名就是一个新桶，所以这里天然互不影响）
     name_b = f"{PREFIX}b_{uuid.uuid4().hex[:8]}"
     status, body, _headers = call("POST", "/auth/register",
                                  body={"username": name_b, "password": PASSWORD})

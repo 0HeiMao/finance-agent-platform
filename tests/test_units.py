@@ -2385,5 +2385,69 @@ def test_export_period_patterns_accept_month_quarter_year_but_not_half_written()
     assert not alert.match("2097-Q4") and not alert.match("2097")
 
 
+# ------------------------------------------------- 限流窗口判定与桶锁（㉑）
+
+def test_rate_limit_decision_is_a_pure_sliding_window():
+    """窗口判定是纯函数：滑动的，不是「固定窗口」；被拒的尝试不占名额。
+
+    把策略从 SQL 里抽出来单测的理由很实在：这一层原来靠一个进程内的 `deque`，
+    「够不够 limit」「还要等几秒」全都埋在对象状态里，只能靠打真请求去猜。
+    """
+    from backend import ratelimit
+
+    now = 1_000_000.0
+    assert ratelimit.decide([], limit=2, window_seconds=60, now=now) == ratelimit.Decision(True, 0, 1)
+
+    # 窗口里的两条都在 60 秒内 → 满
+    full = ratelimit.decide([now - 50, now - 10], limit=2, window_seconds=60, now=now)
+    assert full.allowed is False and full.remaining == 0
+    # 等到最早那条滑出窗口（还差 10 秒，向上取整），就又有名额
+    assert full.retry_after == 10
+
+    # 只有一条还在窗口里：最早的那条（-70）已经不算了
+    sliding = ratelimit.decide([now - 70, now - 10], limit=2, window_seconds=60, now=now)
+    assert sliding.allowed is True and sliding.remaining == 0
+
+    # 边界：正好在窗口起点上的那条算过期（`>` 而不是 `>=`），否则窗口会「多算一条」
+    edge = ratelimit.decide([now - 60.0], limit=1, window_seconds=60, now=now)
+    assert edge.allowed is True
+
+    # retry_after 至少是 1 秒：Retry-After: 0 会让客户端立刻重试
+    nearly = ratelimit.decide([now - 59.999, now - 1], limit=2, window_seconds=60, now=now)
+    assert nearly.retry_after == 1
+
+
+def test_rate_limit_bucket_lock_key_is_stable_and_namespaced():
+    """桶名 → advisory lock key：稳定（跨进程/重启一致）、落在有符号 64 位、与期间锁不撞。"""
+    from backend import locks, ratelimit
+
+    first = ratelimit.bucket_lock_key("login:someone@10.0.0.1")
+    assert first == ratelimit.bucket_lock_key("login:someone@10.0.0.1"), "同一个桶必须拿到同一把锁"
+    assert first != ratelimit.bucket_lock_key("login:someone@10.0.0.2")
+    assert -(2**63) <= first < 2**63, "pg_advisory_xact_lock 只收有符号 64 位"
+
+    # 命名空间不同：同一个字符串在两套锁里必须落在不同的 key 上（否则限流的锁会挡住重算）
+    assert first != locks.lock_key("login:someone@10.0.0.1")
+
+
+def test_rate_limit_quota_registry_reads_config_and_rejects_unknown():
+    """三组配额都登记在案；未登记的名字显式报错（写错配额名不该静默放开）。"""
+    from backend import ratelimit
+    from backend.config import get_settings
+
+    ratelimit.reset_quotas()
+    settings = get_settings()
+    assert set(ratelimit.NAMES) == {"login", "export", "ai"}
+    assert ratelimit.quota("login") == (settings.login_max_attempts, float(settings.login_window_seconds))
+    assert ratelimit.quota("export") == (settings.export_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
+    assert ratelimit.quota("ai") == (settings.ai_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
+    for name in ratelimit.NAMES:
+        assert ratelimit.all_quotas()[name]["limit"] >= 1
+    with pytest.raises(KeyError):
+        ratelimit.quota("nope")
+    with pytest.raises(KeyError):
+        ratelimit.install_quota("nope", 1, 1)
+
+
 
 

@@ -56,6 +56,20 @@ def ensure_application_schema() -> None:
         pass
 
 
+@pytest.fixture(autouse=True)
+def clean_rate_limit_store(require_database) -> None:
+    """每个用例开头把限流计数清干净（㉑：计数是**跨请求、跨进程**的事实）。
+
+    为什么非清不可：`db_session` 的回滚只保证「用例自己写的数据不留痕」，而限流计数故意走
+    独立会话并**立即提交**（不挂在请求的只读事务上，否则请求回滚就等于这次尝试没发生）。
+    于是它会真留在库里：上一个用例打过的导出配额会变成下一个用例的「已经用掉几次」。
+    """
+    from backend.ratelimit import purge
+
+    purge()
+    yield
+
+
 @pytest.fixture
 def db_session(require_database):
     """外层事务 + savepoint：用例里的 commit 最终都会随外层 rollback 一起消失。"""

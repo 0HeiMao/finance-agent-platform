@@ -21,6 +21,32 @@ const scopeText = computed(() => {
   return names ? `部门 ${names}` : '未分配部门'
 })
 
+/** 三组配额的展示（㉑）。旧后端没有 `rate_limits` 这个段，所以每个格子都要能显示「（未上报）」。 */
+const QUOTA_LABELS = { login: '登录', export: '导出', ai: '问答' }
+const rateLimits = computed(() => status.value?.rate_limits || null)
+const quotas = computed(() =>
+  Object.entries(rateLimits.value?.quotas || {}).map(([name, quota]) => ({
+    name,
+    label: QUOTA_LABELS[name] || name,
+    limit: quota.limit,
+    window: quota.window_seconds
+  }))
+)
+const rateStoreText = computed(() => rateLimits.value?.store || '（未上报）')
+const rateSharedText = computed(() => {
+  const limits = rateLimits.value
+  if (!limits) return '这个后端还没有这一段'
+  const shared = limits.shared_across_processes ? '多进程共享同一本账' : '只在本进程内存里'
+  const keep = limits.survives_restart ? '重启不清零' : '重启清零'
+  return `${shared} · ${keep}`
+})
+const bucketsText = computed(() => {
+  const limits = rateLimits.value
+  if (!limits) return '（未上报）'
+  if ((limits.buckets ?? 0) < 0) return `读取失败${limits.error ? `：${limits.error}` : ''}`
+  return `${limits.buckets} 个`
+})
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -182,6 +208,34 @@ onMounted(load)
             <button v-if="loggedOut" class="btn primary" @click="goLogin">去登录页</button>
           </div>
           <p v-if="loggedOut" class="muted">{{ loggedOut }}</p>
+        </section>
+
+        <section class="page-card">
+          <div class="card-head"><h2>配额与限流</h2></div>
+          <p class="muted">
+            登录、导出、问答是三个「一次请求很贵」的出口，各自独立计数（登录被限流不该影响看数据，
+            导出打满也不该让人问不出问题），超限都是 429 + <code>Retry-After</code>。 计数落在数据库表
+            <code>rate_limit_hits</code> 里：存的是<strong>逐次尝试的时间戳</strong>
+            而不是一个计数，所以窗口是真的滑动窗口，不会在整分钟边界上把额度翻倍。
+            落库的直接好处是<strong>多进程/多副本共享同一本账、重启也不清零</strong>；
+            被拒的那次不记账（拒绝不该把封锁越拖越久）。
+          </p>
+          <div class="settings-grid">
+            <div>
+              <span>计数存放</span>
+              <strong>{{ rateStoreText }}</strong>
+              <small>{{ rateSharedText }}</small>
+            </div>
+            <div v-for="quota in quotas" :key="quota.name">
+              <span>配额 · {{ quota.label }}</span>
+              <strong>{{ quota.limit }} 次 / {{ quota.window }} 秒</strong>
+            </div>
+            <div>
+              <span>当前活跃桶</span>
+              <strong>{{ bucketsText }}</strong>
+              <small>一个「用户名+来源」或一个账号就是一只桶</small>
+            </div>
+          </div>
         </section>
 
         <section class="page-card">

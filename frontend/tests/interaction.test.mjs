@@ -1172,6 +1172,18 @@ const SYSTEM_STATUS = {
     pgvector: true,
     ok: true
   },
+  // ㉑ 的配额计数存放段：真实形状见 backend/api_system.py 的 _rate_limits()
+  rate_limits: {
+    store: 'postgres:rate_limit_hits',
+    shared_across_processes: true,
+    survives_restart: true,
+    quotas: {
+      login: { limit: 10, window_seconds: 300.0 },
+      export: { limit: 30, window_seconds: 60.0 },
+      ai: { limit: 60, window_seconds: 60.0 }
+    },
+    buckets: 3
+  },
   embedding: {
     model: 'finance-embedding',
     dimension: 384,
@@ -1233,6 +1245,59 @@ test('系统设置（⑯）：运行态里写明业务时区，业务日与当�
   await view.click('↻ 重新读取')
   assert.ok(await waitFor(() => view.text().includes('（未上报）')), `实际渲染：${view.text()}`)
   assert.match(view.text(), /配置体检通过/) // 页面其它内容仍在（不是错误页）
+  assert.doesNotMatch(view.text(), /读取系统状态失败/)
+  view.app.unmount()
+})
+
+test('系统设置（㉑）：配额计数落在库里这件事在页面上说清楚，缺字段与读不到计数都能退化显示', async () => {
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
+  // '' = 正常；'missing' = 旧后端没有这个段；'broken' = 库读不到（buckets = -1 + error）
+  let mode = ''
+  useRoutes([
+    {
+      path: '/api/v1/system/status',
+      response: () => {
+        const payload = structuredClone(SYSTEM_STATUS)
+        if (mode === 'missing') delete payload.rate_limits
+        if (mode === 'broken') {
+          payload.rate_limits.buckets = -1
+          payload.rate_limits.error = '连接失败'
+        }
+        return jsonResponse(payload)
+      }
+    }
+  ])
+  const router = makeRouter()
+  router.push('/dashboard')
+  await router.isReady()
+  const Settings = (await import('../src/views/Settings.vue')).default
+  const view = mount(Settings, { global: { plugins: [router] } })
+
+  assert.ok(await waitFor(() => view.text().includes('配额与限流')), `实际渲染：${view.text()}`)
+  // 存的是逐次尝试的时间戳 -> 真滑动窗口；落库 -> 跨进程共享、重启不清零（这就是 ㉑ 的全部要点）
+  assert.match(view.text(), /逐次尝试的时间戳/)
+  assert.match(view.text(), /多进程\/多副本共享同一本账、重启也不清零/)
+  assert.match(view.text(), /postgres:rate_limit_hits/)
+  assert.match(view.text(), /多进程共享同一本账 · 重启不清零/)
+  // 三组配额逐格对上服务端给的数字（顺序也按服务端给的来）
+  assert.match(view.text(), /配额 · 登录\s*10 次 \/ 300 秒/)
+  assert.match(view.text(), /配额 · 导出\s*30 次 \/ 60 秒/)
+  assert.match(view.text(), /配额 · 问答\s*60 次 \/ 60 秒/)
+  assert.match(view.text(), /当前活跃桶\s*3 个/)
+
+  // 库读不到时不该显示「0 个」装成正常：如实说读取失败并把原因带上
+  mode = 'broken'
+  await view.click('↻ 重新读取')
+  assert.ok(await waitFor(() => view.text().includes('读取失败')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /读取失败：连接失败/)
+
+  // 旧后端（还没有 rate_limits 这个段）不能把整页弄坏：三处都显示「未上报」，其它卡片照常
+  mode = 'missing'
+  await view.click('↻ 重新读取')
+  assert.ok(await waitFor(() => view.text().includes('这个后端还没有这一段')), `实际渲染：${view.text()}`)
+  assert.match(view.text(), /计数存放\s*（未上报）/)
+  assert.match(view.text(), /当前活跃桶\s*（未上报）/)
+  assert.match(view.text(), /配置体检通过/)
   assert.doesNotMatch(view.text(), /读取系统状态失败/)
   view.app.unmount()
 })

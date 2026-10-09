@@ -60,14 +60,19 @@ Retry-After: 213
 {"detail":"登录尝试过于频繁，请在 213 秒后重试"}
 ```
 
-**被拒的尝试也计数**（否则爆破方只要保证成功一次就能重置窗口），登录成功后该桶清零。
+**被拒的尝试不落库**（拒绝不是一次尝试——否则越被拒锁得越久，`decide()` 里是「凑够就提前返回」），
+登录成功后该桶清零。
+计数在 `rate_limit_hits`（`bucket` / `hit_at`）：**存逐次尝试的时间戳而不是一个计数**，
+多进程/多副本共享同一本账、重启不清零，同桶判定靠 `pg_advisory_xact_lock` 串行化；
+库不可用时是 fail-closed（报错，不静默放行）。运维入口是 `GET /system/status` 的 `rate_limits` 段。
 `AUTH_SECRET_KEY` 留空或仍是占位值 `change-this-secret-in-env` 时，进程启动会用 `secrets.token_urlsafe(48)`
 生成一个并**就地写回 `.env`**（保留其它行、不重复追加键）：占位密钥意味着任何人都能自己签一个合法 JWT。
 副作用是密钥一变，之前签发的 token 全部失效，客户端需要重新登录。
 
 ### 账号锁定与口令强度（落库的那一半）
 
-滑动窗口限流按「用户名 + 来源 IP」分桶，**换 IP 就能绕、多 worker 各记一份**，所以连续失败还会落库：
+滑动窗口限流按「用户名 + 来源 IP」分桶，**换 IP 就能重来**（分桶键里带来源，这是口径不是存储），
+所以连续失败还会落库，锁的是**账号**：
 
 - `users` 上三列：`failed_attempts`（`NOT NULL DEFAULT 0`）、`locked_until`、`last_failed_at`。
   配置项 `LOGIN_LOCKOUT_THRESHOLD=5`、`LOGIN_LOCKOUT_BASE_SECONDS=60`、`LOGIN_LOCKOUT_MAX_SECONDS=900`、
@@ -117,9 +122,15 @@ Retry-After: 42
 - 三组配额（`login` / `export` / `ai`）**互不影响**：登录被限流不影响看数据，导出打满也能继续问答。
 - `/export/scope` 是元数据（给按钮用的口径与上限），不占配额。
 - `EXPORT_LIMIT = 20000` 限制的是**单次**导出行数，与本表无关——它拦不住「脚本每分钟导 100 次」。
-- **429 不写审计**：一条被拒请求写一条审计等于给攻击者一个「用便宜请求写满审计表」的放大器；
+- **导出/问答的 429 不写审计**：一条被拒请求写一条审计等于给攻击者一个「用便宜请求写满审计表」的放大器；
   观测性里按 `429:路径` 计数，`GET /admin/overview` 的 `observability.requests` 能看到。
-- **边界**：与登录限流同一实现（`backend/ratelimit.py`，进程内滑动窗口、无 Redis），重启清零、不跨副本。
+  **登录的 429 是例外，它会留痕**（`user.login_blocked`）——「有人在打这个账号」本身就是证据，
+  值得一条记录；两类 429 的差别是有意的。
+- **计数落库（㉑）**：三组配额共用 `rate_limit_hits(bucket, hit_at)`，桶名 `配额名:分桶键`
+  （`export:张三`、`login:张三@10.0.0.9`）。记的是**逐次尝试的时间戳**，判定时按 `hit_at` 裁窗口，
+  所以是真滑动窗口而不是「一个计数 + 固定边界」；同桶判定用 `pg_advisory_xact_lock` 串行化，
+  避免两个并发尝试都读到最后一行然后各自放行。**跨进程/副本共享、重启不清零**，
+  库不可用时 fail-closed。运维入口：`GET /system/status` 的 `rate_limits`（只报聚合桶数，不给分桶键）。
 
 ### 慢接口告警（按路径耗时阈值）
 
@@ -480,7 +491,7 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 | --- | --- | --- |
 | GET | `/system/status` | 运行态汇总（前端页面 `/settings`） |
 
-返回 `{app,llm,database,embedding,rag,directories,data,me,config_problems}`：
+返回 `{app,llm,database,rate_limits,embedding,rag,directories,data,me,config_problems}`：
 
 - `app`：`env`/`is_development`/`strict_config`/`api_prefix`/`cors_origins`/`log_level`/`token_expire_minutes`/
   `business_timezone`——后者是 `{name,label,offset,now,today}`（如 `{"name":"Asia/Shanghai",
@@ -489,6 +500,10 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
   README「业务时区（`BUSINESS_TIMEZONE`）」）。老版本没有这个键，前端显示「（未上报）」而不是报错。
 - `llm`：`provider_configured`（**只报有没有配，不回显密钥**）、`base_url`、`model`、`rerank_model`。
 - `database`：`ok`/`error`/`version`/`url`（口令打码为 `user:***@host`）/`pgvector`。
+- `rate_limits`（㉑）：`{store, shared_across_processes, survives_restart, quotas, buckets}`——计数落在哪、
+  三组配额在不在、当前有多少个活跃分桶（`quotas` 就是「配置项现在是什么值」的机器可读版本，
+  改配置后这里立刻跟着变）。**只给聚合桶数，不给分桶键**：键里有用户名与来源 IP，而这个接口普通账号也能读。
+  库不可用时 `buckets` 是 `-1` 并带 `error`，而不是把这个健康检查接口自己打成 500。
 - `embedding`：`model`/`dimension`(384)/`using_fallback`。
 - `rag`：`max_distance`/`candidate_k`。
 - `directories[]`：`{name,path,configured,writable,error}`——`writable` 是真写一个探针文件再删的结果。

@@ -1234,10 +1234,10 @@ async def test_admin_departments_groups_rows_and_rejects_scoped_account(anon_cli
 
 async def test_login_is_rate_limited_by_username_and_source(anon_client):
     """连续失败到阈值后返回 429，并带 Retry-After；换一个用户名不受影响。"""
-    from backend.ratelimit import SlidingWindowLimiter, get_login_limiter, reset_login_limiter
+    from backend import ratelimit
 
     username = f"nobody_{uuid.uuid4().hex[:8]}"
-    reset_login_limiter(SlidingWindowLimiter(limit=2, window_seconds=60))
+    ratelimit.install_quota("login", 2, 60)
     try:
         for _ in range(2):
             response = await anon_client.post("/api/v1/auth/login",
@@ -1248,36 +1248,40 @@ async def test_login_is_rate_limited_by_username_and_source(anon_client):
         assert blocked.status_code == 429, blocked.text
         assert "重试" in blocked.json()["detail"]
         assert int(blocked.headers["Retry-After"]) >= 1
+        # 计数落在库里（㉑）：进程里的状态重启就没了，库里的尝试时间戳不会 ——
+        # 而且被拒的那几次**不落库**（拒绝不延长封锁），所以桶里正好是那两次 401。
+        hits = ratelimit.snapshot(prefix=f"login:{username}@")
+        assert len(hits) == 1 and hits[0]["hits"] == 2, hits
         # 限速是按「用户名 + 来源」分桶的，不能把别人一起锁住
         other = await anon_client.post("/api/v1/auth/login",
                                        json={"username": f"other_{uuid.uuid4().hex[:6]}",
                                              "password": "wrong-password-2026"})
         assert other.status_code == 401
     finally:
-        reset_login_limiter()
-    assert get_login_limiter().limit == get_settings().login_max_attempts
+        ratelimit.reset_quotas()
+    assert ratelimit.quota("login")[0] == get_settings().login_max_attempts
 
 
 async def test_login_limiter_resets_after_success(anon_client, credentials):  # noqa: ARG001
     """成功后清掉计数：否则正常用户偶尔敲错几次就会被自己的失败次数锁在门外。"""
-    from backend.ratelimit import SlidingWindowLimiter, reset_login_limiter
+    from backend import ratelimit
 
     username = f"reset_{uuid.uuid4().hex[:8]}"
     password = "pytest-login-2026"
     assert (await anon_client.post("/api/v1/auth/register",
                                    json={"username": username, "password": password})).status_code == 200
-    limiter = SlidingWindowLimiter(limit=3, window_seconds=60)
-    reset_login_limiter(limiter)
+    ratelimit.install_quota("login", 3, 60)
     try:
         for _ in range(2):
             wrong = await anon_client.post("/api/v1/auth/login",
                                            json={"username": username, "password": "wrong-pass-2026"})
             assert wrong.status_code == 401
+        assert ratelimit.tracked_buckets(prefix=f"login:{username}@") == 1
         ok = await anon_client.post("/api/v1/auth/login", json={"username": username, "password": password})
         assert ok.status_code == 200, ok.text
-        assert limiter.tracked_keys == 0
+        assert ratelimit.tracked_buckets(prefix=f"login:{username}@") == 0
     finally:
-        reset_login_limiter()
+        ratelimit.reset_quotas()
 
 
 def test_placeholder_auth_secret_is_replaced_and_persisted(tmp_path, monkeypatch):
@@ -3399,10 +3403,9 @@ async def test_transaction_list_period_filter_stays_sargable(anon_client, auth_h
 async def test_export_quota_returns_429_and_does_not_touch_ai(anon_client, auth_headers, stub_retrieval):
     """导出打满后返回 429 + Retry-After；问答配额是另一本账，不受影响。"""
     from backend import ratelimit
-    from backend.ratelimit import SlidingWindowLimiter
 
-    ratelimit.install_limiter("export", SlidingWindowLimiter(limit=2, window_seconds=60))
-    ratelimit.install_limiter("ai", SlidingWindowLimiter(limit=5, window_seconds=60))
+    ratelimit.install_quota("export", 2, 60)
+    ratelimit.install_quota("ai", 5, 60)
     try:
         for _ in range(2):
             ok = await anon_client.get("/api/v1/export/metrics", headers=auth_headers)
@@ -3417,20 +3420,21 @@ async def test_export_quota_returns_429_and_does_not_touch_ai(anon_client, auth_
         assert (await anon_client.post("/api/v1/rag/search", headers=auth_headers,
                                        json={"query": "奖金方案", "top_k": 5})).status_code == 200
         # 计数按账号分桶：本用例只写了当前账号 + 一个配额名，不写审计（429 写审计会被拿来放大）
-        assert ratelimit.get_limiter("export").tracked_keys == 1
+        assert ratelimit.tracked_buckets(prefix="export:") == 1
+        # 被拒的那两次（429）不落库，桶里就是那两次成功的导出
+        assert ratelimit.snapshot(prefix="export:")[0]["hits"] == 2
     finally:
-        ratelimit.reset_limiters()
+        ratelimit.reset_quotas()
 
 
 async def test_ai_quota_covers_search_answer_and_agent(anon_client, auth_headers, stub_retrieval, monkeypatch):
     """问答配额：/rag/search、/rag/answer、/ai/* 共用一本账，超限同样是 429 + Retry-After。"""
     from backend import ratelimit
-    from backend.ratelimit import SlidingWindowLimiter
 
     monkeypatch.setattr("backend.api_rag.generate_answer", lambda question, results: ("依据证据的回答", []))
     monkeypatch.setattr("backend.api_ai.rag_answer",
                         lambda question, **kwargs: {"answer": "依据证据的回答", "sources": []})
-    ratelimit.install_limiter("ai", SlidingWindowLimiter(limit=3, window_seconds=60))
+    ratelimit.install_quota("ai", 3, 60)
     try:
         first = await anon_client.post("/api/v1/rag/search", headers=auth_headers,
                                        json={"query": "奖金方案", "top_k": 5})
@@ -3449,7 +3453,36 @@ async def test_ai_quota_covers_search_answer_and_agent(anon_client, auth_headers
         # 导出不受影响
         assert (await anon_client.get("/api/v1/export/metrics", headers=auth_headers)).status_code == 200
     finally:
-        ratelimit.reset_limiters()
+        ratelimit.reset_quotas()
+
+
+async def test_rate_limit_counts_live_in_the_database_not_in_memory(require_database):  # noqa: ARG001
+    """㉑ 的核心承诺：计数在库里，多个 worker / 重启后共享同一本账。
+
+    这里刻意不走 HTTP：`consume()` 每次都用**自己的会话并立即提交**（和生产里一样），
+    所以第三次「另一个进程」读到的仍是同一个窗口 —— 换成进程内的 `deque`，多 worker 下
+    每个 worker 各算 10 次、重启清零，这条断言就会红。
+    """
+    from backend import ratelimit
+
+    key = f"restart_{uuid.uuid4().hex[:8]}@10.1.2.3"
+    ratelimit.install_quota("login", 2, 60)
+    try:
+        assert [ratelimit.consume("login", key).allowed for _ in range(2)] == [True, True]
+        third = ratelimit.consume("login", key)
+        assert third.allowed is False and third.retry_after >= 1
+        # 被拒的那次没落库：窗口里就是那两次尝试
+        rows = ratelimit.snapshot(prefix=f"login:{key}")
+        assert len(rows) == 1 and rows[0]["hits"] == 2, rows
+        # reset 只清这一个桶；purge 按前缀清（真机脚本与用例夹具靠它收拾现场）
+        assert ratelimit.reset("login", key) == 2
+        assert ratelimit.consume("login", key).allowed is True
+        assert ratelimit.tracked_buckets(prefix=f"login:{key}") == 1
+        assert ratelimit.purge(bucket_prefix=f"login:{key}") == 1
+        assert ratelimit.tracked_buckets(prefix=f"login:{key}") == 0
+    finally:
+        ratelimit.reset_quotas()
+        ratelimit.purge(bucket_prefix=f"login:{key}")
 
 
 async def test_quota_registry_reports_config_and_rejects_unknown_name():
@@ -3457,18 +3490,23 @@ async def test_quota_registry_reports_config_and_rejects_unknown_name():
     from backend import ratelimit
     from backend.config import get_settings
 
-    ratelimit.reset_limiters()
+    ratelimit.reset_quotas()
     try:
         with pytest.raises(KeyError):
             ratelimit.quota("nope")
+        with pytest.raises(KeyError):
+            ratelimit.install_quota("nope", 1, 1)
         settings = get_settings()
         assert ratelimit.quota("export") == (settings.export_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
         assert ratelimit.quota("ai") == (settings.ai_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
-        assert ratelimit.get_limiter("export") is ratelimit.get_limiter("export")
-        assert ratelimit.get_limiter("login") is ratelimit.get_login_limiter()
+        assert ratelimit.quota("login") == (settings.login_max_attempts, float(settings.login_window_seconds))
+        # 覆盖只换「上限 + 窗口」这两条策略，不动库里的计数（计数是事实，不是缓存）
+        assert ratelimit.install_quota("export", 1, 30) == (1, 30.0)
+        assert ratelimit.quota("export") == (1, 30.0)
+        assert ratelimit.all_quotas()["export"] == {"limit": 1, "window_seconds": 30.0}
     finally:
-        ratelimit.reset_limiters()
-    assert ratelimit.get_limiter("export").limit == get_settings().export_max_per_minute
+        ratelimit.reset_quotas()
+    assert ratelimit.quota("export") == (get_settings().export_max_per_minute, ratelimit.LIMIT_WINDOW_SECONDS)
 
 
 # ---------------------------------------------------- 季度/年度落库（financial_rollups）

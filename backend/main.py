@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-from backend import metrics, observability
+from backend import metrics, observability, ratelimit
 from backend.api_admin import router as admin_router
 from backend.api_agent import router as agent_router
 from backend.api_ai import router as ai_router
@@ -170,6 +170,13 @@ def _validate_config_on_startup() -> None:
         if index_gaps:
             logger.error("数据库索引与模型不一致，缺失：%s（检查 backend/migrations.py 的 INDEXES）",
                          "、".join(index_gaps))
+        # 限流计数表（㉑）随尝试增长，启动时扫一次过期行并报数：
+        # 没有任何地方会主动清它，日志里这一行是「表在长大还是被裁掉了」的唯一线索。
+        removed = ratelimit.purge_expired()
+        logger.info("限流计数：三组配额 %s；启动清扫删除过期尝试 %s 条",
+                    "、".join(f"{name}={limit}/{window:g}s" for name, (limit, window)
+                              in ((n, ratelimit.quota(n)) for n in ratelimit.NAMES)),
+                    removed)
     except Exception as exc:  # noqa: BLE001
         logger.error("schema 迁移失败（数据库可能不可用）：%s", exc)
 

@@ -4197,7 +4197,7 @@
     },
     "/api/v1/auth/login": {
       "post": {
-        "description": "登录。两道闸：按「用户名 + 来源」的进程内限流（见 backend/ratelimit.py），\n以及按**账号**的失败锁定 + 指数退避（落库，见 backend/lockout.py）。\n\n两道闸的 429 文案**故意一模一样**，且不回显「账号存在但被锁了」：否则拿 401 与 429 的\n差别就能问出哪些账号存在，这个接口就顺带成了用户名枚举接口。",
+        "description": "登录。两道闸：按「用户名 + 来源」的**出口限流**（落库共享，见 backend/ratelimit.py），\n以及按**账号**的失败锁定 + 指数退避（落库，见 backend/lockout.py）。\n\n两道闸的 429 文案**故意一模一样**，且不回显「账号存在但被锁了」：否则拿 401 与 429 的\n差别就能问出哪些账号存在，这个接口就顺带成了用户名枚举接口。",
         "operationId": "login_api_v1_auth_login_post",
         "requestBody": {
           "content": {

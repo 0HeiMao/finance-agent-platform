@@ -166,7 +166,8 @@ if BaseSettings is not None:
         auth_secret_key: str = DEFAULT_AUTH_SECRET_KEY
         # JWT 有效期改成可配置：原来硬编码 12 小时，改口径必须动代码。
         access_token_expire_minutes: int = 12 * 60
-        # 登录限流（进程内滑动窗口）：同一用户名+来源在窗口内超过次数就 429。
+        # 登录限流（滑动窗口）：同一用户名+来源在窗口内超过次数就 429。
+        # ㉑ 起计数落在 rate_limit_hits 表里（跨进程共享、不随重启清零），不再是进程内。
         login_max_attempts: int = 10
         login_window_seconds: int = 300
         # 登录失败锁定（账号级、落库）：连续失败到阈值才锁，锁定时长按 2 的幂增长并封顶。
