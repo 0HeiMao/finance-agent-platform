@@ -94,6 +94,9 @@ COLUMNS: list[tuple[str, str, str]] = [
     # ⑱ 跨进程执行权：谁正在跑这条任务（`jobs.WORKER_ID`）。可空 —— 老库里排队中/已结束的行
     # 本来就没有执行者，NULL 正是「没有进程持有它」。
     ("background_jobs", "worker_id", "VARCHAR(80)"),
+    # ㉒ 「用户点过停止」的事实：可空，NULL = 没点过。老库里挂着的 streaming 行补列后仍是 NULL，
+    # 读取时照旧算「已中断」——这正是它们本来的含义（没人写回终态），不能凭空说成「已停止」。
+    ("agent_messages", "stop_requested_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # 加列时顺带做一次的**数据**回填：(表名, 列名) → (为什么, SQL)。

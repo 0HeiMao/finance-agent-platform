@@ -1970,45 +1970,151 @@ def test_estimate_tokens_and_derive_title():
     assert len(long_title) == agent_sessions.TITLE_MAX and long_title.endswith("…")
 
 
-def test_effective_status_normalises_stale_streaming_only():
-    """进程崩了没人写回终态：挂太久的 streaming 读取时算「已中断」，终态原样返回。"""
+def test_effective_status_tells_a_user_stop_apart_from_a_crash():
+    """挂太久的 streaming 归一成终态，但两种挂法要分得开：用户点过停止 ≠ 进程崩了。
+
+    ㉒ 之前 `_STOP_EVENTS` 只在生成进程的内存里，进程一没这个事实就没了，两种挂法都是
+    「已中断」；现在标志位在 `stop_requested_at` 上，谁读都读得出用户当时点过停止。
+    """
     from backend import agent_sessions
 
     now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     fresh = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=5))
     stale = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=121))
     naive = SimpleNamespace(status="streaming", created_at=datetime(2026, 5, 1, 11, 0))
+    stopped = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=121),
+                              stop_requested_at=now - timedelta(seconds=119))
+    blank = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=121),
+                            stop_requested_at=None)
+    # 老库补列前的行没有这个属性：照旧算「从没点过」，不能凭空说成用户停的
+    legacy = SimpleNamespace(status="streaming", created_at=now - timedelta(seconds=600))
     done = SimpleNamespace(status="stopped", created_at=now - timedelta(days=3))
     unknown = SimpleNamespace(status="streaming", created_at=None)
 
     assert agent_sessions.effective_status(fresh, now) == "streaming"
     assert agent_sessions.effective_status(stale, now) == "interrupted"
     assert agent_sessions.effective_status(naive, now) == "interrupted"   # 无时区的库值按 UTC 读
+    assert agent_sessions.effective_status(stopped, now) == "stopped"
+    assert agent_sessions.effective_status(blank, now) == "interrupted"
+    assert agent_sessions.effective_status(legacy, now) == "interrupted"
     assert agent_sessions.effective_status(done, now) == "stopped"
     assert agent_sessions.effective_status(unknown, now) == "streaming"
 
 
-def test_stop_registry_keeps_early_stops_and_releases_events():
-    """停止请求可能比流先到：登记时要把早到的标志补上，生成结束必须能释放干净。"""
+def test_stop_signal_reads_the_database_on_a_beat(monkeypatch):
+    """库里的标志才是事实（㉒）：本地事件只是快路径，读库按节拍，不是每块一查。"""
+    from backend import agent_sessions
+
+    reads: list[int] = []
+    flag = {"stop": False}
+    monkeypatch.setattr(agent_sessions, "stop_requested",
+                        lambda message_id, db=None: reads.append(message_id) or flag["stop"])
+
+    agent_sessions.reset()
+    agent_sessions.set_poll_seconds(60)
+    try:
+        assert agent_sessions.poll_seconds() == 60
+        signal = agent_sessions.register(31)
+        assert signal.is_set() is False
+        assert reads == [31], "第一次检查必须读库：停止请求可能比第一块先到"
+        assert signal.is_set() is False
+        assert reads == [31], "节拍没到就不该再问库"
+
+        agent_sessions.set_poll_seconds(0)                     # 节拍调到「每次问」
+        assert signal.is_set() is False
+        assert reads == [31, 31]
+
+        flag["stop"] = True                                    # 另一个进程把标志写下去了
+        assert signal.is_set() is True
+        assert reads == [31, 31, 31]
+        assert signal.is_set() is True
+        assert reads == [31, 31, 31], "本地已经知道要停了，连库都不用问"
+
+        flag["stop"] = False
+        other = agent_sessions.register(32)                    # 新句柄的节拍从头开始
+        assert other.is_set() is False
+        assert reads == [31, 31, 31, 32]
+    finally:
+        agent_sessions.set_poll_seconds(None)
+        agent_sessions.reset()
+    assert agent_sessions.poll_seconds() == agent_sessions.STOP_POLL_SECONDS
+
+
+def test_stop_signal_keeps_generating_when_the_database_is_unreadable(monkeypatch, caplog):
+    """读不到库时不当作「用户要停」：取消是尽力而为的动作，不能因为一次查询失败掐掉回答。
+
+    与 ㉑ 的限流正好相反（那边必须 fail-closed）—— 那是授权闸门，读不到就得拒绝。
+    """
+    import logging as _logging
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from backend import agent_sessions
+
+    def boom(message_id, db=None):
+        raise SQLAlchemyError("连不上")
+
+    monkeypatch.setattr(agent_sessions, "stop_requested", boom)
+    agent_sessions.reset()
+    agent_sessions.set_poll_seconds(0)
+    try:
+        with caplog.at_level(_logging.WARNING, logger="backend.agent_sessions"):
+            signal = agent_sessions.register(41)
+            assert signal.is_set() is False
+            assert signal.is_set() is False
+        assert any("读停止标志失败" in record.getMessage() for record in caplog.records)
+
+        signal.set()                                           # 本进程内的快路径照旧生效
+        assert signal.is_set() is True
+    finally:
+        agent_sessions.set_poll_seconds(None)
+        agent_sessions.reset()
+
+
+def test_request_stop_writes_the_flag_on_the_streaming_row(db_session, monkeypatch):
+    """停止请求 = 往那一行写时间戳（不是生成中的行一个字节都不写），释放不动库里的标志。"""
+    from backend import agent_sessions
+
+    user = _agent_user(db_session)
+    _, _, assistant = agent_sessions.start_exchange(db_session, user, "成本率怎么了？")
+    message_id = assistant.id
+
+    assert agent_sessions.request_stop(db_session, message_id) is True
+    db_session.flush()
+    assert agent_sessions.stop_requested(message_id, db=db_session) is True
+    assert agent_sessions.is_stopped(message_id, db=db_session) is True
+    assert agent_sessions.active_count() == 0, "端点写的是库，不要求本进程里有生成器句柄"
+
+    agent_sessions.finish_exchange(db_session, assistant, content="算到一半", status="stopped")
+    assert agent_sessions.request_stop(db_session, message_id) is False, "终态行不再接受停止"
+    assert agent_sessions.request_stop(db_session, 999_999_999) is False, "不存在的行也不写"
+
+    agent_sessions.release(message_id)                          # 释放只清本地句柄
+    assert agent_sessions.stop_requested(message_id, db=db_session) is True, "终态行要留着这个事实"
+
+
+def test_stop_registry_is_idempotent_and_releases_every_signal():
+    """同一条回答反复登记拿同一个句柄；生成结束必须释放，否则注册表随问答数一直涨。"""
     from backend import agent_sessions
 
     agent_sessions.reset()
     try:
-        assert agent_sessions.request_stop(77) is False      # 还没登记：记下来，等登记时补
-        event = agent_sessions.register(77)
-        assert event.is_set() is True
-        assert agent_sessions.is_stopped(77) is True
-        assert agent_sessions.register(77) is event          # 幂等：同一条回答同一个事件
+        first = agent_sessions.register(77)
+        assert agent_sessions.register(77) is first
         assert agent_sessions.active_count() == 1
 
-        other = agent_sessions.register(78)
-        assert agent_sessions.request_stop(78) is True
-        assert other.is_set() is True
+        agent_sessions.register(78)
+        assert agent_sessions.active_count() == 2
 
         agent_sessions.release(77)
         assert agent_sessions.active_count() == 1
-        assert agent_sessions.is_stopped(77) is False
+        agent_sessions.release(77)                              # 重复释放不能炸
+        assert agent_sessions.active_count() == 1
         agent_sessions.release(78)
+        assert agent_sessions.active_count() == 0
+
+        agent_sessions.register(79)
+        agent_sessions.reset()
         assert agent_sessions.active_count() == 0
     finally:
         agent_sessions.reset()

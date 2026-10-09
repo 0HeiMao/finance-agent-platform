@@ -6,12 +6,14 @@
    的占位行，结束时（正常/被停/出错）才被写回正文与用量。落下占位行的意义是：
    回答还在流的时候，前端就有一个稳定的 `message_id` 可以拿来「停止」，
    而进程崩了也能在读取时看出一条「没写完的回答」。
-2. **停止生成 = 服务端标志位。** 客户端 `abort()` 只断开连接，服务端要等到下一块吐出、
-   写 SSE 失败时才知道——那期间模型还在跑、token 还在烧。所以停止做成一次显式的
-   `POST …/sessions/{id}/stop`：端点给这条回答的 `message_id` 置一个 `threading.Event`，
-   生成器每吐一块查一次，看到就收尾。
-   **这是单进程内存态**（与 ㉑ 之后的限流不同——那本账已经落库了，这里还没有）：多 worker
-   部署时停止只对该回答所在进程有效——要跨进程得换成 Redis 之类的共享介质，README 里写明了这个边界。
+2. **停止生成 = 服务端标志位（㉒ 起落库）。** 客户端 `abort()` 只断开连接，服务端要等到下一块
+   吐出、写 SSE 失败时才知道——那期间模型还在跑、token 还在烧。所以停止做成一次显式的
+   `POST …/sessions/{id}/stop`：端点把「用户点过停止」写进 `agent_messages.stop_requested_at`，
+   生成器**按节拍读库**、看到就收尾；同一进程里还有一条本地事件快路径（零查询）。
+   ⑮ 最初这只是一个进程内的 `threading.Event`，于是多 worker 部署时停止请求落在别的 worker 上
+   就等于没点（README 里当时把这条写成了已知边界）；㉒ 把事实搬进库里 —— 与 ⑱ 的任务执行权、
+   ㉑ 的限流计数同一个道理：**进程里的状态只是缓存，事实要在库里**。
+   附带的好处是重启后读得出区别：挂着不动的 streaming 有这一列就是「已停止」，没有才是「已中断」。
 3. **token 统计。** 模型报的用量记 `usage_source="api"`，按字数估的记 `"estimated"`，
    没调用模型（错误、或"没有证据"的固定文案）记 `None` 并把 token 记 0。
    把估算和账单混在一起报账等于自欺，界面上也分开显示。
@@ -22,15 +24,21 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend import biztime
 from backend.db import SessionLocal
 from backend.models import AgentMessage, AgentSession, User
+
+logger = logging.getLogger(__name__)
 
 ROLES = ("user", "assistant")
 ROLE_LABELS = {"user": "提问", "assistant": "回答"}
@@ -65,49 +73,140 @@ def open_session():
     return SESSION_FACTORY()
 
 
+@contextmanager
+def _session(db=None):
+    """有现成的会话就用它（端点），没有就开一条短的读完即关（生成器的读库节拍）。"""
+    if db is not None:
+        yield db
+        return
+    session = open_session()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------- 停止注册表
+#
+# ㉒ 起「用户点过停止」这件事的**事实**在 `agent_messages.stop_requested_at` 里，
+# 进程内的事件只是一条快路径（同一个 worker 上零查询地查到）。这样：
+#   ① 停止请求落在别的 worker 上也能生效（生成器按节拍读库，而不是只在本地事件里找）；
+#   ② 进程重启后，一条挂着的 streaming 有停止标志就显示「已停止」，没有才是「已中断」；
+#   ③ 不再需要 `_EARLY_STOPS` 那套「停止比流先到」的补记 —— 占位行在流开始前就落库了，
+#      「停止先到」就是这一列已经有值，生成器第一次检查（构造后立刻做，见 `_last_poll` 初值）
+#      就会读到它。
 
-_STOP_EVENTS: dict[int, threading.Event] = {}
-_EARLY_STOPS: set[int] = set()
+_STOP_EVENTS: dict[int, StopSignal] = {}
 _STOP_LOCK = threading.Lock()
+# 生成器隔多久回头看一眼库（秒）。1 秒是「停得够快」与「别把库问爆」之间的折中：
+# 真模型一次回答通常几十块、几秒到几十秒，1 秒的延迟用户感觉不到，而每块一查库没必要。
+STOP_POLL_SECONDS = 1.0
+_poll_seconds = STOP_POLL_SECONDS
 
 
-def register(message_id: int) -> threading.Event:
-    """登记一条正在生成的回答。已登记的返回同一个事件（幂等）。"""
-    with _STOP_LOCK:
-        event = _STOP_EVENTS.get(message_id)
-        if event is None:
-            event = threading.Event()
-            _STOP_EVENTS[message_id] = event
-            # 停止请求比流先到（前端在建会话后立刻点了停止）：登记时就把标志补上
-            if message_id in _EARLY_STOPS:
-                _EARLY_STOPS.discard(message_id)
-                event.set()
-        return event
+def poll_seconds() -> float:
+    return _poll_seconds
 
 
-def request_stop(message_id: int) -> bool:
-    """请求停止。返回 True 表示要么这条回答正在生成、要么停止请求已先记下。"""
-    with _STOP_LOCK:
-        event = _STOP_EVENTS.get(message_id)
-        if event is None:
-            _EARLY_STOPS.add(message_id)
+def set_poll_seconds(value: float | None) -> float:
+    """调节读库节拍（测试与真机脚本用；`None` = 还原默认值）。返回生效值。"""
+    global _poll_seconds
+    _poll_seconds = STOP_POLL_SECONDS if value is None else max(0.0, float(value))
+    return _poll_seconds
+
+
+def stop_requested(message_id: int, *, db=None) -> bool:
+    """库里的停止标志（㉒）。读不到行（已被删）也返回 False —— 没有事实就是「没点过」。"""
+    with _session(db) as session:
+        value = session.execute(
+            select(AgentMessage.stop_requested_at).where(AgentMessage.id == message_id)
+        ).scalar_one_or_none()
+    return value is not None
+
+
+class StopSignal:
+    """一条正在生成的回答的「该不该停」句柄：本地事件是快路径，事实在库里。
+
+    接口与 `threading.Event` 一致（只用了 `is_set()` 与 `set()`），生成器那边看不出区别。
+    **库读不出来时不把它当成"用户要停"**：取消是尽力而为的动作，一次查询失败不该把用户
+    正在等的回答掐掉——这与限流（㉑）必须 fail-closed 是两回事，那边是授权闸门，
+    读不到就必须拒绝；这边读不到只是这一拍没看见停止请求，下一拍再问。
+    """
+
+    def __init__(self, message_id: int):
+        self.message_id = message_id
+        self._event = threading.Event()
+        # 初值是 -inf：第一次检查一定读一次库，所以「停止比第一块先到」也能立刻生效
+        self._last_poll = float("-inf")
+
+    def set(self) -> None:
+        self._event.set()
+
+    def is_set(self) -> bool:
+        if self._event.is_set():
+            return True
+        now = time.monotonic()
+        if now - self._last_poll < poll_seconds():
             return False
-        event.set()
-        return True
+        self._last_poll = now
+        try:
+            if stop_requested(self.message_id):
+                self._event.set()
+        except SQLAlchemyError as exc:      # 库连不上/表还没建：这一拍当作没看见
+            logger.warning("读停止标志失败（这一拍当作没停）：message_id=%s %s",
+                           self.message_id, exc.__class__.__name__)
+        return self._event.is_set()
 
 
-def is_stopped(message_id: int) -> bool:
+def register(message_id: int) -> StopSignal:
+    """登记一条正在生成的回答。已登记的返回同一个句柄（幂等，且不重置读库节拍）。"""
     with _STOP_LOCK:
-        event = _STOP_EVENTS.get(message_id)
-        return bool(event is not None and event.is_set())
+        signal = _STOP_EVENTS.get(message_id)
+        if signal is None:
+            signal = StopSignal(message_id)
+            _STOP_EVENTS[message_id] = signal
+        return signal
+
+
+def request_stop(db, message_id: int) -> bool:
+    """请求停止（㉒）：把标志写进库里，同进程里顺手置一下本地事件。
+
+    返回 True 表示这条回答**此刻**确实还在 streaming、标志已经写下去；False 表示它已经
+    不在生成了（调用方应当如实告诉用户「已经结束了」，而不是回一个 stopped=true）。
+    **不 commit**：调用方（端点）用自己的请求会话提交，提交之后别的进程才看得见。
+    """
+    result = db.execute(
+        update(AgentMessage)
+        .where(AgentMessage.id == message_id, AgentMessage.status == "streaming")
+        .values(stop_requested_at=datetime.now(UTC))
+        .execution_options(synchronize_session=False)
+    )
+    if not result.rowcount:
+        return False
+    with _STOP_LOCK:
+        signal = _STOP_EVENTS.get(message_id)
+    if signal is not None:
+        signal.set()
+    return True
+
+
+def is_stopped(message_id: int, *, db=None) -> bool:
+    """本地事件（快路径）或库里的标志。测试与真机脚本用它判断"停下来了没有"。"""
+    with _STOP_LOCK:
+        signal = _STOP_EVENTS.get(message_id)
+    if signal is not None and signal._event.is_set():
+        return True
+    return stop_requested(message_id, db=db)
 
 
 def release(message_id: int) -> None:
-    """生成结束（不管什么结局）后必须调用，否则注册表会随问答数一直涨。"""
+    """生成结束（不管什么结局）后必须调用，否则注册表会随问答数一直涨。
+
+    **不动库里的标志**：终态行要留着它，读取时才能把「用户停的」与「进程崩的」分开
+    （`effective_status`）。本地句柄删掉不影响这件事。
+    """
     with _STOP_LOCK:
         _STOP_EVENTS.pop(message_id, None)
-        _EARLY_STOPS.discard(message_id)
 
 
 def active_count() -> int:
@@ -116,10 +215,9 @@ def active_count() -> int:
 
 
 def reset() -> None:
-    """清空注册表（测试与真机脚本收尾用）。"""
+    """清空本地注册表（测试与真机脚本收尾用）。库里的标志归 `agent_messages` 自己管。"""
     with _STOP_LOCK:
         _STOP_EVENTS.clear()
-        _EARLY_STOPS.clear()
 
 
 # ---------------------------------------------------------------- 小工具
@@ -150,7 +248,12 @@ def estimate_tokens(*texts: str) -> int:
 
 
 def effective_status(message: AgentMessage, now: datetime | None = None) -> str:
-    """读取时的状态：挂太久的 streaming 当成 interrupted（进程崩了没人写回终态）。"""
+    """读取时的状态：挂太久的 streaming 归一成终态 —— 是「用户停的」还是「进程崩的」看标志位。
+
+    ㉒ 之后两种挂法在库里是分得开的：`stop_requested_at` 有值 = 用户明确点过停止，
+    只是那一块之后再没有进程写回终态（多 worker、或重启）；没有值 = 进程崩了没人管。
+    都算 `interrupted` 会把用户自己要的停止说成故障。
+    """
     if message.status != "streaming":
         return message.status
     created = message.created_at
@@ -160,7 +263,7 @@ def effective_status(message: AgentMessage, now: datetime | None = None) -> str:
         created = created.replace(tzinfo=UTC)
     now = now or datetime.now(UTC)
     if now - created > timedelta(seconds=STREAMING_STALE_SECONDS):
-        return "interrupted"
+        return "stopped" if getattr(message, "stop_requested_at", None) is not None else "interrupted"
     return message.status
 
 
@@ -310,6 +413,9 @@ def message_payload(message: AgentMessage, now: datetime | None = None) -> dict:
         "total_tokens": int(message.total_tokens or 0),
         "usage_source": message.usage_source or "",
         "duration_ms": message.duration_ms,
+        # ㉒ 用户点过停止没有（事实在库里）。前端据此把「已停止」与「已中断」分开说，
+        # 真机脚本也用它断言「停止请求确实落到了行上」。
+        "stop_requested": getattr(message, "stop_requested_at", None) is not None,
         "created_at": message.created_at,
     }
 

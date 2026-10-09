@@ -153,7 +153,13 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
             sources += [{"name": x.source, "kind": "knowledge_base"} for x in docs]
             period = financial.get("period")
             knowledge_chunks = len(docs)
-            if not financial["has_data"] and not docs:
+            if event.is_set():
+                # 停止请求早于第一块（甚至早于这条流开始）就到了：一块都不吐，直接按 stopped 收尾。
+                # 这一拍一次模型都没调用，所以用量不按字数估（count_estimate=False 记 0），
+                # 否则「没花模型 token 的空回答」会在用量报表里凭空多出一笔估算。
+                status = "stopped"
+                count_estimate = False
+            elif not financial["has_data"] and not docs:
                 # 没有证据就不花模型的 token，直接把平台自己的话吐出去（用量记 0，见 _persist）
                 count_estimate = False
                 text = "当前知识库里没有相关材料，系统内也没有已导入的财务数据，请先导入数据或补充材料后人工复核。"

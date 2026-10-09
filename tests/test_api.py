@@ -5152,6 +5152,12 @@ async def test_agent_stop_marks_the_answer_stopped(anon_client, api_app, stub_re
             assert stopped.status_code == 200, stopped.text
             assert stopped.json() == {"session_id": session_id, "message_id": message_id,
                                       "stopped": True}
+            # ㉒ 事实落在那一行上：别的进程（另一个 worker、重启后的进程）读库就知道要停
+            from backend.models import AgentMessage
+
+            with real.SessionLocal() as db:
+                row = db.get(AgentMessage, message_id)
+                assert row.status == "streaming" and row.stop_requested_at is not None
         finally:
             gate.set()                                        # 用例早早失败时别把线程池挂死
         body = await asyncio.wait_for(task, timeout=20)
@@ -5167,9 +5173,68 @@ async def test_agent_stop_marks_the_answer_stopped(anon_client, api_app, stub_re
         assert answer["status"] == "stopped" and answer["status_label"] == "已停止"
         assert answer["content"] == "已经写了一半"
         assert answer["usage_source"] == "estimated" and answer["total_tokens"] > 0
+        assert answer["stop_requested"] is True                # 读取时说得清是用户停的
 
         again = await anon_client.post(f"/api/v1/ai/agent/sessions/{session_id}/stop", headers=headers)
         assert again.status_code == 409                       # 已经没有在生成的了
+
+
+async def test_agent_stop_before_the_first_chunk_wastes_nothing(anon_client, api_app,
+                                                               stub_retrieval, monkeypatch):
+    """停止请求比第一块先到：一块都不吐，也不用给模型付一次钱（量记 0，不是按字数估）。"""
+    import asyncio
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def evidence(db, question, scope):
+        entered.set()
+        assert release.wait(timeout=30), "测试没有放开闸门"
+        return {"has_data": False, "context": "", "sources": [], "period": None}
+
+    llm = _agent_llm(chunks=("不该出现的回答",), tokens=(12, 5))
+    monkeypatch.setattr("backend.api_ai.collect_financial_evidence", evidence)
+    monkeypatch.setattr("backend.api_ai.get_llm", lambda: llm)
+
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        created = await anon_client.post("/api/v1/ai/agent/sessions", headers=headers, json={})
+        session_id = created.json()["id"]
+
+        async def drive():
+            async with anon_client.stream("POST", f"/api/v1/ai/agent/chat/stream?session_id={session_id}",
+                                          headers=headers, json={"question": "成本率怎么了？"}) as response:
+                assert response.status_code == 200
+                return "".join([chunk async for chunk in response.aiter_text()])
+
+        task = asyncio.create_task(drive())
+        try:
+            for _ in range(1000):                              # 等生成器走到取证据那一步
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            assert entered.is_set(), "生成器没开始取证据"
+            stopped = await anon_client.post(f"/api/v1/ai/agent/sessions/{session_id}/stop",
+                                            headers=headers)
+            assert stopped.status_code == 200, stopped.text
+        finally:
+            release.set()
+        body = await asyncio.wait_for(task, timeout=20)
+
+        events = _agent_events(body)
+        assert _agent_text(events) == ""                       # 一块都没吐
+        assert events[-1][1]["status"] == "stopped"
+        assert llm.calls == [], "已经知道要停了，就不该再去调模型烧 token"
+
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{session_id}",
+                                        headers=headers)).json()
+        answer = detail["messages"][-1]
+        assert answer["status"] == "stopped" and answer["status_label"] == "已停止"
+        assert answer["content"] == ""
+        assert answer["stop_requested"] is True
+        assert answer["total_tokens"] == 0 and answer["usage_source"] == "", \
+            "一次模型都没调用，不该凭空记一笔估算用量"
 
 
 async def test_agent_endpoints_require_token_and_usage_scope(anon_client, api_app, auth_headers):

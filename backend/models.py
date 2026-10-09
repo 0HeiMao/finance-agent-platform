@@ -401,6 +401,11 @@ class AgentMessage(Base):
     # api / estimated（哪个都拿不到时是 None）
     usage_source: Mapped[str | None] = mapped_column(String(20))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
+    # 「用户点过停止」这件事的**事实**（㉒）：⑮ 起停止只是生成进程里的一个 threading.Event，
+    # 于是多 worker 部署时停止请求落在别的 worker 上就石沉大海（生成器看不到），进程重启后
+    # 也分不清一条挂着的 streaming 是「用户停了但没写完」还是「进程崩了」。落库之后：
+    # 生成器按节拍读这一列（本地事件只是快路径），重启后读取时也能如实显示「已停止」。
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

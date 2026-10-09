@@ -532,9 +532,9 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 | POST | `/ai/agent/chat/stream` | `{"question":"..."}` | SSE 流式；可用查询参数 `?session_id=<会话 id>` **接着已有会话问**（不带就按会话里的立场新起一条会话） |
 | GET | `/ai/agent/sessions?limit=&offset=` | — | 我的会话列表（倒序）：`{data,total,limit,offset,untitled}`，每行 `{id,title,display_title,scope,answers,total_tokens,created_at,updated_at}` |
 | POST | `/ai/agent/sessions` | `{"title"?: "..."}` | 显式建会话，成功 **201 且直接返回会话体（不裹 `data`）**；标题会压掉首尾空白，超过 120 字 → 422 |
-| GET | `/ai/agent/sessions/{session_id}` | — | 会话详情：`{data,messages,status_labels}`；**别人的会话与不存在的会话都 404** |
+| GET | `/ai/agent/sessions/{session_id}` | — | 会话详情：`{data,messages,status_labels}`；每条消息带 `status`/`status_label`/`stop_requested`（㉒：这条回答被用户点过停止就是 `true`）；**别人的会话与不存在的会话都 404** |
 | DELETE | `/ai/agent/sessions/{session_id}` | — | 删会话（连同它的消息）：`{"id","title","deleted_messages","deleted":true}`；别人的会话 404 |
-| POST | `/ai/agent/sessions/{session_id}/stop` | — | 停止正在生成的回答：`{"session_id","stopped":true,...}`；该会话当前**没有**正在生成的回答 → **409 `这个会话当前没有正在生成的回答`** |
+| POST | `/ai/agent/sessions/{session_id}/stop` | — | 停止正在生成的回答：**把 `stop_requested_at` 写到那一行上并立即提交**（㉒，跨 worker 也停得下来），返回 `{"session_id","message_id","stopped":true}`；该会话当前**没有**正在生成的回答、或那一行刚好收尾了 → **409 `这个会话当前没有正在生成的回答`**；别人的会话 404 |
 | GET | `/ai/agent/usage?days=30` | — | 我的用量：`{data,series,status_labels}`；`days` 取 1..365（越界 422） |
 
 流式响应为 `text/event-stream`：
@@ -564,10 +564,22 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 - **`start` 事件先于第一块 `delta`**：会话 id 与两条消息 id 在这时就交给前端了。前端若没显式建会话，
   就用这个 id 记住会话（后续追问带 `?session_id=`）；显式建过的会话沿用原来的 id。
 - **回答先落一行 `status="streaming"` 再调用模型**，所以生成中刷新页面能看到「生成中」。
-  进程被杀会留下孤儿行，读的时候按 `STREAMING_STALE_SECONDS = 120` 判成「已中断」（`effective_status()`），
-  库里那份不动。状态只有五个：`streaming` / `ok` / `stopped` / `error` / `interrupted`。
-- **停止生成是显式请求**，不是断开连接：`POST …/stop` 置标志位，生成器每块查一次，收尾时把已生成的正文
-  按 `status="stopped"` 落库并在 `done` 里回 `stopped: true`。没有正在生成的回答 → 409。
+  进程被杀会留下孤儿行，读的时候按 `STREAMING_STALE_SECONDS = 120` 判成终态（`effective_status()`），
+  库里那份不动；**判成哪一个看 `stop_requested_at`（㉒）**：有值（用户点过停止）读成「已停止」，
+  没有值（进程崩了没人管）读成「已中断」——把用户自己要的停止说成故障是错的。
+  状态只有五个：`streaming` / `ok` / `stopped` / `error` / `interrupted`。
+- **停止生成是显式请求**，不是断开连接：`POST …/stop` 把 `agent_messages.stop_requested_at`
+  写到那一行上（**立即提交**），生成器**按节拍回头读库**（`STOP_POLL_SECONDS = 1`，本地
+  `threading.Event` 只做快路径），收尾时把已生成的正文按 `status="stopped"` 落库并在 `done` 里回
+  `stopped: true`。
+  - 标志位**落库而不是只放在进程内存里**（㉒）：多 worker 部署时停止请求可能落在别的 worker 上，
+    重启后也要读得出「这条是用户停的、那条是进程崩的」。
+  - 409 有两种情形：会话里**没有**正在生成的回答；或者查出来的那一行还在 `streaming`、写下去时它
+    刚好收尾了（`rowcount = 0`）——**假装成功会让用户以为停下了**，所以宁可报 409。
+  - **读库失败时当作「没停」**（fail-open，日志留痕）：一次查询失败不该掐掉用户正在等的回答。
+    这与 ㉑ 的限流必须 fail-closed 是两回事——那是授权闸门，这是尽力而为的取消。
+  - 停止请求**早于第一块**到达时一块都不吐，并且这一拍不调用模型、`total_tokens` 记 0
+    （没有用量可估算，不凭空多记一笔）。
 - **token 两路记账，别把估算当账单**：最后一帧报了用量就是 `usage_source="api"`；被停止 / 出错拿不到用量，
   按 `CHARS_PER_TOKEN = 1.5` 折算为 `estimated`；一次模型都没调用则是 `free`。`data` 里三者分开计数
   （`api_answers` / `estimated_answers` / `free_answers`），`series` 是**含今天的 N 个自然日**（起点对齐
@@ -578,6 +590,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 - 令牌与数据范围的口径与其它接口一致（⑳ 起只认服务端记录，请求头不算）：会话的 `scope` 记的是提问时的口径快照；
   未分配部门的账号只检索得到没标部门的公共片段。
 - 完整前缀是 `/api/v1/ai/agent/...`（`backend/api_agent.py` 的 `prefix="/api/v1/ai"`），漏掉 `/ai` 会 404。
+- 真机验证：`scripts/verify_agent_stop.py`（真模型流式 + **真子进程**：父进程开着一条流，另起一个
+  全新 Python 解释器只连库往那一行写标志，父进程这条流随即以 `stopped` 收尾——全程没打过停止接口，
+  所以停它的确实是另一个进程；另验重启后「已停止」与「已中断」读得出来、跑完不留临时会话与临时行）。
+  `scripts/verify_agent_sessions.py` 与 `verify_agent_memory.py` 里那两次「生成中停止」走的仍是
+  本进程的 HTTP 路径。
 
 ### 多轮上下文（追问时模型看得见前几轮）
 

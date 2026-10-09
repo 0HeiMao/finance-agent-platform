@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下二十三个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第二十四个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下二十四个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第二十五个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -120,6 +120,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 
 | `verify_agent_sessions.py` | Agent 会话与用量 39 项（**每次跑两次真模型调用**：一次完整回答、一次生成中就停止）：显式建会话 201 且显示「未命名会话」、空会话详情带 `status_labels`、没有正在生成的回答时停止 409、匿名 401、`start`→`delta`→`done` 事件齐全且 `start` 带 `session_id`/`message_id`/`question_message_id`/`title`、**落库正文与流式正文一字不差**（实测 1883 字、19 秒）、`usage_source=api` 且 prompt+completion=total 与 done 一致、**第一块 delta 时占位行就已经在库里且 `status=streaming`**、停止请求在流结束前被受理（`stopped=true`）且下一块就收尾成 `done.status=stopped`、被停回答只留已生成的部分并按字数估算记账（`estimated`）、停止之后再停止 409、`days=1` 的 `series` 就是今天这一天（**这条曾抓到「跑着的后端还是旧进程」**）、`api/estimated/free` 三个计数相加等于回答数、`days=0`/`days=400`/`limit=0` 422、`/admin/agent-usage` 的 `by_user`（未受限账号显示「不受限」）/`by_status`、别人的会话读写都 404、部门受限账号看不到管理员会话但能看自己的用量（管理端点 403）、删会话回报 `deleted_messages` 并留 `agent_session.delete` 审计，跑完删临时会话与临时账号 |
 | `verify_agent_memory.py` | 多轮上下文 15 项（**真模型连问 8 轮 + 1 次生成中停止**，用临时不受限账号）：第一轮的 start/done 都带会话 id 且历史全 0（0 轮/0 条/0 tokens/未截断）、第一轮真调了模型（正文非空且 token>0）、第二轮历史变成 1 轮 2 条且 **★ 第一轮埋的随机口令原样出现在第二轮回答里**（这条才是"历史真送到上游"的证据，假模型会照抄、真模型不会）、逐轮历史轮数 `[0,1,2,3,4,5,6,6]` 单调递增、**第 7 轮刚攒满 6 对时 `truncated` 仍是 false、第 8 轮再多一对就翻成 true 且轮数停在 6**（`truncated` 的含义是"有更早的没带上"，不是"到上限了"）、每轮 `messages = turns × 2` 且估算 tokens ≤ 1500、8 轮问答全部落库且都是终态 `ok`、生成中停止被受理（200）后**被停的回答照样进下一轮上下文**（半截但写完了）、跑完临时会话与临时账号都清干净 |
+| `verify_agent_stop.py` | 停止生成的标志位落库 27 项（㉒，**真模型流式 + 真子进程**）：`agent_messages.stop_requested_at` 列与类型在库里（可空、老行是 NULL）、启动体检不点它的名 → 真机 HTTP：第一块 delta 时停止被受理（200 且 `message_id` 就是那行）→ **库里那一行立刻写着 `stop_requested_at`**、生成器下一块收尾成 `done.status=stopped`、详情里 `stop_requested=true` 且正文只留已生成部分、**再停 409**（终态行不再接受停止）、没有问题的空会话停止 409、匿名 401 / 别人的会话 404 → **跨进程（这才是「多 worker 也停得下来」的证据）**：父进程开着一条流，另起一个**全新 Python 解释器**（`--set-stop <id>`，只带 SQLAlchemy 连库、不经过后端进程）往那一行写下标志，父进程这条流随即以 `stopped` 收尾 —— 全程没打过停止接口，所以停它的确实是**另一个进程**；子进程再跑一次同一个 id 时报「已经不在生成」（`rowcount=0`）→ **重启后读得出区别**：直接插两条挂着的 `streaming` 行（`created_at` 三分钟前），带标志的读成「已停止」、不带标志的读成「已中断」，库里两份都不动 → 同一进程里重复登记拿同一个句柄、`release` 清不掉库里的标志、本地注册表跑完归 0 → 临时会话/临时账号/临时行清干净、演示账号 `failed_attempts`/`locked_until`/`token_version` 一字未动且仍能登录（可反复跑） |
 
 验证脚本会把自己的上传件写到临时子目录并在结束时删除，不会污染项目的 `data/uploads/`。
 
@@ -179,7 +180,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 297 项、前端 55 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 301 项、前端 55 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -364,7 +365,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **297** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**配额计数的判定与桶锁（㉑：`decide()` 是纯函数滑动窗口——边界是「早于窗口」而不是「恰好等于窗口」，凑够上限时 `retry_after` 按最早那条滑出窗口算且至少 1 秒；桶名 → advisory lock key 稳定、落在有符号 64 位内、与期间锁不撞号；配额注册表读配置且对未登记的名字显式报错）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+`tests/` 下三个文件共 **301** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**配额计数的判定与桶锁（㉑：`decide()` 是纯函数滑动窗口——边界是「早于窗口」而不是「恰好等于窗口」，凑够上限时 `retry_after` 按最早那条滑出窗口算且至少 1 秒；桶名 → advisory lock key 稳定、落在有符号 64 位内、与期间锁不撞号；配额注册表读配置且对未登记的名字显式报错）**/**停止信号与状态归一（㉒：`effective_status()` 把「用户点的停止」和「进程崩了」分开——带标志的挂起行读成「已停止」、不带的读成「已中断」、老行没有这一列时也读成「已中断」；停止信号按节拍读库——第一次一定读、节拍内不重复读、`set_poll_seconds(0)` 变成每次都读、库里有标志后本地就知道不再查；**读库失败按「没停」处理**（fail-open，另记一条告警）而本地显式 `set()` 仍然生效；`request_stop` 只写得中 `streaming` 那一行、终态行写不进、不存在的 id 写不进、`release` 清不掉库里的标志）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
 **多轮上下文（⑰）**：`history_for` 只收写完的成对问答（`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问整对丢掉）、超预算从最老的一整对开始丢（宁可少一轮不给半轮）、任一预算为 0 即关掉多轮、`truncated` 只表示「有更早的没带上」；`_messages` 的顺序是 system → 历史 → 本轮，历史里混进的 `system`/非法 role/空正文被丢掉且本轮的证据紧挨本轮提问；`stream` 透传 history 而位置参数不变（旧调用照旧）**、`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**、**`AGENT_HISTORY_MAX_TURNS` 默认 6、`AGENT_HISTORY_MAX_TOKENS` 默认 1500、两项为 0 是合法配置（= 关掉多轮）、负数进 `config_problems`**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -441,7 +442,9 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 别人的会话读与删都 404→**真实流式的整链路用例走真库 + 真会话**：`start` 事件给出会话与两条消息 id、
 正文与落库内容一字不差、`done.tokens` 三项自洽且 `usage_source="api"`、追问带 `?session_id=` 累积到同一条会话
 （`answers` 从 1 到 2、tokens 相加）且不覆盖已有标题、未知 `session_id` 404、
-生成期间占位行确实是 `streaming` 时停止请求被受理并在收尾时变成 `stopped`（正文只留已生成部分）、
+生成期间占位行确实是 `streaming` 时停止请求被受理、**那一行上立刻写下了 `stop_requested_at`**（㉒）
+并在收尾时变成 `stopped`（正文只留已生成部分）、
+**停止请求早于第一块时一块都不吐、`total_tokens` 记 0**（一次模型都没调用，不按字数估算，详见 `test_api.py`）、
 没有正在生成的回答时再停止是 409、四个会话/用量端点匿名 401 而部门受限账号看管理端点 403、看自己的用量照常
 （`days=0` → 422）→**多轮上下文（⑰）**：第一轮 `history_*` 全 0 且没截断、第二轮
 `history_turns=1` / `history_messages=2` / `history_tokens>0` 且模型假件收到的 `history` 正是第一轮那对问答、
@@ -618,7 +621,7 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 297 项 + 覆盖率门槛 |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 301 项 + 覆盖率门槛 |
 | `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 55 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
@@ -977,12 +980,23 @@ loading）、空数据（`.empty-state` + 去导入引导）、失败（`.error-
   「没有」与「不是你的」**），免得会话 id 变成探测他人提问的探针；跨用户的用量只在管理员端点看汇总。
 - **先写占位行，再调用模型**：回答一开始就是库里的一行 `status="streaming"`，所以生成中刷新页面能看到
   「生成中」，而不是等写完才出现。进程被杀留下的孤儿行不靠定时任务清理——**读的时候按
-  `STREAMING_STALE_SECONDS = 120` 判成「已中断」**（`effective_status()`），库里那份不动。
-- **停止生成是显式请求**（`POST /api/v1/ai/agent/sessions/{id}/stop`）：生成器每吐一块查一次标志位，
-  看到就收尾、把已经生成的正文按 `status="stopped"` 落库、`done` 事件里回 `stopped: true`。
+  `STREAMING_STALE_SECONDS = 120` 判成终态**（`effective_status()`），库里那份不动；判成哪一个看
+  `stop_requested_at`（㉒）：**有值就是「已停止」**（用户点过停止，只是那一块之后再没有进程写回终态），
+  **没有值才是「已中断」**（进程崩了没人管）。都算「已中断」会把用户自己要的停止说成故障。
+- **停止生成是显式请求**（`POST /api/v1/ai/agent/sessions/{id}/stop`）：生成器**按节拍回头读库**
+  （`STOP_POLL_SECONDS = 1`，同一进程里另有一条零查询的本地事件快路径），看到标志就收尾、
+  把已经生成的正文按 `status="stopped"` 落库、`done` 事件里回 `stopped: true`。
   前端「停止」必须**先打这个接口再 abort 本地流**：只 abort 的话服务端要到下一块才发现连接没了，
-  那期间模型仍在按 token 计费。没有正在生成的回答时返回 **409**（不是 500，也不是默默成功）。
-  进程内的停止标志位是 `threading.Event`，早到的停止请求会先记在 `_EARLY_STOPS` 里等生成器来取。
+  那期间模型仍在按 token 计费。没有正在生成的回答时返回 **409**（不是 500，也不是默默成功）——
+  包括「查出来还在生成、写下去时它自己刚好收尾了」这一瞬间，那也是 409，谎报 `stopped: true`
+  会让用户以为停下了。**停止请求连一块都还没吐就到达时一块都不吐**，并且这一拍不按字数估算用量
+  （一次模型都没调用，`total_tokens` 记 0，别在用量报表里凭空多一笔）。
+- **停止标志位是库里的 `agent_messages.stop_requested_at`（㉒）**，不是进程内存里的 `threading.Event`：
+  多 worker 部署时停止请求可能落在**别的 worker** 上，只有写进共享的库才停得下来；进程重启后
+  读得出「当时是用户停的」。端点写这一列后**立即提交**，生成器（另一条连接）才看得见；
+  同一个进程里顺手置一下本地事件，省掉那一拍查询。读库失败时**当作没停**（下一拍再问）——
+  取消是尽力而为的动作，一次查询失败不该把用户正在等的回答掐掉（与㉑的限流相反，
+  限流是授权闸门、读不到就必须拒绝）。这一列只增不改，终态行留着它。
 - **token 统计分两路，估算不当账单**：网关在最后一帧报了用量 → `usage_source="api"`（账单口径）；
   被停止 / 出错时拿不到用量，就按字数折算（`CHARS_PER_TOKEN = 1.5`）→ `usage_source="estimated"`。
   `GET /api/v1/ai/agent/usage?days=` 把两者分开计数（`api_answers` / `estimated_answers` /
@@ -1010,10 +1024,11 @@ loading）、空数据（`.empty-state` + 去导入引导）、失败（`.error-
 - **工作台 `/agent` 左侧是会话列表**（标题 + `N 问 · M tokens`、删除、近 7 天用量），回答下面挂
   `本回答 N tokens`；管理概览页多了一张 **Agent 用量卡**（`GET /api/v1/admin/agent-usage?days=7`，
   按用户列 token、逐日列出），它有自己的错误状态——**用量统计挂了不该把整页概览变成错误页**。
-- 真机验证是 `scripts/verify_agent_sessions.py`（39 项）与 `scripts/verify_agent_memory.py`（⑰，15 项，
-  见上表）；单测在 `tests/test_units.py`
-  （用量口径、估算与账单三种记账、状态归一、停止注册表）与 `tests/test_api.py`（真库整链路：
-  `tests/test_api.py` 里两个流式用例走**真库 + 真会话**，因为流式落库在 Starlette 的线程池里另开会话，
+- 真机验证是 `scripts/verify_agent_sessions.py`（39 项）、`scripts/verify_agent_memory.py`（⑰，15 项）
+  与 `scripts/verify_agent_stop.py`（㉒，见上表）；单测在 `tests/test_units.py`
+  （用量口径、估算与账单三种记账、状态归一、**停止信号的读库节拍与读不到库时不当作要停（㉒）**）
+  与 `tests/test_api.py`（真库整链路，含**停止请求早于第一块时一块都不吐且不记估算用量**：
+  `tests/test_api.py` 里那几个流式用例走**真库 + 真会话**，因为流式落库在 Starlette 的线程池里另开会话，
   外层事务的 savepoint 里未提交的占位行它看不见）。踩过的坑：agent 端点的完整前缀是
   `/api/v1/ai/agent/...`（`api_agent.py` 的 `prefix="/api/v1/ai"` 再加 `"/agent/…"`），少写 `/ai` 全都 404。
 

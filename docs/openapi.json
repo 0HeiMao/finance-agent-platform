@@ -3558,7 +3558,7 @@
     },
     "/api/v1/ai/agent/sessions/{session_id}/stop": {
       "post": {
-        "description": "停止正在生成的回答。\n\n只置一个服务端标志位，**不等它写完**：生成器每吐一块查一次，看到就收尾并把已经生成的\n正文按 `status=\"stopped\"` 落库（前端的 abort 只断开连接，服务端要到下一块才发现，\n那期间模型还在烧 token，所以停止必须是显式请求）。",
+        "description": "停止正在生成的回答（㉒ 起落库）。\n\n只写一个标志位、**不等它写完**：生成器按节拍读 `agent_messages.stop_requested_at`，\n看到就收尾并把已经生成的正文按 `status=\"stopped\"` 落库（前端的 abort 只断开连接，\n服务端要到下一块才发现，那期间模型还在烧 token，所以停止必须是显式请求）。\n\n这一列就是「用户点过停止」的**事实**，所以停不下来的情况只有一种：这条回答已经不在生成。\n那种情况下这里回 409，而不是回一个 `stopped=true` —— 假装成功会让用户以为停下了。",
         "operationId": "stop_agent_session_api_v1_ai_agent_sessions__session_id__stop_post",
         "parameters": [
           {

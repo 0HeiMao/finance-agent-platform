@@ -83,17 +83,24 @@ def delete_agent_session(session_id: int, user: User = Depends(current_user),
 
 @router.post("/agent/sessions/{session_id}/stop")
 def stop_agent_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """停止正在生成的回答。
+    """停止正在生成的回答（㉒ 起落库）。
 
-    只置一个服务端标志位，**不等它写完**：生成器每吐一块查一次，看到就收尾并把已经生成的
-    正文按 `status="stopped"` 落库（前端的 abort 只断开连接，服务端要到下一块才发现，
-    那期间模型还在烧 token，所以停止必须是显式请求）。
+    只写一个标志位、**不等它写完**：生成器按节拍读 `agent_messages.stop_requested_at`，
+    看到就收尾并把已经生成的正文按 `status="stopped"` 落库（前端的 abort 只断开连接，
+    服务端要到下一块才发现，那期间模型还在烧 token，所以停止必须是显式请求）。
+
+    这一列就是「用户点过停止」的**事实**，所以停不下来的情况只有一种：这条回答已经不在生成。
+    那种情况下这里回 409，而不是回一个 `stopped=true` —— 假装成功会让用户以为停下了。
     """
     session = _session_or_404(db, user, session_id)
     message = agent_sessions.streaming_message(db, session.id)
     if message is None:
         raise HTTPException(409, "这个会话当前没有正在生成的回答")
-    agent_sessions.request_stop(message.id)
+    if not agent_sessions.request_stop(db, message.id):
+        # 查出来还在生成、写下去却不在生成了：这一瞬间它自己收尾了。如实说不，别谎报
+        db.rollback()
+        raise HTTPException(409, "这个会话当前没有正在生成的回答")
+    db.commit()
     return {"session_id": session.id, "message_id": message.id, "stopped": True}
 
 
