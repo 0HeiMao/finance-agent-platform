@@ -85,8 +85,8 @@
 
 ## 回归与演示脚本
 
-`scripts/` 下十八个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
-（第十九个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
+`scripts/` 下二十一个验证脚本都是**真 PostgreSQL + 真 ASGI 接口**，跑完自行回滚或清理
+（第二十二个 `verify_ci_workflow.py` 不碰数据库，它核对的是 CI 配置本身，见「持续集成」一节；
 另外两个 `check_coverage.py` / `check_frontend_coverage.py` 是覆盖率门槛，见「覆盖率门槛」一节；
 `check_openapi_snapshot.py` 也不碰数据库，它比的是「代码里的接口」与仓库里冻结的那一份，见「接口契约快照」一节；
 `check_visual_baseline.py` 只在本地跑，它比的是首屏像素与仓库里的基线截图，见「截图基线视觉回归」一节；
@@ -107,6 +107,7 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_recalc_lock.py` | 并发重算互斥（期间锁）18 项：锁 key 稳定/不撞号/在 bigint 内、月会连季与年一起锁且按名字排序、起始干净（无数据无残留锁）、**进程外一条真连接持锁时另一个事务真的被挡住**（`SET LOCAL lock_timeout='400ms'` 必报 lock timeout）、另一年不被挡、同年不同季共享年锁而不同年份零共享、持锁方提交/回滚都自动释放、真机 HTTP：无竞争重算 32 ms → 有人持锁 2031 ms（持锁 2000 ms）、导入与单行更正同样被挡且指标随后等于明细之和、两个并发重算都 200 且不丢更新、跑完 0 条残留 advisory 锁 |
 | `verify_session_revocation.py` | 会话版本号与强制下线 22 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、部门受限账号 403、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
 | `verify_job_retry.py` | 后台任务幂等与重试 31 项，**分两阶段跑**（「重启之后会怎样」没法在一个进程里验，所以第一阶段埋现场后要重启后端，再跑 `--phase 2`）：无键去重复用队列里那条且 `payload.ip` 不参与指纹、`Idempotency-Key` 提交/同键重放拿回同一条（**成功过的任务重放仍回那条**，批次已被删也不是 404）、换个键拿 404、201 字符的键 422、真库部分唯一索引的 `indexdef` 与「直接插第二条同键」抛 `UniqueViolation`、失败任务第 4 次尝试要等 16 秒退避才回队列且 `next_attempt_at` 真在将来、`job.retry` 审计带 `previous_error`、重试未知任务 404 / 重试非失败状态 409、重启日志里的「启动接续」与埋下的 `running` 残骸被接续跑完（`attempts` 1→2、批次那 3 行真被删），跑完清掉探针批次与验证产生的任务行 |
+| `verify_job_claim.py` | 后台任务跨进程执行权 23 项（⑱）：任务锁 key 稳定/不撞号/在 bigint 内且与接续锁、期间锁三族互不撞、起始干净（`worker_id` 列已建好、0 条残留 advisory 锁）、**两个真 Python 子进程（`--worker` 自调用，都走生产路径 `run_job(job_id)`）同时抢同一条 `queued` 任务 → 处理函数只跑了 1 遍**（计数文件 1 行，一个 `ran` 一个 `skipped`）、任务收在 `succeeded` 且 `attempts` 只加了 1、`worker_id` 又清空、`result.ran_by` 就是赢的那个进程、running 的任务 `claim` 返回 `None` 且 `attempts` 不变（`run_job(db=…)` 再走一遍也不重复执行）、`claim(不存在的 id)` 返回 `None`、**真有人持执行权锁的那条进 `still_running` 原样不动，只有锁是空的（进程已死）才被重排并清空 `worker_id`/`started_at`**、锁的连接一关（进程真的没了）那条才被重排、**池化连接 `close()` 之后锁还在**（所以执行权只能显式解锁，不能靠关连接——本脚本首跑就是栽在这个池子假象上，4 个 FAIL 全是它）、别人正在接续时本进程 `skipped=True` 一个字都不改、接续锁释放后同一个函数立刻能干活（不是被永久锁死）、真机 HTTP：`GET /admin/jobs` 每行都带 `worker_id`、导入 2097 小批次 → `POST /admin/jobs/batch-revert` 202 → 轮询看到 `running` 那一刻写着执行它的进程、最终 `succeeded` 且 `worker_id` 清空，跑完 0 条残留 advisory 锁且演示明细 8909 行一行没动 |
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
 | `verify_backup_restore.py` | 备份与恢复 29 项：真库打一份归档（9 张表 9928 行 + 上传件）→ `verify` 只对着归档自检（每张表一个 `COPY` 成员、sha256 一个个重算、`.env`/`data/models`/`data/index` 都不在里面且排除理由写在 manifest 里）→ **恢复进临时库 `finance_restore_check`**（先用不带 `--yes` 的一次预演确认「预演之后临时库仍然不存在」，再真恢复）→ 逐表 `count(*)` 与活库对平、`vector` 列 5 行全非空且维度 384、序列已推到 `max(id)` 之后、恢复出的表能真查 → 上传件往返（写探针 → 备份 → 删 → 恢复到 `output/_restore_uploads` → 字节级一致，且**没有**写回真实 `data/uploads`）→ 三个负例该红的都红（改一个数据字节 → `verify` 点名 sha256；清单里多一列 → 恢复拒绝并点名这一列；清单 sha256 改坏 → 恢复拒绝）→ 同一个归档可反复恢复 → 跑完删临时库、探针文件与探针归档，**全程不动演示库 `finance`** |
 | `verify_security_headers.py` | 安全响应头 + GZip + 请求 id 29 项：正常响应与 404 都带四个静态头与严格 CSP、请求 id 合规则原样回传（128 位边界）而超长/带空格/带分号一律换成 32 位、**响应里那个 id 能在后端日志里 grep 到**（每次跑换新 id，否则上一轮那条会让这项假绿）、`/docs`/`/redoc`/`/openapi.json` 换成文档 CSP、HSTS 只在 `X-Forwarded-Proto: https`（或 `https, http`）时出现、`/openapi.json` 与 CSV 导出**真被压**且解压后与 `Accept-Encoding: identity` 那份 JSON 相等（用 `iter_raw()` 数网线上真实字节，`content` 是解压后的）、同样 8909 行的 xlsx 导出**不压**、SSE 没被压且仍按 chunked 传（带不带 gzip 收到的字节一致）、500 也带请求 id 与安全头（它绕过所有中间件，是处理器自己补的）。静态头期望值**写死在脚本里**、不从 `backend.http_headers` import —— 否则常量被改错时脚本跟着一起错。跑一次消耗 3 次导出配额 |
@@ -175,7 +176,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 279 项、前端 49 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 284 项、前端 51 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -359,7 +360,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **279** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+`tests/` 下三个文件共 **284** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
 **多轮上下文（⑰）**：`history_for` 只收写完的成对问答（`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问整对丢掉）、超预算从最老的一整对开始丢（宁可少一轮不给半轮）、任一预算为 0 即关掉多轮、`truncated` 只表示「有更早的没带上」；`_messages` 的顺序是 system → 历史 → 本轮，历史里混进的 `system`/非法 role/空正文被丢掉且本轮的证据紧挨本轮提问；`stream` 透传 history 而位置参数不变（旧调用照旧）**、`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**、**`AGENT_HISTORY_MAX_TURNS` 默认 6、`AGENT_HISTORY_MAX_TOKENS` 默认 1500、两项为 0 是合法配置（= 关掉多轮）、负数进 `config_problems`**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -383,7 +384,13 @@ $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 失败按 2/4/8… 秒退避自动重排（`next_attempt_at` 有值才算在等）、重跑时「一行都没删」判成功并标
 `already_reverted`（审计里第二条 `batch.revert` 记 `deleted_rows: 0`）、人工重试只认 failed 且
 **追加**一份预算（原失败原因保留、留 `job.retry` 审计）、重启接续把 queued/running 放回队列
-（预算用完或类型已注销才判失败）、非管理员 403→**结构漂移**：模型里的列都在真库里
+（预算用完或类型已注销才判失败）→**多进程抢占（⑱）**：`claim` 对 `queued` 任务成功一次即写
+`worker_id`/`attempts`/`started_at`（并清掉 `next_attempt_at`），**第二次 `claim` 返回 `None` 且 `attempts` 不变**、
+对 already-running 的任务直接 `None`、对不存在的 id 也是 `None`（不抛异常）；执行权锁是真 DB 会话锁
+（第二个连接抢不到、同连接重入两次要放两次、连接关了才放开——用例用 `NullPool` 连接模拟「另一个进程」）；
+别人持着执行权锁时 `run_job(job_id)` 走不到处理函数；接续时**持锁的 `running` 行原样进 `still_running`**、
+只有锁是空的才被重排并清空 `worker_id`；接续全局锁被别的进程持着时返回 `{"skipped": true}` 且一个字都不改、非管理员 403→
+**结构漂移**：模型里的列都在真库里
 （漏写 `migrations.COLUMNS` 时点名，而不是等接口 500）、模型里声明的索引也都在真库里且列顺序不变
 （漏写 `migrations.INDEXES` 时点名）、明细接口发出的 SQL 里期间过滤是区间比较而不是 `to_char`（抓真实
 执行的 SQL 断言）、**从零建的库也建得全**：子进程里只导入 `backend.migrations` 时 `document_chunks`
@@ -442,7 +449,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
-44 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
+51 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
@@ -453,7 +460,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
-- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（17 项）：
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（23 项）：
   `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
   `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
   `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
@@ -472,6 +479,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
   覆盖的是**行为而不是快照**：分页守卫（末页再点不发事件）、口径切换器写进请求参数、
   导出提示取自响应头、侧边栏高亮、Agent 的 SSE 流与错误重试、后台任务失败行点「重试」打的是
   `POST /admin/jobs/{id}/retry`、被后端去重时提示的是「没有重复提交」而不是「已提交」、
+  运行中的后台任务要写出「运行进程：…」而队列中的不许写（⑱）、
   预警外发页点「测试」打的是 `POST /admin/alert-channels/{id}/test` 并把失败原因写回「最近结果」、
   「补发通知」用 `{"period": ""}` 触发台账重读、台账筛选带 `status=` 且行内「重发」打到
   `POST /admin/alert-deliveries/{id}/retry`。
@@ -590,8 +598,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 279 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 49 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 284 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 51 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -906,7 +914,7 @@ Prometheus 的基数撑爆，而被撑死的是监控不是接口。真机验证
 | `/agent` | 财务分析 Agent 工作台（示例问题 + 流式问答 + 依据） | `POST /ai/agent/chat/stream`（SSE） |
 | `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild` |
 | `/admin/users` | 用户管理（按用户名/部门/是否受限筛选、分页、改部门、删除） | `GET/PATCH/DELETE /admin/users[/{id}]` |
-| `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务：第几次尝试、失败可**重试**） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs`、`POST /admin/jobs/{job_id}/retry` |
+| `/admin/batches` | 导入批次（分页、查看、**异步**撤销并重算受影响期间 + 最近后台任务：第几次尝试、**谁在跑**（⑱ 运行中显示 `worker_id`）、失败可**重试**） | `GET /admin/batches`、`DELETE /admin/batches/{batch}`、`POST /admin/jobs/batch-revert`、`GET /admin/jobs`、`POST /admin/jobs/{job_id}/retry` |
 | `/admin/knowledge` | 知识库管理（按来源模糊搜/文档类型筛选、分页、整份删除） | `GET/DELETE /admin/knowledge` |
 | `/admin/departments` | 部门权限（账号绑部门、各部门数据规模） | `GET /admin/departments`、`PATCH /admin/users/{id}` |
 | `/admin/alert-rules` | 预警规则（改阈值/级别/开关/描述；按部门、按期间分档） | `GET /admin/alert-rules`、`POST /admin/alert-rules`、`PUT /admin/alert-rules/id/{id}`、`DELETE /admin/alert-rules/id/{id}`、`PUT /admin/alert-rules/{alert_type}`（只改默认规则） |
@@ -1254,10 +1262,18 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   会传给 `batch_ops.revert_batch(..., allow_missing=...)`：第一次跑时「一行都没删」是真异常（批次不存在
   或已被别人撤销），重跑时同样的情形说明**上次已经把活干完了**，于是判成功并在 `result` 里标
   `already_reverted: true`，而不是让一个已经完成的任务永远显示失败。
-- **重启接续**：进程重启时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running` 放回队列接着跑
-  （`error = 进程重启，任务已重新排队（下次是第 N 次尝试）`），并且**保留**已经用掉的尝试次数；
+- **重启接续（⑱ 起跨进程安全）**：进程重启时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running`
+  放回队列接着跑（`error = 进程重启，任务已重新排队（下次是第 N 次尝试）`），并且**保留**已经用掉的尝试次数；
   只有两种情况判失败：预算已用完（`error` 里点名用了几次），或者这个 `kind` 已经没有处理函数了
   （代码删了、库里还留着行）。放回队列的任务会立刻被调度一次，所以重启后不需要人工去点。
+  **⑱ 的两道护栏**：① 只重排「真的没人跑」的任务——每条任务的执行权由一把 Postgres **会话级 advisory 锁**代表，
+  接续时先探一下这把锁，抢得到说明持有它的进程已经死了（连接断开、锁由数据库释放）→ 才重排并清空
+  `worker_id`/`started_at`；抢不到说明那个副本还活着 → 原样不动，只列进返回值的 `still_running`。
+  以前这里一律重排，于是第二个副本一启动就把别人的活又排了一遍。② 接续本身也用一把全局锁串行化，
+  抢不到的副本直接返回 `{"skipped": true}`、一个字都不改。执行入口同理：`jobs.run_job(job_id)` 先抢执行权锁，
+  抢不到就安静跳过；抢到后再用**条件 UPDATE**（`WHERE id=… AND status='queued'`）把行改成 `running`，
+  `rowcount != 1` 就当没抢到——所以「两个进程同时拿到同一条任务」在数据库那一层就不可能发生，
+  `attempts` 也只会加一次。`worker_id` 字段记着「谁在跑」，跑完/判失败/放回队列都会清空。
 - **人工重试**：`POST /admin/jobs/{job_id}/retry`（只认 `failed`，其它状态 409）把任务放回队列并
   **追加**一份预算（`max_attempts = attempts + 3`），不把 `attempts` 归零 —— 归零会让重跑被当成
   「第一次尝试」，正好丢掉「上次可能已经做完了」这个信息。上次的失败原因保留在 `error` 里，
@@ -1267,9 +1283,13 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
 - **撤销逻辑只有一份**：同步的 `DELETE /admin/batches/{batch}` 与后台任务都调
   `backend/batch_ops.revert_batch()`——删除、重算、审计写在同一个事务里，撤销到一半不会留下
   「明细没了、指标还在」的幽灵报表。
-- **单进程内存队列的边界**：多副本部署要换成外部队列。`BackgroundTasks` + `threading.Timer` 只在这一个
-  进程里有意义（重试定时器重启即丢，靠启动接续补回来；但两个副本会各自接续同一批任务），
+- **单进程派发的边界（⑱ 收窄）**：多副本部署仍要换成外部队列，但**抢占与接续本身已经跨进程安全**——
+  执行权锁 + 条件 UPDATE 保证同一条任务只会被一个副本执行一次，接续只会重排真的没人跑的任务，
+  且同一时刻只有一个副本在接续。剩下的边界是：`BackgroundTasks` + `threading.Timer` 只在**提交任务的那个进程**
+  里有意义（任务不会漂到其它副本去跑，重试定时器重启即丢，靠启动接续补回来），
   所以这条约束写进了代码 docstring 与本节。
+- **前端看得见「谁在跑」**：`/admin/batches` 的任务行在 `running` 时会多写一行 `运行进程：<worker_id>`
+  （`worker_id` 形如 `主机名-pid-随机串`）。它是排障用的——多副本下能一眼确认这条任务归哪个副本。
 - 前端 `/admin/batches` 提交后按 800ms 轮询任务状态，撤销中的批次按钮变成「撤销中…」并禁止重复提交；
   页面下方列出最近 5 条任务（类型/状态/第几次尝试/提交人/耗时/结果），失败的行有「重试」按钮，
   排队等退避的行把 `next_attempt_at` 显示在结果列的 tooltip 里。
@@ -1278,6 +1298,10 @@ Redis（连 `redis` 包都没装），broker 与 worker 都不存在，而且 `r
   「启动接续：N 条未完成的后台任务已重新排队」），第二阶段再确认那条残骸被接续跑完（`attempts` 从 1 涨到 2、
   批次的行真的被删掉）。这条链路里「重启」是脚本自己造不出来的前提，所以立项时就按两阶段设计，
   而不是把重启之后的断言删掉。
+- **真机验证（⑱）**：`scripts/verify_job_claim.py`（23 项）**起两个真 Python 子进程抢同一条任务**——
+  两个子进程都走生产路径 `run_job(job_id)`（不传 db），谁真跑到处理函数由计数文件数出来（1 行才算对）。
+  另有一条检查专门把「池化连接 `close()` 之后锁还在」固定成事实：执行权只能显式 `pg_advisory_unlock`，
+  不能指望关连接。跑法见上表。
 
 ### 安全收口
 

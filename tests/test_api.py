@@ -2535,6 +2535,165 @@ async def test_jobs_list_filters_and_restart_resume(anon_client, api_app, auth_h
         assert isinstance(db_session.get(BackgroundJob, job.id), BackgroundJob)
 
 
+async def test_job_claim_is_atomic_and_refuses_a_running_job(anon_client, auth_headers, db_session):
+    """⑱ 抢占是原子的：`queued → running` 只发生一次，第二个抢的人什么都不改。"""
+    from backend import jobs
+    from backend.models import BackgroundJob
+
+    job, created = jobs.submit(
+        db_session, "batch.revert", {"batch": f"pytest-claim-{uuid.uuid4().hex}"}, actor="pytest"
+    )
+    assert created
+
+    claimed = jobs.claim(db_session, job.id)
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.attempts == 1
+    assert claimed.worker_id == jobs.WORKER_ID
+    assert claimed.started_at is not None and claimed.next_attempt_at is None
+
+    # 输的那一方：同一个 `queued` 条件已经不再成立，`rowcount == 0` → 它不会去跑这条任务。
+    # 关键断言是 attempts **没有**被加第二次 —— 加了就说明两个进程都认为自己抢到了。
+    assert jobs.claim(db_session, job.id) is None
+    assert db_session.get(BackgroundJob, job.id).attempts == 1
+
+    # 已经在跑的（或已经跑完的）任务不会被 `run_job` 再跑一遍：
+    # ⑱ 之前判的是「在不在 ACTIVE_STATUSES 里」，`running` 也在其中 → 同一个任务被并发跑两遍。
+    job.status = "running"
+    db_session.flush()
+    jobs.run_job(job.id, db_session)
+    assert db_session.get(BackgroundJob, job.id).attempts == 1
+
+    # 不存在的任务同样安静返回
+    assert jobs.claim(db_session, 99999999) is None
+
+
+async def test_job_claim_lock_is_a_real_cross_process_lock(anon_client, auth_headers):
+    """⑱ 执行权锁是**全库**可见的会话级锁：别的连接抢不到；同一连接可重入，重入几次就要放几次。"""
+    from backend.db import engine
+    from backend.locks import job_lock_key, release_session_lock, try_session_lock
+
+    # 负数 key：绝不会和真实任务 id（自增正数）撞号
+    key = job_lock_key(-12345)
+    with engine.connect() as first:
+        assert try_session_lock(first, key) is True
+        with engine.connect() as second:
+            # 另一个会话（= 另一个进程）抢不到 —— 这就是「这条任务已经有人在跑」的判据
+            assert try_session_lock(second, key) is False
+            # 而且它没资格解锁：`pg_advisory_unlock` 对自己不持有的锁返回 false
+            assert release_session_lock(second, key) is False
+        # 同一会话里再抢一次是重入（计数 +1），所以下面要放两次才真的空出来
+        assert try_session_lock(first, key) is True
+        assert release_session_lock(first, key) is True
+        assert release_session_lock(first, key) is True
+        assert release_session_lock(first, key) is False  # 已经空了
+    # 连接关掉之后锁一定不在（进程崩了也一样）——「抢得到 = 没人在跑」正是接续判断僵尸的依据
+    with engine.connect() as third:
+        assert try_session_lock(third, key) is True
+        assert release_session_lock(third, key) is True
+
+
+async def test_run_job_skips_when_another_process_holds_the_claim(anon_client, auth_headers, db_session):
+    """⑱ 执行权锁被别人持有时，本进程不碰这条任务；自己跑完一定把锁放掉（否则任务永久卡住）。"""
+    from backend import jobs
+    from backend.db import engine
+    from backend.locks import release_session_lock, try_session_lock
+
+    job, _ = jobs.submit(
+        db_session, "batch.revert", {"batch": f"pytest-busy-{uuid.uuid4().hex}"}, actor="pytest"
+    )
+    db_session.flush()
+    key = jobs.job_lock_key(job.id)
+
+    with engine.connect() as holder:
+        assert try_session_lock(holder, key) is True
+        # `run_job(job_id)`（生产路径）就是走这个上下文管理器进出执行段的
+        with jobs.job_claim_lock(job.id) as locked:
+            assert locked is False
+        assert release_session_lock(holder, key) is True
+
+    # 锁空着 → 抢得到，而且退出上下文时锁必须已经放掉（不然这条任务再也抢不动）
+    with jobs.job_claim_lock(job.id) as locked:
+        assert locked is True
+    with engine.connect() as after:
+        assert try_session_lock(after, key) is True
+        assert release_session_lock(after, key) is True
+
+
+async def test_restart_resume_leaves_jobs_that_are_really_running(anon_client, auth_headers, db_session):
+    """⑱ 接续只重排僵尸：执行权锁被持有的 `running` 行原样不动，锁空着的才重排重跑。"""
+    from backend import jobs
+    from backend.db import engine
+    from backend.locks import job_lock_key, release_session_lock, try_session_lock
+    from backend.models import BackgroundJob
+
+    live, _ = jobs.submit(
+        db_session, "batch.revert", {"batch": f"pytest-live-{uuid.uuid4().hex}"}, actor="pytest"
+    )
+    live.status = "running"
+    live.worker_id = "pytest-other-worker"
+    dead, _ = jobs.submit(
+        db_session, "batch.revert", {"batch": f"pytest-dead-{uuid.uuid4().hex}"}, actor="pytest"
+    )
+    dead.status = "running"
+    dead.worker_id = "pytest-gone-worker"
+    db_session.flush()
+
+    key = job_lock_key(live.id)
+    with engine.connect() as holder:
+        # 模拟「另一个进程正在跑 live」：它持有执行权锁
+        assert try_session_lock(holder, key) is True
+        resumed = jobs.resume_interrupted_jobs(db_session, schedule=False)
+        assert resumed["skipped"] is False
+        assert live.id in resumed["still_running"] and live.id not in resumed["requeued"]
+        assert dead.id in resumed["requeued"]
+        # 正在跑的那条一个字都没改（状态、归属进程都还在）
+        db_session.expire_all()
+        assert db_session.get(BackgroundJob, live.id).status == "running"
+        assert db_session.get(BackgroundJob, live.id).worker_id == "pytest-other-worker"
+        assert release_session_lock(holder, key) is True
+
+    # 那个进程没了（锁随连接断开自动释放）→ 下一次接续才把它当僵尸重排，归属进程清空
+    resumed = jobs.resume_interrupted_jobs(db_session, schedule=False)
+    assert live.id in resumed["requeued"]
+    db_session.expire_all()
+    fetched = db_session.get(BackgroundJob, live.id)
+    assert fetched.status == "queued" and fetched.worker_id is None
+    assert "重新排队" in fetched.error
+
+
+async def test_restart_resume_only_one_process_does_the_work(anon_client, auth_headers, db_session):
+    """⑱ 多副本同时启动时只有抢到全局锁的那个进程动这些行，其它进程返回 skipped 且一个字都不改。"""
+    from backend import jobs
+    from backend.db import engine
+    from backend.locks import release_session_lock, resume_lock_key, try_session_lock
+    from backend.models import BackgroundJob
+
+    job, _ = jobs.submit(
+        db_session, "batch.revert", {"batch": f"pytest-skip-{uuid.uuid4().hex}"}, actor="pytest"
+    )
+    # 有预算的 running：如果后面那个进程真的接续了，它一定会被重排 —— 所以「还是 running」就是证据
+    job.status = "running"
+    job.worker_id = "pytest-other-worker"
+    db_session.flush()
+
+    key = resume_lock_key()
+    with engine.connect() as holder:
+        assert try_session_lock(holder, key) is True
+        try:
+            resumed = jobs.resume_interrupted_jobs(db_session, schedule=False)
+            assert resumed == {
+                "requeued": [], "failed": [], "still_running": [], "skipped": True, "total": 0
+            }
+            db_session.expire_all()
+            untouched = db_session.get(BackgroundJob, job.id)
+            assert untouched.status == "running"
+            assert untouched.worker_id == "pytest-other-worker"
+            assert untouched.error is None
+        finally:
+            assert release_session_lock(holder, key) is True
+
+
 async def test_batch_revert_submit_is_idempotent(anon_client, auth_headers, db_session):
     """⑩ 重复提交不会排出第二条任务：默认拦「同一批次正在撤销中」，给了 Idempotency-Key 连成功过的也复用。"""
     from sqlalchemy import func, select

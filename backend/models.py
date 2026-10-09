@@ -198,8 +198,12 @@ class BackgroundJob(Base):
     `run_monthly_analysis` 也没人调用。真需要异步的只有「撤销批次」这一条（期间多、每期全量重算），
     于是用「进程内线程 + 这张表」落地：任务状态可查询、失败有记录，不再假装有一个消息队列。
 
-    代价写在 README 里：单进程内存队列，多副本部署需要换成真正的外部队列。进程重启时
-    `jobs.resume_interrupted_jobs()` 会把还挂在 `queued`/`running` 的记录**重新排队重跑**
+    代价写在 README 里：跨进程的**派发**仍然没有（任务只在提交它的那个进程里执行），
+    多副本部署需要换成真正的外部队列。⑱ 起「抢占」与「重启接续」本身是跨进程安全的：
+    执行前要先抢一条会话级 advisory lock（`backend/locks.py` 的 `job_lock_key`）+ 条件更新
+    `status='queued'`，启动接续也先抢一把全局锁、并且只重排那些**执行权锁没人持有**的
+    `running` 行（真有人正在跑的不动），见 `jobs.run_job()` / `jobs.resume_interrupted_jobs()`。
+    进程重启时还挂在 `queued`/`running` 的记录会被**重新排队重跑**
     （所以处理函数必须幂等：同一份 payload 跑两遍不能多删一行、也不能报「已经被撤销了」），
     已经用完重试预算的才标记为失败。
     """
@@ -224,6 +228,10 @@ class BackgroundJob(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default="3")
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ⑱ 谁正在跑这条任务（`jobs.WORKER_ID`：主机名-pid-随机串）。只在 `status=running` 时有意义，
+    # 跑完/判失败/放回队列都会清空 —— 它不是「最后谁跑过」的审计，而是「现在这条 running 归谁」，
+    # 多副本下配合 `locks.job_lock_key` 就能解释「任务卡在运行中」到底是哪个进程不在了。
+    worker_id: Mapped[str | None] = mapped_column(String(80))
     __table_args__ = (
         # 「先查再插」在并发下会漏：两个请求同时查空、各自插一条。这条部分唯一索引把它变成
         # 数据库层面的保证，撞上时 `jobs.submit()` 把已有那条读回来，接口照样返回同一个任务 id。

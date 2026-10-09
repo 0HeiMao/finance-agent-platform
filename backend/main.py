@@ -173,18 +173,25 @@ def _validate_config_on_startup() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("schema 迁移失败（数据库可能不可用）：%s", exc)
 
-    # 后台任务是进程内队列：进程重启时还挂在 queued/running 的记录不会有人来跑。
+    # 后台任务是进程内派发：进程重启时还挂在 queued/running 的记录不会有人来跑。
     # ⑩ 之后不再一律判死——处理函数是幂等的，所以默认**重新排队重跑**（启动后各开一个定时器执行），
     # 只有「类型已经没有处理函数」和「已经用完重试预算」两种情况才标记失败。
+    # ⑱ 多副本：每个进程都会跑这个函数，但只有抢到全局锁的那个进程真的改（其它的返回 skipped），
+    # 而且真有人正在跑的 running 行原样不动（列在 still_running 里，只记日志）。
     try:
         with Session(engine) as session:
             resumed = resume_interrupted_jobs(session)
+        if resumed["skipped"]:
+            logger.info("启动接续：另一个进程正在接续后台任务，本进程跳过")
         if resumed["requeued"]:
             logger.info("启动接续：%s 条未完成的后台任务已重新排队：%s",
                         len(resumed["requeued"]), resumed["requeued"])
         if resumed["failed"]:
             logger.info("启动清理：%s 条未完成的后台任务已标记为失败：%s",
                         len(resumed["failed"]), resumed["failed"])
+        if resumed["still_running"]:
+            logger.info("启动接续：%s 条后台任务正被其它进程执行，原样保留：%s",
+                        len(resumed["still_running"]), resumed["still_running"])
     except Exception as exc:  # noqa: BLE001
         logger.error("后台任务接续失败：%s", exc)
 

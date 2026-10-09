@@ -379,6 +379,7 @@ function jobFixture(overrides = {}) {
     attempts: 3,
     max_attempts: 3,
     next_attempt_at: null,
+    worker_id: null,
     error: '第 3 次尝试失败：批次不存在或已被撤销',
     result: null,
     ...overrides
@@ -424,6 +425,8 @@ test('后台任务（⑩）：失败的任务显示「第 3/3 次」并能点「
   // 失败不再等于「没救了」：界面必须看出已经用掉几次预算，否则人工重试无从判断
   assert.match(view.text(), /第 3\/3 次/)
   assert.match(view.text(), /第 3 次尝试失败：批次不存在或已被撤销/)
+  // ⑱：失败的任务没有执行者，不能把上一轮的进程名留在界面上
+  assert.doesNotMatch(view.text(), /运行进程/)
 
   await view.click('重试')
   assert.ok(
@@ -482,6 +485,27 @@ test('后台任务（⑩）：同一批次重复提交被后端去重时，提�
   await view.click('确认撤销')
   assert.ok(await waitFor(() => view.text().includes('已经在队列里')), `实际渲染：${view.text()}`)
   assert.doesNotMatch(view.text(), /已提交后台任务/)
+  view.app.unmount()
+})
+
+test('后台任务（⑱）：运行中的任务写出「谁在跑」，多副本下卡住时才知道去翻哪个进程的日志', async () => {
+  const running = () =>
+    jsonResponse(jobFixture({ status: 'running', attempts: 1, worker_id: 'finance-host-4242-ab12cd' }))
+  const view = await mountBatches(
+    batchesRoutes([
+      {
+        path: '/api/v1/admin/jobs',
+        response: () =>
+          jsonResponse({
+            data: [jobFixture({ status: 'running', attempts: 1, worker_id: 'finance-host-4242-ab12cd' })],
+            total: 1
+          })
+      },
+      { path: '/api/v1/admin/jobs/77', response: running }
+    ])
+  )
+  assert.match(view.text(), /运行进程：finance-host-4242-ab12cd/)
+  assert.match(view.text(), /第 1\/3 次/)
   view.app.unmount()
 })
 

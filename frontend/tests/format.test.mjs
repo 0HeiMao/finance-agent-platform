@@ -17,6 +17,7 @@ import {
   describeResult,
   durationText,
   formatTime,
+  ownerText,
   parseDepartments,
   periodsText,
   resultText,
@@ -99,6 +100,19 @@ test('retryWaitText 只在「排队等退避」时给时间，别的状态不假
   assert.equal(retryWaitText({ status: 'running', next_attempt_at: '2026-10-08T16:23:25' }), '—')
   assert.equal(retryWaitText({ status: 'failed', next_attempt_at: null }), '—')
   assert.equal(retryWaitText(null), '—')
+})
+
+test('ownerText 只在运行中且记了进程时给「谁在跑」，其它状态不留上一个早已结束的进程名', () => {
+  assert.equal(
+    ownerText({ status: 'running', worker_id: 'finance-host-4242-ab12cd' }),
+    '运行进程：finance-host-4242-ab12cd'
+  )
+  // 跑完/判失败/放回队列：后端会清空 worker_id，界面这里也要挡住「有值但状态不对」的老数据
+  assert.equal(ownerText({ status: 'succeeded', worker_id: 'finance-host-4242-ab12cd' }), '')
+  assert.equal(ownerText({ status: 'running', worker_id: null }), '')
+  assert.equal(ownerText({ status: 'running', worker_id: '' }), '')
+  assert.equal(ownerText({ status: 'queued' }), '')
+  assert.equal(ownerText(null), '')
 })
 
 test('重跑时上次已经删干净的结果（already_reverted）不当成失败，也不说成「删除 0 行」', () => {

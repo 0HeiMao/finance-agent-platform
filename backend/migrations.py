@@ -86,6 +86,9 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("background_jobs", "attempts", "INTEGER DEFAULT 0 NOT NULL"),
     ("background_jobs", "max_attempts", "INTEGER DEFAULT 3 NOT NULL"),
     ("background_jobs", "next_attempt_at", "TIMESTAMP WITH TIME ZONE"),
+    # ⑱ 跨进程执行权：谁正在跑这条任务（`jobs.WORKER_ID`）。可空 —— 老库里排队中/已结束的行
+    # 本来就没有执行者，NULL 正是「没有进程持有它」。
+    ("background_jobs", "worker_id", "VARCHAR(80)"),
 ]
 
 # 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。

@@ -8,6 +8,7 @@ import {
   describeResult,
   durationText,
   formatTime,
+  ownerText,
   periodsText,
   resultText,
   retryWaitText,
@@ -297,6 +298,7 @@ onUnmounted(stopPolling)
                   <td>
                     <span class="job-status" :class="job.status">{{ statusLabel(job.status) }}</span>
                     <div class="muted">{{ attemptsText(job) }}</div>
+                    <div v-if="ownerText(job)" class="job-worker">{{ ownerText(job) }}</div>
                   </td>
                   <td>{{ job.actor || '—' }}</td>
                   <td>{{ formatTime(job.created_at) }}</td>
@@ -318,8 +320,9 @@ onUnmounted(stopPolling)
             </table>
           </div>
           <p class="muted">
-            后台任务是进程内队列：进程重启会把未完成的任务重新排队接着跑；失败按
-            2、4、8…秒退避自动重试，用完预算才判失败，之后可以在这里人工重试（追加一份预算）。多副本部署需要换成外部队列。
+            后台任务失败按 2、4、8…秒退避自动重试，用完预算才判失败，之后可以在这里人工重试（追加一份预算）；
+            进程重启会把未完成的任务重新排队接着跑。⑱ 起「谁执行、谁接续」是跨进程安全的（执行权锁 +
+            条件更新，只重排真的没人跑的任务），但任务仍然只在**提交它的那个进程**里执行，多副本部署还是要换成外部队列。
           </p>
         </section>
       </template>
@@ -347,5 +350,11 @@ onUnmounted(stopPolling)
 .job-status.failed {
   background: #fff2f0;
   color: #a8071a;
+}
+/* 进程名（主机名-pid-随机串）比较长：不换行会把整张表顶宽，375 宽的视口就要横向滚动 */
+.job-worker {
+  font-size: 12px;
+  color: #8c8c8c;
+  overflow-wrap: anywhere;
 }
 </style>

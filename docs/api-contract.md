@@ -604,13 +604,13 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 撤销批次要重算所有受影响期间，接口不再同步等着跑完：`POST /admin/jobs/batch-revert` 只往
 `background_jobs` 表写一条 `queued` 记录并交给 FastAPI 的 `BackgroundTasks`，**202** 就返回
 （`{"id","kind","kind_label","status","actor","payload","result","error","created_at","started_at","finished_at",
-"idempotency_key","attempts","max_attempts","next_attempt_at","deduplicated"}`）。
+"idempotency_key","attempts","max_attempts","next_attempt_at","worker_id","deduplicated"}`）。
 前端轮询 `GET /admin/jobs/{id}` 看 `status`：
 
 | status | 含义 |
 | --- | --- |
 | `queued` | 已入队，还没开始（**提交成功 ≠ 已执行**，此时明细还在）；带着 `next_attempt_at` 说明是在等退避重试 |
-| `running` | 正在删除明细并重算受影响期间 |
+| `running` | 正在删除明细并重算受影响期间；`worker_id` 写着**哪个进程**在跑它（形如 `主机名-pid-随机串`，⑱） |
 | `succeeded` | `result = {"batch","deleted_rows","recalculated":[…],"cleared":[…]}`；重跑时若上次已经删干净，`deleted_rows=0` 且带 `already_reverted: true` |
 | `failed` | `error` 是失败原因（截断 500 字）；只有**预算用完**（`attempts >= max_attempts`）或任务类型已经没有处理函数才会落在这里。重试一次会把 `max_attempts` 抬高 3 |
 
@@ -635,11 +635,27 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 **重复执行必须安全**：撤销任务把 `context["is_retry"]`（`attempts > 1`）传给
 `revert_batch(allow_missing=…)`，重跑时「一行都没删」判成功并标 `already_reverted`。
 
-**进程重启接续**（⑩）：启动时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running` 放回队列
+**进程重启接续**（⑩，⑱ 起跨进程安全）：启动时 `jobs.resume_interrupted_jobs()` 把遗留的 `queued`/`running` 放回队列
 （`error = "进程重启，任务已重新排队（下次是第 N 次尝试）"`，保留已用掉的次数）并立刻调度一次；
 预算用完的判 `failed`（`error` 点名用了几次），`kind` 已无处理函数的判 `failed`
-（`error = "进程重启，且这个任务类型已经没有处理函数"`）。**边界**：这是进程内队列，
-重试定时器活在进程内存里（重启即丢，靠启动接续补回来），多副本部署需要换成外部队列。
+（`error = "进程重启，且这个任务类型已经没有处理函数"`）。
+
+**跨进程执行权**（⑱）：每条在跑的任务由一把 Postgres **会话级 advisory 锁**代表（命名空间 `finance:job-claim`），
+`worker_id` 字段记着执行它的进程。两道护栏：
+
+- **执行入口**：`jobs.run_job(job_id)` 先抢执行权锁，抢不到直接安静返回（`status` 不动、`attempts` 不加）；
+  抢到后再用**条件 UPDATE**（`WHERE id = … AND status = 'queued'`）把行改成 `running`，`rowcount != 1` 就当没抢到。
+  所以两个副本同时拿到同一条任务在数据库那一层不可能发生，处理函数只会跑一遍。
+- **启动接续**：接续本身用一把全局锁串行化，抢不到的副本返回 `{"requeued": [], "failed": [], "still_running": [],
+  "skipped": true, "total": 0}`、**一个字都不改**；对每条 `running` 行先探它的执行权锁——抢得到说明持有它的进程
+  已经死了（连接断开、锁由数据库释放）→ 才重排并清空 `worker_id`/`started_at`；抢不到说明那个副本还活着 →
+  原样保留，只列进返回值的 `still_running`。以前这里一律重排，于是第二个副本一启动就把别人的活又排了一遍。
+- **advisory 锁的代价**（脚本 `scripts/verify_job_claim.py` 里固定成一条检查）：锁挂在**会话**上，
+  池化连接 `close()` 只是把连接还回池子、锁还在——所以 `jobs` 里所有取锁的地方都在 `finally` 里
+  显式 `pg_advisory_unlock`，不靠关连接。
+
+**边界**：任务仍然只在**提交它的那个进程**里执行（不会漂到别的副本），重试定时器也活在进程内存里
+（重启即丢，靠启动接续补回来），多副本部署需要换成外部队列。
 
 ### 列表分页与筛选（`/admin/*` 与 `/analysis/alerts/all`）
 
@@ -755,8 +771,15 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 ```json
 { "id": 20, "kind": "batch.revert", "kind_label": "撤销导入批次", "status": "queued",
   "actor": "demo_analyst", "payload": {"batch": "verify-jobs-42246f", "ip": "127.0.0.1"},
-  "result": null, "error": null,
+  "result": null, "error": null, "worker_id": null,
   "created_at": "2026-10-08T08:23:17.7Z", "started_at": null, "finished_at": null }
+```
+
+跑起来之后 `status` 变 `running` 且 `worker_id` 有值（⑱，`主机名-pid-随机串`），落终态时又清回 `null`：
+
+```json
+{ "id": 20, "status": "running", "worker_id": "finance-host-4242-ab12cd",
+  "attempts": 1, "started_at": "2026-10-08T08:23:18.1Z", "next_attempt_at": null }
 ```
 
 执行完 `result` 与 `DELETE` 的响应同形（`{"batch","deleted_rows","recalculated","cleared"}`），
@@ -766,7 +789,7 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 
 ```json
 { "data": [ { "id": 20, "kind": "batch.revert", "kind_label": "撤销导入批次",
-              "status": "succeeded", "actor": "demo_analyst",
+              "status": "succeeded", "actor": "demo_analyst", "worker_id": null,
               "result": {"batch": "verify-jobs-42246f", "deleted_rows": 1,
                          "recalculated": ["2026-10"], "cleared": []},
               "error": null, "created_at": "…", "started_at": "…", "finished_at": "…" } ],

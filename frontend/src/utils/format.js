@@ -37,6 +37,18 @@ export function retryWaitText(job) {
   return `约 ${formatTime(job.next_attempt_at)} 重试`
 }
 
+/**
+ * 谁正在跑这条任务（⑱）。
+ *
+ * 多副本部署下同一个任务只能有一个执行者，把那个进程记在界面上才解释得清「任务一直卡在运行中」：
+ * 记下来的主机名 + 进程号就是该去翻的那份日志。只有 `running` 才显示 —— 跑完/判失败/重新排队的
+ * 任务没有执行者，显示一个早就结束的进程只会让人以为它还在跑。
+ */
+export function ownerText(job) {
+  if (!job || job.status !== 'running' || !job.worker_id) return ''
+  return `运行进程：${job.worker_id}`
+}
+
 export function formatTime(value) {
   if (!value) return '—'
   const date = new Date(value)
