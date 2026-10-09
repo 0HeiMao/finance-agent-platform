@@ -1,12 +1,15 @@
 """管理员接口：用户、导入批次、知识库三块的查看与维护。
 
-权限模型沿用项目既有语义：**`User.department` 为空 = 不受部门限制 = 财务管理员**
-（与 `GET /auth/me` 的 `unrestricted`、README 的口径一致），因此不额外引入角色字段，
-也就不需要迁移。所有接口都经过 `admin_user` 依赖，普通账号拿到 403 而不是空数据，
-避免"看不到就等于没有"的误判。
+**权限与数据范围是两件事**（⑳ 起）：能不能管看账号上的 `users.is_admin` 标识，能看哪些数据看部门
+列表（`backend/scope.py::scope_of`）。⑳ 之前两者是同一件事——「没有部门 = 不受部门限制 = 管理员」——
+于是任何账号把自己的部门清空就等于升权，自助注册的新账号更是一注册就是管理员。现在
+`is_admin()` 只读那一位标识，部门清空只表示「范围还没分配，什么都看不到」。
+所有接口都经过 `admin_user` 依赖，普通账号拿到 403 而不是空数据，避免"看不到就等于没有"的误判。
 
-两条刻意的安全约束：
-- 不允许管理员改自己的部门/删自己的账号。改部门会立刻把自己锁在管理入口之外，属于自伤操作。
+三条刻意的安全约束：
+- 不允许管理员改自己（部门或管理员标识）：改错了会立刻把自己锁在管理入口之外，属于自伤操作，
+  要走就让**另一个**管理员来改。因此「最后一个管理员」不可能被自己弄丢，删除账号也另有一道守卫。
+- 收回管理员标识前会数一遍管理员人数，最后一个不给收回（否则这个库再没人能管）。
 - 删除导入批次时会**重算受影响期间**，否则会留下与交易明细对不上的历史指标（幽灵报表）。
   长任务版本走 `POST /admin/jobs/batch-revert`（后台执行 + 任务可查），同步版本保留给脚本调用。
 """
@@ -44,7 +47,7 @@ from backend.models import (
 from backend.observability import snapshot
 from backend.periods import GRAIN_LABELS, grain_of
 from backend.rag.pgvector_store import DocumentChunk
-from backend.scope import departments_of
+from backend.scope import departments_of, is_admin, scope_of
 
 logger = logging.getLogger("finance-api")
 
@@ -66,21 +69,28 @@ METRIC_LABELS = {
 LEVELS = {"high": "高", "medium": "中", "low": "低"}
 
 
-def is_admin(user: User) -> bool:
-    return not departments_of(user)
-
-
 def admin_user(user: User = Depends(current_user)) -> User:
     if not is_admin(user):
-        raise HTTPException(403, "需要管理员权限：当前账号已限定部门")
+        raise HTTPException(403, "需要管理员权限：当前账号没有管理员标识")
     return user
 
 
+def _admin_count(db: Session, *, excluding: int | None = None) -> int:
+    """还有几个管理员（`excluding` 用来把某一行先排除掉再数）。"""
+    condition = select(func.count()).select_from(User).where(User.is_admin.is_(True))
+    if excluding is not None:
+        condition = condition.where(User.id != excluding)
+    return db.scalar(condition) or 0
+
+
 class DepartmentUpdate(BaseModel):
-    # 空字符串等同于"清空部门"（升级为管理员），所以不做 min_length。
-    # 多部门用 `departments`；只给 `department` 时按「一个部门」处理（老前端兼容）。
+    # 部门（数据范围）：`departments` 优先；只给 `department` 时按「一个部门」处理（老前端兼容）；
+    # 给空串/空数组 = **清空范围**（⑳ 起不再等于升级为管理员，那只表示「什么都看不到」）。
+    # 两个都**没发**时范围一个字都不动（只授予/收回管理员标识时就是这种请求）。
     department: str = Field(default="", max_length=100)
     departments: list[str] | None = Field(default=None, max_length=20)
+    # 管理员标识（⑳）：None = 本次不动它；true/false = 显式授予/收回。与部门各改各的。
+    is_admin: bool | None = Field(default=None)
 
 
 class BatchRevertRequest(BaseModel):
@@ -317,8 +327,9 @@ def list_users(
         else:
             condition = condition.where(User.department.is_(None))
     if unrestricted is not None:
-        # 「不受部门限制」= 部门列表为空，与 is_admin() 同一口径；
-        # 用或上空白字符串/空数组是为了兼容历史上写成空串或空列表的行。
+        # 「不受部门限制」= 部门列表为空（⑳ 起这只是「范围读全公司」，与管理员标识无关：
+        # 没配部门的普通账号同样落在这一档，但他们什么都看不到）。用或上空白字符串/空数组
+        # 是为了兼容历史上写成空串或空列表的行。
         blank = _blank_departments()
         condition = condition.where(blank if unrestricted else ~blank)
     total = db.scalar(select(func.count()).select_from(condition.subquery())) or 0
@@ -340,7 +351,10 @@ def list_users(
                 "username": user.username,
                 "department": user.department or "",
                 "departments": list(departments_of(user)),
-                "unrestricted": is_admin(user),
+                # 两件事分别给：能不能管（is_admin）与当前是不是全公司口径（unrestricted）。
+                # 管理员被收窄到某部门时是第一栏 true、第二栏 false —— 前端「管理员」徽标读前者。
+                "is_admin": is_admin(user),
+                "unrestricted": scope_of(user) is None,
                 "created_at": user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else None,
                 # 会话版本号：0 表示「从没退出/被踢过」，>0 表示历史上有过多少次作废动作
                 "token_version": token_version_of(user),
@@ -369,7 +383,7 @@ def _target_user(db: Session, user_id: int, me: User) -> User:
     if not target:
         raise HTTPException(404, "用户不存在")
     if target.id == me.id:
-        raise HTTPException(400, "不能通过管理接口修改自己：请到 System 设置里改「我的部门」")
+        raise HTTPException(400, "不能通过管理接口修改自己：数据范围与管理员标识要由另一个管理员改（⑳ 起没有自改入口）")
     return target
 
 
@@ -381,19 +395,43 @@ def update_user(
     db: Session = Depends(get_db),
     me: User = Depends(admin_user),
 ):
+    """改一个账号的**数据范围**与**管理员标识**（两件事，可以只改其中一件）。
+
+    自改被 `_target_user` 挡住 —— 那一条才是「不会把自己锁在门外」的主力：既然操作者也必须是
+    管理员，接口上就永远至少剩下操作者本人这一位，所以「不能收回最后一个管理员」这条计数守卫
+    在接口上只是兜底，真正会踩到的是没有「自己」这个概念的 `scripts/grant_admin.py --revoke`。
+    两处改动分开留痕：只改范围就只记 `user.department_change`，只改标识就只记 `user.admin_change`；
+    没发的字段一个字都不动（只授予标识的请求不该顺手清掉对方的部门）。
+    """
     target = _target_user(db, user_id, me)
-    previous = "、".join(departments_of(target)) or "不受限"
-    if payload.departments is not None:
-        wanted = [item.strip() for item in payload.departments if (item or "").strip()]
-    else:
-        single = payload.department.strip()
-        wanted = [single] if single else []
-    target.departments = wanted or None
-    # 单值列同步成第一个部门：老前端的「部门」列与审计文案读的都是它（权限只看 departments）。
-    target.department = wanted[0] if wanted else None
-    audit.record(db, me, "user.department_change", target_type="user", target_id=target.id,
-                 detail={"username": target.username, "from": previous,
-                         "to": "、".join(wanted) or "不受限"}, request=request)
+    previous_departments = "、".join(departments_of(target)) or "未分配"
+    previous_admin = is_admin(target)
+    if payload.is_admin is False and previous_admin and _admin_count(db, excluding=target.id) == 0:
+        raise HTTPException(400, "不能收回最后一个管理员的管理员标识：收回后这个库再没有人能管")
+    # 只改标识的请求（{"is_admin": true}）里没有部门字段，但 `department` 的默认值是空串 —— 直接照它
+    # 执行就会把目标账号的部门一起清掉。所以只有客户端**真发了**某一个部门字段才动范围。
+    department_fields_sent = bool({"departments", "department"} & payload.model_fields_set)
+    if department_fields_sent:
+        if payload.departments is not None:
+            wanted = [item.strip() for item in payload.departments if (item or "").strip()]
+        else:
+            single = payload.department.strip()
+            wanted = [single] if single else []
+        target.departments = wanted or None
+        # 单值列同步成第一个部门：老前端的「部门」列与审计文案读的都是它（范围只看 departments）。
+        target.department = wanted[0] if wanted else None
+    current_departments = "、".join(departments_of(target)) or "未分配"
+    if department_fields_sent and current_departments != previous_departments:
+        audit.record(db, me, "user.department_change", target_type="user", target_id=target.id,
+                     detail={"username": target.username, "from": previous_departments,
+                             "to": current_departments}, request=request)
+    if payload.is_admin is not None and bool(payload.is_admin) != previous_admin:
+        target.is_admin = bool(payload.is_admin)
+        audit.record(db, me, "user.admin_change", target_type="user", target_id=target.id,
+                     detail={"username": target.username,
+                             "from": "管理员" if previous_admin else "普通账号",
+                             "to": "管理员" if target.is_admin else "普通账号"},
+                     request=request)
     db.commit()
     db.refresh(target)
     return {
@@ -401,18 +439,23 @@ def update_user(
         "username": target.username,
         "department": target.department or "",
         "departments": list(departments_of(target)),
-        "unrestricted": is_admin(target),
+        "is_admin": is_admin(target),
+        "unrestricted": scope_of(target) is None,
     }
 
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, request: Request, db: Session = Depends(get_db), me: User = Depends(admin_user)):
     target = _target_user(db, user_id, me)
+    # 删掉最后一个管理员 = 这个库再没人能管（不能改自己，所以这条只能在删「别人」时踩到）。
+    if is_admin(target) and _admin_count(db, excluding=target.id) == 0:
+        raise HTTPException(400, "不能删除最后一个管理员：删掉后这个库再没有人能管")
     username = target.username
     department = "、".join(departments_of(target))
     # 先记录再删：删掉以后 target.id 还在这个 Python 对象里，但写进 detail 的必须是快照
     audit.record(db, me, "user.delete", target_type="user", target_id=target.id,
-                 detail={"username": username, "department": department or "不受限"}, request=request)
+                 detail={"username": username, "department": department or "未分配",
+                         "is_admin": is_admin(target)}, request=request)
     db.delete(target)
     db.commit()
     return {"deleted": True, "username": username}
@@ -516,15 +559,19 @@ def list_departments(db: Session = Depends(get_db), me: User = Depends(admin_use
         item["periods"] = [row[0] for row in db.execute(
             select(distinct_periods.c.period).order_by(distinct_periods.c.period)).all()]
 
-    unrestricted = []
+    unassigned = []
     for user in users:
         payload = {
             "id": user.id, "username": user.username, "department": user.department or "",
             "departments": list(departments_of(user)),
-            "unrestricted": is_admin(user), "is_self": user.id == me.id,
+            "is_admin": is_admin(user), "unrestricted": scope_of(user) is None,
+            "is_self": user.id == me.id,
         }
-        if payload["unrestricted"]:
-            unrestricted.append(payload)
+        if not payload["departments"]:
+            # ⑳ 起「没有部门」这一档里有两类账号，都必须出现在这里，不能只收 unrestricted 的那种：
+            # 管理员（没配部门 = 看全公司）与刚注册、还没分配范围（什么都看不到）的普通账号。
+            # 否则新账号会在部门权限页里彻底消失，管理员根本找不到该给谁配范围。
+            unassigned.append(payload)
         else:
             # 多部门账号会出现在它每一个部门下（每行都带着完整的部门列表，前端只展示一行归属）。
             for name in payload["departments"]:
@@ -545,11 +592,16 @@ def list_departments(db: Session = Depends(get_db), me: User = Depends(admin_use
         item.pop("expense_total", None)
     return {
         "departments": rows,
-        "unrestricted_users": unrestricted,
+        # 键名保留 `unrestricted_users`（老前端与脚本读它），含义按 ⑳ 收窄成
+        # 「不属于任何部门的账号」：里面有管理员，也有还没分配范围的普通账号。
+        "unassigned_users": unassigned,
+        "unrestricted_users": unassigned,
         "summary": {
             "departments_with_data": sum(1 for item in rows if item["transactions"]),
             "departments_with_users": sum(1 for item in rows if item["user_count"]),
-            "unrestricted_users": len(unrestricted),
+            "unrestricted_users": sum(1 for item in unassigned if item["unrestricted"]),
+            "unassigned_users": len(unassigned),
+            "admin_users": sum(1 for item in users if is_admin(item)),
             "total_users": len(users),
         },
         "me": {"id": me.id, "username": me.username, "department": me.department or "",

@@ -59,21 +59,18 @@ def login(username: str, password: str) -> str:
     return payload["access_token"]
 
 
-def make_scoped(label: str, departments: list[str]) -> tuple[str, int, str]:
+def make_scoped(admin: str, label: str, departments: list[str]) -> tuple[str, int, str]:
+    """注册一个临时账号并把数据范围分给它（⑳ 起只能由管理员分配，账号自己改会 403）。"""
     suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
     username = f"tier_{label}_{suffix}"
     status, payload = call("POST", "/auth/register", body={"username": username, "password": PASSWORD})
     assert status == 200, f"注册 {username} 失败：{status} {payload}"
+    user_id = payload["id"]
     token = login(username, PASSWORD)
-    status, payload = call("PATCH", "/auth/me", token=token, body={"departments": departments})
-    assert status == 200, f"绑定部门失败：{status} {payload}"
-    return token, payload_id(username, token), username
-
-
-def payload_id(_username: str, token: str) -> int:
-    status, payload = call("GET", "/auth/me", token=token)
-    assert status == 200, f"读 /auth/me 失败：{status} {payload}"
-    return payload["id"]
+    status, payload = call("PATCH", f"/admin/users/{user_id}", token=admin,
+                           body={"departments": departments})
+    assert status == 200, f"分配部门失败：{status} {payload}"
+    return token, user_id, username
 
 
 def alerts(token: str, period: str) -> list[dict]:
@@ -112,8 +109,8 @@ def main() -> int:
     check("默认规则 scope_label = 全公司 · 所有期间",
           defaults[0]["scope_label"] == "全公司 · 所有期间", defaults[0]["scope_label"])
 
-    token_a, id_a, user_a = make_scoped("a", ["018"])
-    token_b, id_b, user_b = make_scoped("b", ["097"])
+    token_a, id_a, user_a = make_scoped(admin, "a", ["018"])
+    token_b, id_b, user_b = make_scoped(admin, "b", ["097"])
     check("临时受限账号绑定成功（018 / 097）", True, f"{user_a} / {user_b}")
 
     # 找一个 018 与 097 都会按默认规则报「利润异常」的期间，再找一个当对照期间

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,6 +28,7 @@ from backend.db import (  # noqa: E402
     get_db,  # noqa: E402
 )
 from backend.main import app  # noqa: E402
+from backend.models import User  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -97,10 +98,20 @@ def credentials() -> dict:
 
 
 @pytest.fixture
-async def auth_headers(anon_client, credentials) -> dict:
-    """注册并登录一个随机用户，返回可直接传给请求的 Bearer 头。"""
+async def auth_headers(anon_client, credentials, db_session) -> dict:
+    """注册并登录一个随机用户，返回可直接传给请求的 Bearer 头。
+
+    ⑳ 起「注册出来的账号」不等于管理员（也不能自己把部门改成空来自我扩权），
+    而全套用例都拿这个夹具当「管理员操作者」，所以这里**显式授予管理员标识** ——
+    对应的真机动作是管理员在用户管理里勾上、或者 `scripts/grant_admin.py <用户名>`。
+    需要「普通账号」的用例请自己注册一个（别用这个夹具，它给的是管理员）。
+    """
     response = await anon_client.post("/api/v1/auth/register", json=credentials)
     assert response.status_code == 200, response.text
     response = await anon_client.post("/api/v1/auth/login", json=credentials)
     assert response.status_code == 200, response.text
+    user = db_session.scalar(select(User).where(User.username == credentials["username"]))
+    assert user is not None
+    user.is_admin = True
+    db_session.commit()
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

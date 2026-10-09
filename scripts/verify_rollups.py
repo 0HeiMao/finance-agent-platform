@@ -66,17 +66,20 @@ def login(username: str, password: str) -> str:
     return payload["access_token"]
 
 
-def make_scoped(label: str, departments: list[str]) -> tuple[str, int, str]:
+def make_scoped(admin: str, label: str, departments: list[str]) -> tuple[str, int, str]:
+    """注册一个临时账号并把数据范围分给它（⑳ 起账号不能自己改，只能由管理员分配）。"""
     suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
     username = f"rollup_{label}_{suffix}"
     status, payload = call("POST", "/auth/register", body={"username": username, "password": PASSWORD})
     assert status == 200, f"注册 {username} 失败：{status} {payload}"
+    user_id = payload["id"]
     token = login(username, PASSWORD)
-    status, payload = call("PATCH", "/auth/me", token=token, body={"departments": departments})
-    assert status == 200, f"绑定部门失败：{status} {payload}"
+    status, payload = call("PATCH", f"/admin/users/{user_id}", token=admin,
+                           body={"departments": departments})
+    assert status == 200, f"分配部门失败：{status} {payload}"
     status, me = call("GET", "/auth/me", token=token)
     assert status == 200, f"读 /auth/me 失败：{status} {me}"
-    return token, me["id"], username
+    return token, user_id, username
 
 
 def plan_periods(months: list[str]) -> tuple[str, tuple[str, ...], str, tuple[str, ...], tuple[str, ...]]:
@@ -130,7 +133,7 @@ def main() -> int:
     status, overview = call("GET", "/admin/overview", token=admin)
     assert status == 200, f"读 /admin/overview 失败：{status} {overview}"
     quarter, quarter_months, year, year_months, year_missing = plan_periods(overview["periods"]["all"])
-    token_dep, user_id, username = make_scoped("dept", [DEPT])
+    token_dep, user_id, username = make_scoped(admin, "dept", [DEPT])
     print(f"临时受限账号 {username}（id={user_id}，部门 {DEPT}）", flush=True)
     print(f"库里有 {len(year_months)} 个月的指标：{'、'.join(year_months)}", flush=True)
     print(f"验的季度 {quarter}（{'、'.join(quarter_months)}）、年度 {year}（缺 {len(year_missing)} 个月：{'、'.join(year_missing)}）\n", flush=True)

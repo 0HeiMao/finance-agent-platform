@@ -84,11 +84,40 @@ async function saveDepartment(user) {
     const updated = await response.json()
     user.department = updated.department
     user.departments = updated.departments
+    user.is_admin = updated.is_admin
     user.unrestricted = updated.unrestricted
     drafts[user.id] = departmentsText(updated.departments)
     notice.value = updated.unrestricted
-      ? `已保存：${updated.username} 部门为空，现在是管理员（不受部门限制）。`
+      ? `已保存：${updated.username} 没有分配部门，所以看不到任何财务数据（也不会因此变成管理员）。`
       : `已保存：${updated.username} 只能检索「${departmentsText(updated.departments)}」与未标注部门的片段。`
+  } catch (e) {
+    error.value = `保存失败：${e.message}`
+  } finally {
+    busyId.value = null
+  }
+}
+
+// 授予/收回管理员标识：只发 is_admin 一个字段，服务端就不会动它的部门
+async function toggleAdmin(user) {
+  busyId.value = user.id
+  error.value = ''
+  notice.value = ''
+  try {
+    const response = await apiFetch(`/admin/users/${user.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ is_admin: !user.is_admin })
+    })
+    const updated = await response.json()
+    user.is_admin = updated.is_admin
+    user.unrestricted = updated.unrestricted
+    user.departments = updated.departments
+    notice.value = updated.is_admin
+      ? `已授予 ${updated.username} 管理员标识：它现在能进管理端、能给别的账号分配部门。` +
+        (updated.unrestricted
+          ? '它没有分配部门，因此看得到全公司数据。'
+          : '它的数据范围不变，仍是原来那几个部门。')
+      : `已收回 ${updated.username} 的管理员标识：它不再能进管理端，只能看自己被分配的数据范围。` +
+        '（要确认这个库里还有另一位管理员，否则最后一位收不回来。）'
   } catch (e) {
     error.value = `保存失败：${e.message}`
   } finally {
@@ -168,7 +197,7 @@ onMounted(load)
           <div>
             <h1>用户管理</h1>
             <p>
-              部门决定知识库检索与财务数据的可见范围：留空＝不受限制（管理员）；可填多个部门（用「、」分隔），看到的是这些部门的并集。
+              两件事分开管：<strong>管理员标识</strong>决定能不能进管理端、能不能改别人的账号；<strong>部门</strong>决定能看哪些数据。部门留空＝什么都没分配（看不到任何数据），不等于管理员；可填多个部门（用「、」分隔），看到的是这些部门的并集。
             </p>
           </div>
         </div>
@@ -203,7 +232,7 @@ onMounted(load)
         <section v-else class="page-card">
           <div class="card-head">
             <h2>{{ summary }}</h2>
-            <span>修改自己的部门请到 System 设置（管理接口会拒绝自改，避免把自己锁在管理入口之外）</span>
+            <span>数据范围与管理员标识都只能由管理员改（⑳ 起账号没有自改入口）</span>
           </div>
 
           <div class="filter-row">
@@ -215,7 +244,7 @@ onMounted(load)
               <span>部门</span>
               <select v-model="departmentFilter" class="select">
                 <option value="">全部部门</option>
-                <option value="__unrestricted__">不受限（管理员）· {{ unrestrictedCount }}</option>
+                <option value="__unrestricted__">未分配部门 · {{ unrestrictedCount }}</option>
                 <option v-for="name in departments" :key="name" :value="name">{{ name }}</option>
               </select>
             </label>
@@ -228,8 +257,8 @@ onMounted(load)
                 <tr>
                   <th>id</th>
                   <th>用户名</th>
-                  <th>角色</th>
-                  <th>部门（可编辑，多个用「、」分隔）</th>
+                  <th>权限</th>
+                  <th>数据范围（可编辑，多个用「、」分隔）</th>
                   <th>登录</th>
                   <th>会话</th>
                   <th>创建时间</th>
@@ -244,13 +273,16 @@ onMounted(load)
                     <span v-if="user.is_self" class="level medium">当前账号</span>
                   </td>
                   <td>
-                    <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
+                    <span class="level" :class="user.is_admin ? 'high' : 'medium'">
+                      {{ user.is_admin ? '管理员' : '普通账号' }}
+                    </span>
+                    <span class="muted">
                       {{
                         user.unrestricted
-                          ? '管理员'
-                          : (user.departments || []).length > 1
-                            ? `限定 ${user.departments.length} 个部门`
-                            : '限定部门'
+                          ? '全公司'
+                          : (user.departments || []).length
+                            ? `看 ${user.departments.length} 个部门`
+                            : '未分配'
                       }}
                     </span>
                   </td>
@@ -259,7 +291,7 @@ onMounted(load)
                       v-model.trim="drafts[user.id]"
                       class="select"
                       maxlength="500"
-                      placeholder="留空＝不受限；多个用「、」分隔"
+                      placeholder="留空＝未分配（看不到任何数据）；多个用「、」分隔"
                       :disabled="user.is_self"
                     />
                   </td>
@@ -285,6 +317,14 @@ onMounted(load)
                         @click="saveDepartment(user)"
                       >
                         保存部门
+                      </button>
+                      <button
+                        class="btn"
+                        :disabled="user.is_self || busyId === user.id"
+                        title="授予或收回管理员标识：只改这一位，不动它的数据范围（不能改自己，避免把自己锁在管理端外面）"
+                        @click="toggleAdmin(user)"
+                      >
+                        {{ user.is_admin ? '收回管理员' : '授予管理员' }}
                       </button>
                       <button
                         class="btn"

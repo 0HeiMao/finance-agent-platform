@@ -654,6 +654,17 @@
               }
             ],
             "title": "Departments"
+          },
+          "is_admin": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Admin"
           }
         },
         "title": "DepartmentUpdate",
@@ -3085,6 +3096,7 @@
         ]
       },
       "patch": {
+        "description": "改一个账号的**数据范围**与**管理员标识**（两件事，可以只改其中一件）。\n\n自改被 `_target_user` 挡住 —— 那一条才是「不会把自己锁在门外」的主力：既然操作者也必须是\n管理员，接口上就永远至少剩下操作者本人这一位，所以「不能收回最后一个管理员」这条计数守卫\n在接口上只是兜底，真正会踩到的是没有「自己」这个概念的 `scripts/grant_admin.py --revoke`。\n两处改动分开留痕：只改范围就只记 `user.department_change`，只改标识就只记 `user.admin_change`；\n没发的字段一个字都不动（只授予标识的请求不该顺手清掉对方的部门）。",
         "operationId": "update_user_api_v1_admin_users__user_id__patch",
         "parameters": [
           {
@@ -3233,24 +3245,6 @@
     "/api/v1/ai/agent/ask": {
       "post": {
         "operationId": "agent_ask_api_v1_ai_agent_ask_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "x-user-department",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Department"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3329,22 +3323,6 @@
                 }
               ],
               "title": "Session Id"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-user-department",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Department"
             }
           }
         ],
@@ -3676,24 +3654,6 @@
     "/api/v1/ai/rag/chat": {
       "post": {
         "operationId": "chat_api_v1_ai_rag_chat_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "x-user-department",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Department"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4332,7 +4292,7 @@
         ]
       },
       "patch": {
-        "description": "设置/清空自己的部门（可以一次给多个）。留空表示不限制部门（财务管理员口径）。\n\n刻意不让前端用请求头自述部门：那样任何登录用户都能伪造 finance-admin 看到全部资料。",
+        "description": "**已停用**（⑳）：数据范围与管理员标识不能再由账号自己改。\n\n⑳ 之前这里允许任何登录用户设置/清空自己的部门，而 `is_admin()` 当时的定义是「没有部门限制」，\n于是 `PATCH /auth/me {\"departments\": []}` 是一键升权：任何账号（包括刚在 `/auth/register`\n注册出来的）都能把自己变成全库管理员，读所有人的明细、管所有账号、撤销批次。\n\n之所以**保留路由并明确拒绝**，而不是删掉它：老客户端与脚本调到这里时会拿到一句能照着做的\n错话，而不是一个莫名其妙的 404/405。两件真实需求各有去处：\n\n- 「我是管理员，现在只想看某个部门」→ 页面顶部的口径下拉（`?department=`），只影响这一次查看；\n- 「这个账号该看哪几个部门 / 该不该是管理员」→ 管理端用户管理（`PATCH /admin/users/{id}`），\n  由**另一个**管理员分配，并留审计。\n\n被拒也留痕：这是「账号试图给自己扩权」的信号，值班时应该看得见。",
         "operationId": "update_me_api_v1_auth_me_patch",
         "requestBody": {
           "content": {
@@ -5449,24 +5409,6 @@
       "post": {
         "description": "检索、按部门过滤并生成带来源回答；带 department 标记的资料仅同部门可见。",
         "operationId": "answer_question_api_v1_rag_answer_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "x-user-department",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Department"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -5611,24 +5553,6 @@
     "/api/v1/rag/search": {
       "post": {
         "operationId": "search_documents_api_api_v1_rag_search_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "x-user-department",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Department"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {

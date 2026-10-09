@@ -6,7 +6,9 @@ import { apiFetch } from './client'
  *
  * 为什么不用 Pinia：项目没装 Pinia，而这里只需要"整站只取一次 `/auth/me`、结果共享"。
  * 用一个模块级 ref + 进行中的 Promise 缓存就够了，侧边栏和路由守卫都读同一份，不会重复打接口。
- * 权限口径与后端一致：**部门为空 = 不受限制 = 财务管理员**。
+ * 权限口径与后端一致（⑳ 起是**两个**字段，不能互相推）：
+ * `is_admin` = 能不能进管理端，`unrestricted` = 当前是不是全公司口径（没有分配部门）。
+ * 管理员被收窄到某个部门时前者仍为 true、后者为 false。
  */
 const user = ref(null)
 let pending = null
@@ -16,7 +18,7 @@ export function currentUser() {
 }
 
 export function isAdmin() {
-  return Boolean(user.value?.unrestricted)
+  return Boolean(user.value?.is_admin)
 }
 
 export async function loadCurrentUser(force = false) {

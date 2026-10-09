@@ -72,7 +72,7 @@ test('口径切换器：只绑一个部门的账号没有可换的，整个控�
 })
 
 test('口径切换器：不受限账号默认「全公司（全部部门）」，选项来自接口', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   useRoutes([{ path: '/api/v1/analysis/departments', response: () => jsonResponse(DEPARTMENTS) }])
   setActiveScope('')
   const view = mount(ScopeSwitcher)
@@ -100,7 +100,7 @@ test('口径切换器：多部门账号看到「我绑定的 2 个部门（合�
 })
 
 test('口径切换器：接口挂了就退回默认项，不留一个空下拉', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   useRoutes([
     {
       path: '/api/v1/analysis/departments',
@@ -229,8 +229,8 @@ function makeRouter() {
   })
 }
 
-test('侧边栏：不受限账号看到「管理员」组，受限账号看不到', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+test('侧边栏：有管理员标识才看到「管理员」组，只看「不受限」不再算管理员', async () => {
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   const adminRouter = makeRouter()
   adminRouter.push('/dashboard')
   await adminRouter.isReady()
@@ -250,8 +250,19 @@ test('侧边栏：不受限账号看到「管理员」组，受限账号看不�
   assert.doesNotMatch(scoped.text(), /管理概览/)
 })
 
+test('侧边栏：被收窄到某个部门的管理员照样进管理端（能不能管与数据范围是两件事）', async () => {
+  // ⑳ 之前「管理员」的定义就是「部门为空」，所以这种账号会掉出管理端；现在两件事分开看
+  await seedUser({ is_admin: true, unrestricted: false, departments: ['018'] })
+  const router = makeRouter()
+  router.push('/dashboard')
+  await router.isReady()
+  const view = mount(AppSidebar, { props: { open: false }, global: { plugins: [router] } })
+  assert.ok(await waitFor(() => view.text().includes('管理员')), `实际渲染：${view.text().slice(0, 200)}`)
+  assert.match(view.text(), /管理概览/)
+})
+
 test('侧边栏：点导航会 router.push 并申请收起抽屉；当前页高亮', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   const router = makeRouter()
   router.push('/dashboard')
   await router.isReady()
@@ -280,7 +291,7 @@ test('侧边栏：点导航会 router.push 并申请收起抽屉；当前页高�
 })
 
 test('侧边栏：当前路由已经是目标页时不重复 push（点当前页只收抽屉）', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   const router = makeRouter()
   router.push('/dashboard')
   await router.isReady()
@@ -923,7 +934,7 @@ const AGENT_SESSION_ROW = {
 const AGENT_STATUS_LABELS = { ok: '已完成', streaming: '生成中', stopped: '已停止', error: '失败' }
 
 test('Agent 工作台（⑮）：会话列表点开把落库消息灌回对话框，删除后回到新会话，用量卡列逐日', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   // 删除之后列表就该空了：用一个开关让「重读列表」拿到和服务端一致的结果
   let deleted = false
   useRoutes([
@@ -1076,7 +1087,7 @@ const ADMIN_OVERVIEW = {
 }
 
 test('管理概览（⑮）：Agent 用量卡按用户列 token，它自己挂掉时整页概览仍然在', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   let usageFails = false
   useRoutes([
     { path: '/api/v1/admin/overview', response: () => jsonResponse(ADMIN_OVERVIEW) },
@@ -1180,6 +1191,7 @@ const SYSTEM_STATUS = {
     username: 'demo_analyst',
     department: null,
     departments: [],
+    is_admin: true,
     unrestricted: true,
     token_version: 0
   },
@@ -1187,7 +1199,7 @@ const SYSTEM_STATUS = {
 }
 
 test('系统设置（⑯）：运行态里写明业务时区，业务日与当下时刻只作展示且标了 data-visual-mask', async () => {
-  await seedUser({ unrestricted: true, departments: [] })
+  await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   let missingTimezone = false
   useRoutes([
     {

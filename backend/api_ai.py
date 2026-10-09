@@ -2,7 +2,7 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -71,23 +71,20 @@ def _persist(message_id: int, *, content: str, status: str, sources, period, kno
 
 @router.post("/rag/chat")
 def chat(payload: Question, user: User = Depends(current_user),
-         x_user_department: str | None = Header(default=None),
          _quota: None = Depends(ai_quota)):
-    return rag_answer(payload.question, user_department=user_department_of(user, x_user_department))
+    return rag_answer(payload.question, user_department=user_department_of(user))
 
 
 @router.post("/agent/ask")
 def agent_ask(payload: Question, user: User = Depends(current_user),
-              x_user_department: str | None = Header(default=None),
               _quota: None = Depends(ai_quota)):
-    return {"tool": "rag_search", **rag_answer(payload.question, user_department=user_department_of(user, x_user_department))}
+    return {"tool": "rag_search", **rag_answer(payload.question, user_department=user_department_of(user))}
 
 
 @router.post("/agent/chat/stream")
 def agent_stream(payload: Question, department: str | None = Query(None, max_length=100),
                  session_id: int | None = Query(None, ge=1),
                  user: User = Depends(current_user),
-                 x_user_department: str | None = Header(default=None),
                  db: Session = Depends(get_db),
                  _quota: None = Depends(ai_quota)):
     """财务 Agent 流式问答：证据 = 已导入财务数据 + 知识库检索，模型只能依据证据作答。
@@ -96,10 +93,10 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
     两件事因此成为可能——前端在流当中就知道 `message_id` 并能请求停止；
     进程半路没了也能在会话里看到一条"没写完的回答"，而不是什么都没有。
     """
-    scope = user_department_of(user, x_user_department)
-    # 财务数据的范围只认服务端记录的部门（scope_of），不认请求头：知识库那条兼容路径允许
-    # 老客户端用 finance-admin 自述，如果同一套值拿去过滤财务数据，等于把公司口径的开关交给请求头。
-    # department 只对不受限账号生效（受限账号填别的部门直接 403），与看板/报告同一套 resolve 规则。
+    scope = user_department_of(user)
+    # 财务数据的范围与知识库口径都只认服务端记录（scope_of），请求头自述一律不算数（⑳ 起连
+    # 兼容参数都没有了）。department 只对不受限账号生效（受限账号填别的部门直接 403），
+    # 与看板/报告同一套 resolve 规则。
     financial_scope, violation = resolve_requested_scope(user, department)
     if violation:
         raise HTTPException(403, violation)

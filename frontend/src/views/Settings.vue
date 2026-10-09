@@ -1,18 +1,25 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { apiFetch } from '../api/client'
 import AppSidebar from '../components/AppSidebar.vue'
-import { departmentsText, parseDepartments } from '../utils/format'
+import { departmentsText } from '../utils/format'
 
 const sidebarOpen = ref(false)
 const status = ref(null)
 const loading = ref(false)
 const error = ref('')
 const saved = ref('')
-const saving = ref(false)
-const department = ref('')
 const loggingOut = ref(false)
 const loggedOut = ref('')
+
+/** 当前数据范围的一句话（部门列表 / 全公司 / 还没分配）。 */
+const scopeText = computed(() => {
+  const me = status.value?.me
+  if (!me) return '—'
+  if (me.unrestricted) return '全公司'
+  const names = departmentsText(me.departments)
+  return names ? `部门 ${names}` : '未分配部门'
+})
 
 async function load() {
   loading.value = true
@@ -20,33 +27,11 @@ async function load() {
   try {
     const r = await apiFetch('/system/status')
     status.value = await r.json()
-    department.value = departmentsText(status.value.me?.departments || status.value.me?.department)
   } catch (e) {
     error.value = `读取系统状态失败：${e.message}`
     status.value = null
   } finally {
     loading.value = false
-  }
-}
-
-async function saveDepartment() {
-  saving.value = true
-  error.value = ''
-  saved.value = ''
-  try {
-    const r = await apiFetch('/auth/me', {
-      method: 'PATCH',
-      body: JSON.stringify({ departments: parseDepartments(department.value) })
-    })
-    const me = await r.json()
-    status.value.me = me
-    saved.value = me.unrestricted
-      ? '已清空部门：当前账号不受部门限制（等同于财务管理员）。'
-      : `已保存：只检索「${departmentsText(me.departments)}」与公共片段。`
-  } catch (e) {
-    error.value = `保存失败：${e.message}`
-  } finally {
-    saving.value = false
   }
 }
 
@@ -135,30 +120,37 @@ onMounted(load)
         </section>
 
         <section class="page-card">
-          <div class="card-head"><h2>我的部门</h2></div>
+          <div class="card-head"><h2>我的数据范围</h2></div>
           <p class="muted">
-            留空表示不受限制（财务管理员）；填写后<strong>财务数据与知识库都只按本部门收窄</strong>：
-            看板/分析/报告/Agent 只统计本部门明细（读该部门的指标与预警口径行），知识库检索只返回 「本部门 +
-            未标注部门」的片段，管理接口一律 403。
-            一个账号可以填多个部门（用「、」分隔），看到的是这些部门的<strong>并集</strong>（金额相加、比率按合计重算）。
-            部门由服务端记录，不接受请求头自述，避免伪造提权。
+            这一页<strong>只读</strong>：部门与管理员标识都由管理员在「用户管理」里分配。 ⑳ 起自己改不了 ——
+            以前「把部门留空」等于「不受限制」，也就等于给自己升成财务管理员，
+            所以那条自助入口已经关掉（真去调接口会得到 403 并且留审计）。
+            想只是换个口径看数据，用页面顶部的<strong>部门口径</strong>下拉框（它只影响这一次浏览）。
+            分配后财务数据与知识库都按这些部门收窄：看板/分析/报告/Agent 只统计这些部门的明细，
+            知识库检索只返回「这些部门 + 未标注部门」的片段；一个账号可以分配多个部门，看到的是这些部门的
+            <strong>并集</strong>（金额相加、比率按合计重算）。
           </p>
-          <div class="upload-box">
-            <input
-              v-model.trim="department"
-              class="select"
-              maxlength="500"
-              placeholder="例如：018、097（多个用「、」分隔；留空=不受限）"
-            />
-            <button class="btn primary" :disabled="saving" @click="saveDepartment">
-              {{ saving ? '保存中…' : '保存' }}
-            </button>
+          <div class="settings-grid">
+            <div>
+              <span>当前账号</span>
+              <strong>{{ status.me.username }}</strong>
+              <small>id {{ status.me.id }}</small>
+            </div>
+            <div>
+              <span>数据范围</span>
+              <strong>{{ scopeText }}</strong>
+              <small>{{
+                status.me.unrestricted ? '看得到全公司口径（含未分配部门的行）' : '只按上面这些部门看数据'
+              }}</small>
+            </div>
+            <div>
+              <span>管理员标识</span>
+              <strong>{{ status.me.is_admin ? '是' : '否' }}</strong>
+              <small>{{
+                status.me.is_admin ? '能进管理端、能给账号分配部门与管理员标识' : '只能看数据，进不了管理端'
+              }}</small>
+            </div>
           </div>
-          <p class="muted">
-            当前：<strong>{{ status.me.username }}</strong
-            >（id {{ status.me.id }}）·
-            {{ status.me.unrestricted ? '不受部门限制' : `限定 ${departmentsText(status.me.departments)}` }}
-          </p>
         </section>
 
         <section class="page-card">

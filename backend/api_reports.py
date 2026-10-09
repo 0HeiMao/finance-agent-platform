@@ -365,12 +365,14 @@ def docx_report(period: str, department: str | None = Query(None, max_length=100
     scope, explicit = _report_scope(user, department)
     data = _collect(db, period, scope, explicit)
     payload = _build_docx(data, period)
-    tag = f" {scope_text(scope)}" if scope else ""
+    # 空范围（还没分配部门，⑳）也要在文件名里留痕：报告内容是空的，但标题不能被当成全公司口径。
+    label = "" if scope is None else scope_text(scope)
+    tag = f" {label}" if label else ""
     # 后缀交给 content_disposition 拼：名字里一旦带 ".docx"，ASCII 兜底就永远「合格」了
     # （".docx" 自带字母），中文名会被剥成 ` 2097-05.docx` 这种谁也认不出的样子。
     filename = f"财务分析报告 {period}{tag}"
     # ASCII 兜底名里不能带中文部门名（HTTP 头是 latin-1），部门号本身多为数字，过滤后仍可用。
-    safe_department = "".join(ch for ch in scope_text(scope) if ch.isascii() and ch.isalnum()) if scope else ""
+    safe_department = "".join(ch for ch in scope_text(scope) if ch.isascii() and ch.isalnum()) if scope is not None else ""
     fallback = f"financial-report-{period}" + (f"-{safe_department}" if safe_department else "")
     return Response(
         content=payload,
@@ -386,8 +388,8 @@ def pptx_report(period: str, department: str | None = Query(None, max_length=100
     data = _collect(db, period, scope, explicit)
     payload = _build_ppt(data, period)
     # 指定口径时文件名带上部门，避免「部门 097 报告」被当成公司报告发出去；
-    # 多部门账号用 scope_slug（018-097），中文/特殊字符不会进文件名。
-    tag = f"-{scope_slug(scope)}" if scope else ""
+    # 多部门账号用 scope_slug（018-097）、还没分配部门用 none（空串会拼出「-」结尾的怪名字）。
+    tag = f"-{scope_slug(scope)}" if scope is not None else ""
     filename = f"financial-report-{period}{tag}.pptx"
     return Response(
         content=payload,

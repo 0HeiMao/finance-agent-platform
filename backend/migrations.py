@@ -79,6 +79,11 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("users", "failed_attempts", "INTEGER DEFAULT 0 NOT NULL"),
     ("users", "locked_until", "TIMESTAMP WITH TIME ZONE"),
     ("users", "last_failed_at", "TIMESTAMP WITH TIME ZONE"),
+    # ⑳ 显式管理员标识：老库里「原先不受部门限制」的账号正是财务管理员（⑳ 之前
+    # `is_admin()` 的定义就是「没有部门」），加列时按这个口径回填一次（见 BACKFILLS）。
+    # 不回填的后果很具体：演示账号升级当天就会从管理员掉成「什么也看不到」。
+    # 此后新注册的账号默认 false —— 权限不再由「有没有配部门」兼职。
+    ("users", "is_admin", "BOOLEAN DEFAULT false NOT NULL"),
     # ⑩ 后台任务幂等重试：去重键、重试预算、下次重试时间。
     # 两个 INTEGER 都带 DEFAULT：老库里已有的任务行否则是 NULL，「已经试过几次」一读就是 NULL，
     # 重试判断（attempts < max_attempts）当场变成 None < None 而抛类型错。
@@ -90,6 +95,21 @@ COLUMNS: list[tuple[str, str, str]] = [
     # 本来就没有执行者，NULL 正是「没有进程持有它」。
     ("background_jobs", "worker_id", "VARCHAR(80)"),
 ]
+
+# 加列时顺带做一次的**数据**回填：(表名, 列名) → (为什么, SQL)。
+#
+# 为什么回填必须绑在「这一列本次刚被加出来」上：SQL 是幂等的没错，但它表达的是一次**迁移口径**，
+# 不是一条永远成立的不变式。以 `users.is_admin` 为例——「部门为空 = 管理员」在加列的那一刻是事实，
+# 加完列之后就不再是了（新注册的账号同样部门为空，却是普通账号）。若每次启动都跑一遍，
+# 第二天新注册的账号会被悄悄升成管理员，正是 ⑳ 要修掉的那个洞。
+BACKFILLS: dict[tuple[str, str], tuple[str, str]] = {
+    ("users", "is_admin"): (
+        "原先不受部门限制（departments 为空/空数组，且单值列也为空）= 财务管理员",
+        "UPDATE users SET is_admin = true"
+        " WHERE (departments IS NULL OR departments = '[]'::jsonb)"
+        " AND COALESCE(department, '') = ''",
+    ),
+}
 
 # 需要**去掉**的约束：(表名, 约束名, 为什么要去掉)。
 # Postgres 给列级 `unique=True` 自动起的名字就是 `<表>_<列>_key`，所以这里按名字精确删——
@@ -190,6 +210,13 @@ def ensure_schema(engine: Engine | None = None) -> list[str]:
                 continue
             connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
             applied.append(f"{table}.{column}")
+            # 回填只跟在这一列**刚刚被加出来**这一支里：老库升级时补历史口径，
+            # 之后再启动（列已存在）走 continue，不会把新数据按老口径改写。见 BACKFILLS。
+            backfill = BACKFILLS.get((table, column))
+            if backfill:
+                why, sql = backfill
+                filled = connection.execute(text(sql)).rowcount
+                applied.append(f"{table}.{column} 回填 {filled} 行（{why}）")
         for table, name, _why in DROPPED_CONSTRAINTS:
             exists = connection.scalar(
                 text("SELECT 1 FROM pg_constraint WHERE conname = :name"

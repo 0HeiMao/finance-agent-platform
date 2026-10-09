@@ -79,7 +79,8 @@ const NAV_GROUPS = [
 ]
 
 const groups = computed(() =>
-  NAV_GROUPS.filter((group) => !group.adminOnly || Boolean(user.value?.unrestricted))
+  // ⑳ 起管理组的开关是「管理员标识」，不是「部门为空」：被收窄到某个部门的管理员照样看得到管理组。
+  NAV_GROUPS.filter((group) => !group.adminOnly || Boolean(user.value?.is_admin))
 )
 
 const activePath = computed(() => {

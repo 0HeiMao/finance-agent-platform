@@ -26,7 +26,7 @@ from check_frontend_coverage import COVERED_MODULES, parse_coverage_table  # noq
 from PIL import Image  # noqa: E402
 
 from backend.api_financial import AMOUNT_COLUMNS, validate_row  # noqa: E402
-from backend.api_rag import DEPARTMENT_ADMIN, filter_visible, user_department_of  # noqa: E402
+from backend.api_rag import filter_visible, user_department_of  # noqa: E402
 from backend.jobs import (  # noqa: E402
     attempts_of,
     can_retry,
@@ -144,7 +144,9 @@ def test_filter_visible_keeps_public_and_own_department():
 def test_filter_visible_admin_and_unset_see_everything():
     chunks = [_chunk("部门A"), _chunk("部门B")]
     assert len(filter_visible(chunks, None)) == 2
-    assert len(filter_visible(chunks, (DEPARTMENT_ADMIN,))) == 2
+    # ⑳：空范围（还没分配部门）不是「不受限」——部门资料一律看不见，只剩没标部门的公共资料。
+    assert filter_visible(chunks, ()) == []
+    assert len(filter_visible([_chunk(None), *chunks], ())) == 1
 
 
 def test_filter_visible_multi_department_is_a_union():
@@ -156,16 +158,14 @@ def test_filter_visible_multi_department_is_a_union():
 
 def test_user_department_prefers_server_side_record():
     user = SimpleNamespace(department="部门A")
-    # 请求头自报 finance-admin 不能提权：部门以服务端记录为准
-    assert user_department_of(user, DEPARTMENT_ADMIN) == ("部门A",)
-    assert user_department_of(user, "部门B") == ("部门A",)
+    # 部门只认服务端记录（⑳ 起连请求头参数都没有了，伪造头在接口层就被忽略）
+    assert user_department_of(user) == ("部门A",)
 
 
 def test_user_department_reads_multi_department_list():
     """`departments` 是权威值：有列表就按列表，列表为空才回落到老的单值列。"""
     user = SimpleNamespace(departments=["部门A", "部门B"], department="部门A")
     assert user_department_of(user) == ("部门A", "部门B")
-    assert user_department_of(user, DEPARTMENT_ADMIN) == ("部门A", "部门B")
     legacy = SimpleNamespace(departments=None, department="部门B")
     assert user_department_of(legacy) == ("部门B",)
 
@@ -233,10 +233,11 @@ def test_rule_scope_label_reads_both_dimensions():
 
 
 def test_user_department_ignores_forged_legacy_header():
+    """①⑳：请求头不再参与判定 —— 没分配部门的账号就是空范围，不是「不受限」。"""
     user = SimpleNamespace(department=None)
-    assert user_department_of(user, "部门B") is None
-    # 只有旧用户自己声明 finance-admin 才兼容接受
-    assert user_department_of(user, DEPARTMENT_ADMIN) == (DEPARTMENT_ADMIN,)
+    assert user_department_of(user) == ()
+    # 有管理员标识又没有部门才是真正的不受限（全公司口径）
+    assert user_department_of(SimpleNamespace(department=None, departments=[], is_admin=True)) is None
 
 
 # ---------------------------------------------------------------- 看板计算

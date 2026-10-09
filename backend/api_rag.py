@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -24,7 +24,7 @@ from backend.rag.document_parser import extract_text, split_text
 from backend.rag.embeddings import get_embedding_service
 from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
 from backend.rag.rerank import rerank
-from backend.scope import departments_of
+from backend.scope import scope_of
 
 router = APIRouter(prefix="/api/v1/rag", tags=["rag"])
 
@@ -56,35 +56,34 @@ def _content_hash(text: str) -> str:
 # 部门可见性规则（唯一实现在这里，/rag/* 与 /ai/* 共用）：
 # - 片段没写 department：属于全员可见的公共资料；
 # - 写了 department：只有该部门的人能看到（多部门账号是「其中之一即可」）；
-# - 用户名下的部门列表为空：不受部门限制（财务管理员口径）；
-# - 用户名下是 finance-admin：同样不受限制（旧客户端兼容）。
+# - 用户名下的部门为空且**有**管理员标识：不受部门限制（全公司口径）；
+# - 用户名下的部门为空且**没有**管理员标识：还没分配范围 —— 只看得到公共资料。
 # 之前只有 /rag/answer 做了过滤，而前端 Agent 走的是 /ai/agent/chat/stream，
-# 等于权限形同虚设；现在统一走这个函数，且部门取自服务端用户记录，
-# 不接受请求头自述（X-User-Department 只作为旧客户端的兼容参数保留）。
-DEPARTMENT_ADMIN = "finance-admin"
-
-# 知识库口径：None = 不受限；非空元组 = 只能看这些部门的片段（外加没标部门的公共资料）。
+# 等于权限形同虚设；现在统一走这个函数，且部门只取自服务端用户记录。
+#
+# ⑳ 拆掉了一条自助提权：早先「用户名下没有部门」= 不受限制，于是任何新账号带一个
+# `X-User-Department: finance-admin` 请求头就能读到全部片段（`DEPARTMENT_ADMIN`）。
+# 现在口径完全等于 `scope_of(user)`，请求头连兼容参数都不是了 —— 请求头自述永远不算数。
 ChunkScope = tuple[str, ...] | None
 
 
-def user_department_of(user: User, legacy_header: str | None = None) -> ChunkScope:
-    """知识库口径只认服务端记录；旧客户端的请求头仅在用户尚未设置部门时用于兼容。
+def user_department_of(user: User) -> ChunkScope:
+    """知识库口径 = 服务端记录的数据范围（`scope_of`）：`None` 不受限、`()` 还没分配。
 
     多部门账号会拿到自己那几个部门的并集：片段只要命中其中任何一个都可见，
     没标部门的公共资料对所有登录用户可见。
     """
-    departments = departments_of(user)
-    if departments:
-        return departments
-    return (DEPARTMENT_ADMIN,) if legacy_header == DEPARTMENT_ADMIN else None
+    return scope_of(user)
 
 
 def filter_visible(chunks: Iterable, user_department: ChunkScope) -> list:
-    if not user_department or DEPARTMENT_ADMIN in user_department:
+    """按口径挑出可见片段：`None` = 不受限看全部，空元组 = 还没分配，只剩公共资料。"""
+    if user_department is None:
         return list(chunks)
+    allowed = set(user_department)
     return [
         item for item in chunks
-        if not item.metadata_json.get("department") or item.metadata_json.get("department") in user_department
+        if not item.metadata_json.get("department") or item.metadata_json.get("department") in allowed
     ]
 
 
@@ -180,11 +179,10 @@ async def upload_document(request: Request, file: UploadFile = File(...),
 
 @router.post("/search")
 def search_documents_api(payload: SearchInput, db: Session = Depends(get_db), user: User = Depends(current_user),
-                         x_user_department: str | None = Header(default=None),
                          _quota: None = Depends(ai_quota)) -> dict:
     if payload.embedding is not None and payload.embedding_model != get_embedding_service().model_name:
         raise HTTPException(status_code=422, detail="查询向量的模型标识与当前模型不一致")
-    scope = user_department_of(user, x_user_department)
+    scope = user_department_of(user)
     try:
         settings = get_settings()
         if payload.embedding is None:
@@ -211,11 +209,10 @@ def search_documents_api(payload: SearchInput, db: Session = Depends(get_db), us
 
 @router.post("/answer")
 def answer_question(payload: AnswerInput, db: Session = Depends(get_db), user: User = Depends(current_user),
-                    x_user_department: str | None = Header(default=None),
                     _quota: None = Depends(ai_quota)) -> dict:
     """检索、按部门过滤并生成带来源回答；带 department 标记的资料仅同部门可见。"""
     try:
-        results = retrieve_for_user(db, payload.query, user_department_of(user, x_user_department), payload.top_k)
+        results = retrieve_for_user(db, payload.query, user_department_of(user), payload.top_k)
         answer, sources = generate_answer(payload.query, results)
         return {"success": True, "answer": answer, "sources": sources}
     except Exception as exc:

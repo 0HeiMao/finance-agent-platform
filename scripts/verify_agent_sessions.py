@@ -123,13 +123,19 @@ def names(events: list[tuple[str, dict]]) -> list[str]:
     return [name for name, _ in events]
 
 
-def register_scoped(username: str, department: str = "018") -> tuple[str, int]:
+def register_scoped(admin: str, username: str, department: str = "018") -> tuple[str, int]:
+    """注册一个只看某个部门的临时账号。
+
+    ⑳ 起账号不能自己改数据范围（`PATCH /auth/me` 一律 403），必须由管理员在
+    `/admin/users/{id}` 上分配 —— 真机上就是管理端「用户管理」里点一下。
+    """
     status, payload = call("POST", "/auth/register", body={"username": username, "password": PASSWORD})
     assert status == 200, f"注册 {username} 失败：{status} {payload}"
-    token = login(username, PASSWORD)
-    status, payload = call("PATCH", "/auth/me", token=token, body={"departments": [department]})
-    assert status == 200 and payload.get("unrestricted") is False, f"设置部门失败：{status} {payload}"
     user_id = payload["id"]
+    token = login(username, PASSWORD)
+    status, payload = call("PATCH", f"/admin/users/{user_id}", token=admin,
+                           body={"departments": [department]})
+    assert status == 200 and payload.get("unrestricted") is False, f"分配部门失败：{status} {payload}"
     return token, user_id
 
 
@@ -331,7 +337,7 @@ def main() -> int:
 
         # ---------------------------------------------------------- 越权与受限账号
         username = f"{SCOPED_PREFIX}{int(time.time())}"
-        scoped, scoped_user = register_scoped(username)
+        scoped, scoped_user = register_scoped(admin, username)
         check("别人的会话一律 404（不区分「没有」和「不是你的」）",
               call("GET", f"/ai/agent/sessions/{stream_id}", token=scoped)[0] == 404
               and call("DELETE", f"/ai/agent/sessions/{stream_id}", token=scoped)[0] == 404)

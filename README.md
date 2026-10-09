@@ -105,10 +105,11 @@ lint 不进这里 —— 它由 `check_all.py --quick` 里的 ruff 与前端 `np
 | `verify_slow_paths.py` | 慢接口告警 16 项：默认阈值 1000ms 且按路径可覆盖、启动日志写明阈值、真发一次 `POST /ai/rag/chat`（检索 + 大模型，实测 16 秒）后 `slow_paths` 里出现该路径且超阈值次数 +1、`worst_ms`/`last_ms`/`last_at` 如实、**后端日志里真有一条 `WARNING 慢接口告警 path=… duration_ms=… threshold_ms=…`**、紧接着再发一次只记账不重复刷日志（`suppressed` = 1）、快请求 `/health` 不被记账、`/admin/overview` 给管理页的同一份观测里也有这条 |
 | `verify_indexes.py` | 明细读路径索引 23 项：`missing_indexes()` 在真库上为空、三条索引的 `indexdef` 与列顺序（`(department, transaction_date)`，顺序反了第二列就用不上）、按期间拉明细结果与旧口径一致（93 行）、管理概览不断、`EXPLAIN (ANALYZE)` 里「部门 + 期间」真的走 `ix_financial_transactions_department_date`、冲销来源/预警状态各走自己的索引、**旧的 `to_char(...)` 形状用不上复合索引**（`Filter` 里逐行算）、80 万行同构临时表上 `Seq Scan` 36.70 ms → 建完复合索引 0.02 ms（1931×）、同结果集的一对写法（1314 行）区间比较 5.1× 且 `Index Cond` 里带日期、跑完 `DROP TABLE` |
 | `verify_recalc_lock.py` | 并发重算互斥（期间锁）18 项：锁 key 稳定/不撞号/在 bigint 内、月会连季与年一起锁且按名字排序、起始干净（无数据无残留锁）、**进程外一条真连接持锁时另一个事务真的被挡住**（`SET LOCAL lock_timeout='400ms'` 必报 lock timeout）、另一年不被挡、同年不同季共享年锁而不同年份零共享、持锁方提交/回滚都自动释放、真机 HTTP：无竞争重算 32 ms → 有人持锁 2031 ms（持锁 2000 ms）、导入与单行更正同样被挡且指标随后等于明细之和、两个并发重算都 200 且不丢更新、跑完 0 条残留 advisory 锁 |
-| `verify_session_revocation.py` | 会话版本号与强制下线 22 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、部门受限账号 403、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
+| `verify_session_revocation.py` | 会话版本号与强制下线 23 项：真库 `users.token_version` 是 integer/NOT NULL/默认 0（补列不会把老行算成「已作废」）、令牌里的 `ver` 等于库里那行、**没有 `ver` 声明的老令牌在版本 0 时仍可用**（升级不踢人）、`POST /auth/logout` 返回新版本且旧令牌（含「另一台设备」那份、含老令牌）立刻 401 并带「已在别处退出」、重登即恢复、审计留 `user.logout`（中文标签 + `session_version`，**detail 里没有任何含 token 的键**）、管理员 `POST /admin/users/{id}/logout` 踢掉别人而自己的令牌不受影响、被踢账号重登可用（被踢 ≠ 被停用）、用户列表带出 `token_version`、强制下线审计 actor/target/`from_version`→`to_version`、`/system/status` 的 `me.token_version` 与库一致、踢自己 400、未知账号 404、被管理员收窄成部门账号后强制下线别人 403、**受限账号自己 `PATCH /auth/me` 改范围被 403（⑳ 起账号没有自改入口）**、跑完删干净临时账号且**不登出演示账号**（demo 的版本 0 → 0，脚本可反复跑） |
 | `verify_job_retry.py` | 后台任务幂等与重试 31 项，**分两阶段跑**（「重启之后会怎样」没法在一个进程里验，所以第一阶段埋现场后要重启后端，再跑 `--phase 2`）：无键去重复用队列里那条且 `payload.ip` 不参与指纹、`Idempotency-Key` 提交/同键重放拿回同一条（**成功过的任务重放仍回那条**，批次已被删也不是 404）、换个键拿 404、201 字符的键 422、真库部分唯一索引的 `indexdef` 与「直接插第二条同键」抛 `UniqueViolation`、失败任务第 4 次尝试要等 16 秒退避才回队列且 `next_attempt_at` 真在将来、`job.retry` 审计带 `previous_error`、重试未知任务 404 / 重试非失败状态 409、重启日志里的「启动接续」与埋下的 `running` 残骸被接续跑完（`attempts` 1→2、批次那 3 行真被删），跑完清掉探针批次与验证产生的任务行 |
 | `verify_job_claim.py` | 后台任务跨进程执行权 23 项（⑱）：任务锁 key 稳定/不撞号/在 bigint 内且与接续锁、期间锁三族互不撞、起始干净（`worker_id` 列已建好、0 条残留 advisory 锁）、**两个真 Python 子进程（`--worker` 自调用，都走生产路径 `run_job(job_id)`）同时抢同一条 `queued` 任务 → 处理函数只跑了 1 遍**（计数文件 1 行，一个 `ran` 一个 `skipped`）、任务收在 `succeeded` 且 `attempts` 只加了 1、`worker_id` 又清空、`result.ran_by` 就是赢的那个进程、running 的任务 `claim` 返回 `None` 且 `attempts` 不变（`run_job(db=…)` 再走一遍也不重复执行）、`claim(不存在的 id)` 返回 `None`、**真有人持执行权锁的那条进 `still_running` 原样不动，只有锁是空的（进程已死）才被重排并清空 `worker_id`/`started_at`**、锁的连接一关（进程真的没了）那条才被重排、**池化连接 `close()` 之后锁还在**（所以执行权只能显式解锁，不能靠关连接——本脚本首跑就是栽在这个池子假象上，4 个 FAIL 全是它）、别人正在接续时本进程 `skipped=True` 一个字都不改、接续锁释放后同一个函数立刻能干活（不是被永久锁死）、真机 HTTP：`GET /admin/jobs` 每行都带 `worker_id`、导入 2097 小批次 → `POST /admin/jobs/batch-revert` 202 → 轮询看到 `running` 那一刻写着执行它的进程、最终 `succeeded` 且 `worker_id` 清空，跑完 0 条残留 advisory 锁且演示明细 8909 行一行没动 |
 | `verify_exports.py` | 导出契约 36 项（⑲）：起始基线干净 → 导入 2097 探针批次 → 更正一行（`corrections=1`）与冲销一行（负数行 + `reversal_of_id`，重复冲销 409）→ 明细 CSV **17 列表头** / 5 行 / BOM / `X-Export-Rows=5`，三列标记（`冲销状态` 空/`已冲销`/`冲销行`、`冲销时间` 与 `冲销操作人` 只写在被冲销的原行上、`更正次数`）逐格核对 → 期间 `2097`（年）/`2097-Q4`（季）/`2097-12`（月）都收到 5 行而 `2097-11` 收到 0 行、坏期间 `2097-13`/`2097-Q5`/`2097-4`/`全部期间` 全 422 → `?batch=`/`?query=` 与页面**同源**且多条件是「且」→ XLSX 同表头同行数 + 文件名 → 指标月口径（097 收入 650.00 = 150+300-300+500）、季/年口径读 `financial_rollups`（2097-Q4 全公司 1350.00、`包含月份=2097-12`、`是否完整=否`、文件名 `metrics-quarter-…`）并与 `GET /admin/rollups` 逐值一致 → 演示数据 2026-Q2~Q4 只有 3 行全公司行、2026-Q3 全公司 12191391796.83、年度 2026 一行且「否」+ 7 个月 → 四种粒度/区间错误全 422（粒度不匹配的提示里带 `2026-Q3`）→ 临时账号绑 097 后受限明细只 4 行（无别的部门）、季导出只有「部门 097」、`?department=018` 403 → 预警仍按月（季度 422）、月度 10 列表头 → `/export/scope` 上限 20000 → 审计 `data.export` 逐条字段齐且 `truncated` 全 False → **导出配额 429 真发生**（打满 `Retry-After` 是 1..60 的数字、等过窗口同一个请求又 200，即「拦得住脚本也放得出来」；本脚本自己靠 `Retry-After` 排队重试，`QUOTA_HITS` 记下每次拦截）→ `POST /admin/jobs/batch-revert` 收尾（202 → `succeeded`、`deleted_rows=5`），跑完残留全 0 且五项基线行数与起始完全一致 |
+| `verify_admin_identity.py` | 管理员标识与数据范围解耦 43 项（⑳）：真库 `users.is_admin` 列已补出且**迁移按「原先不受部门限制 = 管理员」回填**（演示账号 = 管理员）、`/auth/me` 与 `/system/status` 的 `me` 同时带 `is_admin` 与 `unrestricted`（**两个字段不能互相推**）、注册只回 `{id, username}` 且新账号默认 `is_admin=false` + 部门为空 → 明细一行都看不到（`total=0`）、未分配部门的新账号进不了管理端（403 文案「需要管理员权限：当前账号没有管理员标识」）、四种自助扩权 body（部门填 018 / 把部门清空 / 只给单值字段 / 直接要管理员标识）全部 403、被拒之后 `/auth/me` 三个字段与库里那一行**一个字都没变**、每次都留一条 `user.department_self_denied`（detail 记下想改成什么）→ 管理员用 `PATCH /admin/users/{id}` 分配 018：标识仍是 false、该账号看得到本部门行（行部门全是 018）而管理端仍 403（**数据范围不是权限**）、留 `user.department_change`（未分配 → 018）→ **只发 `{"is_admin": true}` 就能授予管理员，而且部门一个字都没动**（这条盯的正是"顺手把范围清掉"那个缺陷）、被收窄到某个部门的管理员 `is_admin=true` + `unrestricted=false` 照样进得了 `/admin/users` 与 `/admin/overview`，但读到的仍是本部门那本账、`?department=097` 403 → 授予与收回各留一条 `user.admin_change`（普通账号 ⇄ 管理员）、收回后**立刻**进不了管理端（权限每次从库里读，不必重新登录）→ 管理员把别人的部门清空后 `unrestricted` 仍是 false、那个账号什么都看不到（**清空不再等于升权**）→ 管理员改自己被 400 拒（请找另一个管理员）→ `scripts/grant_admin.py <账号>` 与 `--revoke` 两条救援路径都可用、不存在的账号退出码 1 并说明原因 → **临时摘掉其他管理员让演示账号成为唯一管理员 → `--revoke demo_analyst` 被拒（退出码 1 +「最后一个管理员」）→ 再把那几个标识原样补回来**（这条守卫在管理接口上不可达，只能这么验）→ 临时账号清干净、演示账号仍是管理员且 `token_version` 没被动过（脚本可反复跑） |
 | `verify_login_lockout.py` | 账号锁定与口令强度 19 项：真库 `users` 三列（`failed_attempts` NOT NULL 默认 0、`locked_until`、`last_failed_at`）、退避序列真机核对（阈值前 0、5 次 60s → 120 → 240 → 480 → 900 封顶）、阈值前每次 401 且库里次数一一对上**不写锁定时间**、第 5 次落库锁定、**锁着时口令正确也 429 且带 `Retry-After`**、这条 429 与限流那条**文案一字不差**且不含用户名/「锁」/「密码」（防用户名枚举）、管理页读到 `failed_attempts`/`locked`/`locked_until`、审计正好阈值条 `user.login_failed`（detail 无口令）+ 两条 `user.login_locked`（一条「连续失败达到阈值」一条「账号已锁定」）、管理员解锁清掉计数且**不动会话版本**、解锁后不改口令立刻能登、解锁审计带 `was_locked_for`、静默期 16 分钟后重新从 0 数（连错 3 次 + 1 次 = 只算 1 次）、三种弱口令注册 400 且**一个账号都没建**（审计 `user.register_rejected` 带中文原因）、拿不存在的用户名猛打得到 `user.login_blocked` 限流 429、跑完删干净临时账号且演示账号的失败次数/锁定时间为 0 |
 | `verify_backup_restore.py` | 备份与恢复 29 项：真库打一份归档（9 张表 9928 行 + 上传件）→ `verify` 只对着归档自检（每张表一个 `COPY` 成员、sha256 一个个重算、`.env`/`data/models`/`data/index` 都不在里面且排除理由写在 manifest 里）→ **恢复进临时库 `finance_restore_check`**（先用不带 `--yes` 的一次预演确认「预演之后临时库仍然不存在」，再真恢复）→ 逐表 `count(*)` 与活库对平、`vector` 列 5 行全非空且维度 384、序列已推到 `max(id)` 之后、恢复出的表能真查 → 上传件往返（写探针 → 备份 → 删 → 恢复到 `output/_restore_uploads` → 字节级一致，且**没有**写回真实 `data/uploads`）→ 三个负例该红的都红（改一个数据字节 → `verify` 点名 sha256；清单里多一列 → 恢复拒绝并点名这一列；清单 sha256 改坏 → 恢复拒绝）→ 同一个归档可反复恢复 → 跑完删临时库、探针文件与探针归档，**全程不动演示库 `finance`** |
 | `verify_security_headers.py` | 安全响应头 + GZip + 请求 id 29 项：正常响应与 404 都带四个静态头与严格 CSP、请求 id 合规则原样回传（128 位边界）而超长/带空格/带分号一律换成 32 位、**响应里那个 id 能在后端日志里 grep 到**（每次跑换新 id，否则上一轮那条会让这项假绿）、`/docs`/`/redoc`/`/openapi.json` 换成文档 CSP、HSTS 只在 `X-Forwarded-Proto: https`（或 `https, http`）时出现、`/openapi.json` 与 CSV 导出**真被压**且解压后与 `Accept-Encoding: identity` 那份 JSON 相等（用 `iter_raw()` 数网线上真实字节，`content` 是解压后的）、同样 8909 行的 xlsx 导出**不压**、SSE 没被压且仍按 chunked 传（带不带 gzip 收到的字节一致）、500 也带请求 id 与安全头（它绕过所有中间件，是处理器自己补的）。静态头期望值**写死在脚本里**、不从 `backend.http_headers` import —— 否则常量被改错时脚本跟着一起错。跑一次消耗 3 次导出配额 |
@@ -177,7 +178,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
   放进 `.githooks/` 才会随仓库走。克隆下来只需再跑一次 `git config core.hooksPath .githooks`。
 - **钩子默认只跑 `--quick`**（编码 + 语法 + ruff + 接口契约快照，几秒）：拦的正是「源文件被写成
   mojibake/BOM」、语法错误与「接口改了但没更新快照」这类进库就难查的问题。
-  `PRECOMMIT_FULL=1 git commit …` 会连后端 291 项、前端 53 项与两侧的 lint/覆盖率门槛
+  `PRECOMMIT_FULL=1 git commit …` 会连后端 293 项、前端 54 项与两侧的 lint/覆盖率门槛
   一起跑。
   钩子本身也验证过：故意 `git add` 一个带 BOM 的 `.py` 后提交，两步体检都 FAIL、提交被拒。
 - **`core.autocrlf = false` + `.gitattributes` 的 `* text=auto eol=lf`**：Windows 上默认会把 LF 换成 CRLF，
@@ -228,6 +229,7 @@ PowerShell 文本 cmdlet 往返**；`--quick` 就是给这条纪律准备的哨�
 | --- | --- | --- |
 | 加表 | 定义在 `backend/models.py`（定义在别的模块也行，但**必须被 `migrations.py` 导入**）里的模型 | 应用启动时 `create_all()` 建缺失的表 |
 | 加列 | `backend/migrations.py` 的 `COLUMNS` 加一行 `(表, 列, DDL)` | 启动时按 `information_schema` 查缺再 `ALTER TABLE`，幂等 |
+| 加列**并要回填** | 同一行的 `COLUMNS`，再把回填写进 `backend/migrations.py` 的 `BACKFILLS[(表, 列)] = (为什么, SQL)` | 只在**这次刚 ADD COLUMN** 的那一次执行（`applied` 里会写「… 回填 N 行（为什么）」），幂等：已存在的列不会再跑回填，不会把后来手工改过的值冲掉（⑳ 的 `users.is_admin` 就是这条路径） |
 | 加索引 | 模型里声明（`index=True` 或 `__table_args__` 的 `Index(...)`）**并且**在 `backend/migrations.py` 的 `INDEXES` 加一行 `(表, 索引名, 列清单, 为什么)` | 启动时按 `pg_indexes` 查缺再 `CREATE INDEX IF NOT EXISTS`，幂等；`create_all()` 只在建表时建索引，**老库的表不会被补** |
 | 改列类型 | `scripts/init_pgvector_db.py` 的 `COLUMN_TYPE_MIGRATIONS` | 手工跑一次该脚本 |
 | 装 `vector` 扩展 | `backend/migrations.py` 的 `ensure_pgvector()` | 启动时自动，且排在 `create_all()` **之前** |
@@ -361,7 +363,7 @@ localStorage，再通过 CDP 逐页设置视口。两个踩坑记录写在脚本
 $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe -m pytest
 ```
 
-`tests/` 下三个文件共 **291** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
+`tests/` 下三个文件共 **293** 项：`test_units.py`（导入校验/分块/编码/部门过滤/环比与 KPI 计算/**规则分档优先级**/**期间口径与上期换算（季度、年度、跨年）**/**落库合计与缺月判定**/按路径耗时采样/**慢接口告警阈值、按路径覆盖与日志限流**/**期间边界是左闭右开且区间比较不含 `to_char`**/**期间锁（key 稳定不撞号、补全含季与年、加锁顺序与去重且只传月名也会补全）**/**账号锁定退避（5 次→60 秒、翻倍、900 秒封顶、静默期归零、没到阈值不写锁定时间、`last_failed_at` 是 naive 时按 UTC 读）与解锁（清计数、返回原先锁了多久）**/**弱口令规则（9 个弱口令被拒各有中文原因、4 个正常口令放行、l33t 还原后 `Passw0rd!2026` 仍被认出、用户名本身不能当口令）**/**覆盖率门槛的解析（node 20 平铺与 node 22+ 树形两种覆盖表解析成同一组路径、pytest 的 TOTAL 行与用例计数——「7 files skipped due to complete coverage」不能被读成用例被跳过）**/**接口契约快照（快照与真实路由双向一致、契约文档点名的接口必须存在、每个接口都有说明、差异文案会点名增删的接口与模型、`{id}` 与 `{transaction_id}` 归一成同一路径）**/**截图基线（容差边界 8 不算变而 9 算变、尺寸不符单独判失败、差异图把变了的像素涂红、基线文件名稳定、manifest 能抓出少一张/多一张/被手工改过与尺寸不符、基线图缺失、重拍时只替换被重拍的那几条而不是清空 manifest）**/**后台任务幂等（退避序列 2/4/8/16 与 60 秒封顶、`attempts`/`max_attempts` 为 NULL 时按 0/3 读、活跃去重指纹忽略 `ip` 且与字段顺序无关）**/**备份与恢复（manifest 逐成员校验：sha256 与字节数对不上、成员被删、多出没记录的文件、逐表行数与清单不一致、字段列表为空、格式版本不对、文件计数不一致，各给一句中文说明；成员名拒绝空名/绝对路径/`..`/盘符，含穿越成员的归档一读就拒并说明「跑到归档外面」；逐表行数对平点名是哪张表；字节数与归档文件名的格式化；上传件清单带 sha256；`prune` 只留最近 N 份）**/**安全响应头（请求 id 的合规边界 128 算、129 不算，中文/换行/分号/斜杠一律重生成；接口与文档页两套 CSP 只在 CSP 与 HSTS 上有差别、HSTS 只认 `X-Forwarded-Proto` 的第一段；文档路由判定不误伤 `/api/v1/docs`；gzip 排除表含 `text/event-stream` 与 Office/PDF，门槛 ≥1024 字节；中间件用的是 `setdefault`——已有的头不覆盖，唯独请求 id 一律覆盖成服务器认定的那个；`Tee-Object` 在 Windows PowerShell 5.1 上写出的 **UTF-16 日志也能读**，同一份字节按 utf-8 解就是找不到 `request_id=`）**/**Prometheus 指标与结构化日志（计数器与仪表渲染出的文本、直方图内部只记「落在哪个桶」而渲染时才累加且 `le="+Inf"` 恒等于 `_count`、标签值转义与标签个数不匹配直接报错、`route` 取路由模板而没匹配上路由记 `unmatched`、读库失败时 `finance_db_up` 置 0 且端点不抛、JSON 日志只留白名单字段（塞进 `extra` 的口令不会出现）且 `configure_logging()` 不摘别人挂的 handler、反复调用幂等、慢接口告警的 `path`/`duration_ms`/`threshold_ms`/`exceeded`/`suppressed` 真进了 JSON）**/**Agent 会话与用量（用量三路记账：网关报量 = `api`、按字数折算 = `estimated`、一次模型都没调 = `free`；全 0 的用量是网关占位不算账单，`total` 缺了用 prompt + completion 补；流式回退只在「还没吐出任何字」时发生且只一次；状态归一：120 秒没动静的 `streaming` 读成「已中断」而库里那份不动；停止注册表能收下「生成器还没起来」时早到的停止请求并释放 `Event`；`session_counts` 只数 `assistant`；`start_exchange` 先写占位行并派生标题；`finish_exchange` 按报量与估算两路记账；删会话连同它的消息；`usage_stats` 与 `daily_series` 的窗口含今天、缺日补 0）**/**业务时区（`Zone`/`is_valid`/`now`/`today` 取值、naive 时间戳按 UTC 读而不是按本机时区、`day_bounds` 左闭右开且夏令时那天只有 23 小时、`month_of` 跟业务日历而不是 UTC、`label`/`describe` 说清用了哪个偏移、`usage_stats` 的窗口起点是业务日 00:00）**）、
 **多轮上下文（⑰）**：`history_for` 只收写完的成对问答（`error`/`interrupted`/还在 `streaming` 的、以及没有回答的孤零零提问整对丢掉）、超预算从最老的一整对开始丢（宁可少一轮不给半轮）、任一预算为 0 即关掉多轮、`truncated` 只表示「有更早的没带上」；`_messages` 的顺序是 system → 历史 → 本轮，历史里混进的 `system`/非法 role/空正文被丢掉且本轮的证据紧挨本轮提问；`stream` 透传 history 而位置参数不变（旧调用照旧）**、`test_config.py`（占位密钥与 CORS 校验、启动 strict 语义、**`BUSINESS_TIMEZONE` 默认 `Asia/Shanghai`、`UTC+8`/`Not/AZone`/空串进 `config_problems`、带尾空格的合法名被规范化**、**`AGENT_HISTORY_MAX_TURNS` 默认 6、`AGENT_HISTORY_MAX_TOKENS` 默认 1500、两项为 0 是合法配置（= 关掉多轮）、负数进 `config_problems`**）、`test_api.py`（受保护接口匿名 401、
 真实 ASGI 走完导入→重算→预警→看板→报告→RAG 去重→SSE 流式→PPT 大纲与下载→系统状态脱敏→
 管理员入口鉴权与批次撤销重算→**部门数据隔离**：受限账号只读到本部门口径、拿别人的预警 id 也钻取不到明细、
@@ -457,7 +459,7 @@ cd frontend; npm test        # 等价于 node --test --import ./tests/support/re
 cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「代码风格与 lint」）
 ```
 
-53 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
+54 项，跑在 Node 自带的测试运行器上（**不引入 vitest / jsdom / @vue/test-utils**，本机 Node v24 直接用）：
 
 - `frontend/tests/format.test.mjs`：`src/utils/format.js` 里的表格/时长/期间格式化，
   以及部门文本的收发（`parseDepartments` 按 `、,，;；` 与空白切分、去重保序、截到 20 个上限；
@@ -468,7 +470,7 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
 - `frontend/tests/markdown.test.mjs`：`src/utils/markdown.js` 的安全与结构。
   最要紧的一条是 `renderMarkdown('<script>alert(1)</script>')` 的输出里**不含 `<script>`**——
   报告页与 Agent 回答都用 `v-html` 渲染它，一旦「先解析后转义」的顺序被改反，模型输出就成了可执行 HTML。
-- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（25 项）：
+- `frontend/tests/components.test.mjs`（6 项）与 `frontend/tests/interaction.test.mjs`（26 项）：
   `.vue` 组件在**没有 DOM 的 Node 里真挂载、真点击**。做法是两条自造的支撑：
   `tests/support/sfc-loader.mjs` 是个 Node ESM 钩子，用 `vue/compiler-sfc` 的
   `parse` + `compileScript({ inlineTemplate: true })` 现场把 `.vue` 编成客户端组件
@@ -493,7 +495,10 @@ cd frontend; npm run lint    # eslint，只看「写错了」（配置见下「�
   `POST /admin/alert-deliveries/{id}/retry`、
   **导出按钮组（⑲）**：指标导出的季度/年度两个按钮靠标签前缀区分、点击后请求里真的带上 `grain=quarter|year`，
   以及**页面自带口径时不再叠加全局口径**（`department=` 在查询串里只出现一次且是页面上那个值，
-  全局那个 018 一个字都不出现，`period`/`batch`/`query` 跟着页面上的筛选一起走）。
+  全局那个 018 一个字都不出现，`period`/`batch`/`query` 跟着页面上的筛选一起走）、
+  **管理员标识（⑳）**：侧边栏「管理员」组按 `is_admin` 显隐（`unrestricted` 为真但 `is_admin` 为假
+  时**不**出现「管理概览」，两者不能互相推），被收窄到某个部门的管理员**照样进得了**管理端
+  （能不能管与数据范围是两件事），系统设置页那三格（当前账号 / 数据范围 / 管理员标识）只读。
   这套测试当场抓到一个真 bug：`AgentChat.vue` 的「重试」按钮读的是发送后已被清空的输入框，
   等于点了没点——修法是记住 `lastQuestion`。
 
@@ -609,8 +614,8 @@ prettier、并且这一节写明了「写错」与「排版」的边界 —— �
 
 | job | 跑什么 | 覆盖到什么 |
 | --- | --- | --- |
-| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 291 项 + 覆盖率门槛 |
-| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 53 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
+| `backend` | 起一个 `pgvector/pgvector:pg16` 服务（与 compose 同一个 tag，带 `pg_isready` 健康检查）→ 装 CPU 版 torch 与 `requirements.txt` → `check_all.py --quick`（含 ruff lint 与接口契约快照）→ `verify_ci_workflow.py` → `check_coverage.py`（内部就是 `python -m pytest` 全量） | 结构体检（编码/语法）+ ruff lint + 接口契约快照 + 后端全量 293 项 + 覆盖率门槛 |
+| `frontend` | node 20 + `npm ci` → `npm run lint`（eslint）→ `npm run format:check`（prettier）→ `npm test` → `check_frontend_coverage.py` → `npm run build` | 前端 54 项 + lint/排版 + 覆盖率门槛 + 生产构建（本机沙箱里构建要绕路，这里才是它的主场） |
 
 三处都是「绿得没有意义」的坑，工作流里写成显式的一步：
 
@@ -921,7 +926,7 @@ Prometheus 的基数撑爆，而被撑死的是监控不是接口。真机验证
 | `/financial/transactions` | 明细更正（按期间/部门口径/关键字/批次筛选、翻页、行内更正、两步冲销、**导出明细**——带上页面上这套筛选） | `GET /financial/transactions`、`PATCH /financial/transactions/{id}`、`POST /financial/transactions/{id}/reverse`、`GET /export/transactions` |
 | `/reports` | 报告导出（Word `.docx` + Markdown 月报，可复制 / 打印导出 PDF / 下载 `.md`） | `GET /reports/docx`、`GET /reports/monthly?period=YYYY-MM` |
 | `/reports/pptx` | PPT 报告（先看逐页大纲，再下载 `.pptx`） | `GET /reports/pptx/outline`、`GET /reports/pptx` |
-| `/settings` | System 设置（我的部门 + 运行态与配置体检） | `GET /system/status`、`PATCH /auth/me` |
+| `/settings` | System 设置（当前账号 + 数据范围 + 管理员标识，只读；运行态与配置体检） | `GET /system/status` |
 | `/agent` | 财务分析 Agent 工作台（示例问题 + 流式问答 + 依据） | `POST /ai/agent/chat/stream`（SSE） |
 | `/admin` | 管理概览（数据规模、完整性体检、**季度/年度落库**与缺月清单、季/年**导出**、最近批次、接口观测） | `GET /admin/overview`、`GET /admin/rollups`、`POST /admin/rollups/rebuild`、`GET /export/metrics?grain=` |
 | `/admin/users` | 用户管理（按用户名/部门/是否受限筛选、分页、改部门、删除） | `GET/PATCH/DELETE /admin/users[/{id}]` |
@@ -1057,15 +1062,22 @@ pgvector 是否安装、Embedding 模型与维度、大模型是否已配置、�
 以及**目录可写性**（真写一个探针文件再删，而不是只看路径是否存在）。密钥与口令只报告「有没有配」，
 数据库 URL 里的口令会打码成 `user:***@host`；`config_problems` 复用启动时的 `Settings.validate()`。
 
-「我的部门」走 `PATCH /api/v1/auth/me`：留空表示不受限制（财务管理员），填写后知识库检索只返回
-「本部门 + 未标注部门」的片段。**一个账号可以填多个部门**（用「、」分隔），看到的是这些部门的
-并集——金额相加、比率按相加后的金额重算（比率不能相加）。部门**只认服务端记录**，不采信请求头
-自述（避免伪造提权）。
+设置页现在**只读**：三张卡分别是「当前账号」「数据范围」「管理员标识」，都读 `GET /system/status` 的
+`me`。（⑳ 之前这里有输入框，走 `PATCH /api/v1/auth/me`；那条自助入口正是「把自己部门清空 = 升成
+管理员」的入口，现在一律 403 并留 `user.department_self_denied` 审计。）想改范围请找管理员在
+`用户管理` 里分配；只是想换一次查看口径，用页面右上角的「查看口径」下拉——那走的是请求参数，
+不写库、也不改账号属性。
 
-> 设置页的输入框与「当前：」一行读的是 `GET /system/status` 里的 `me.departments`。
+一个账号可以有**多个部门**，看到的是这些部门的并集——金额相加、比率按相加后的金额重算（比率不能相加）。
+**一个部门都没分配**的账号什么都看不到（空范围不是「不受限」），知识库里只剩没标部门的公共资料。
+部门**只认服务端记录**，不采信请求头自述（⑳ 起连兼容参数都删掉了：那条路径同样能被伪造头提权）。
+
+> 设置页读的是 `GET /system/status` 里的 `me.departments` 与 `me.is_admin`。
 > 这里踩过一个真坑：最初只回了单值列 `department`，多部门账号（018+097）一进页面就只看到
 > `018`、页面写着「限定 018」，点一次保存就把自己缩成了一个部门。真机冒烟脚本当场抓到，
 > 现在 `me` 同时给 `departments`（完整列表）与 `department`（第一个部门，老文案用）。
+> ⑳ 之后还多一个坑：`unrestricted`（数据范围）与 `is_admin`（权限）**不能互相推**——早先
+> 前端正是用 `unrestricted` 当管理员判据，才把「清空部门」变成了自助升权。
 
 同一页还有「登录与令牌」卡片：显示当前账号与会话版本（`me.token_version`）、本机会话是否有效，
 以及「退出登录（作废全部令牌）」按钮——令牌是无状态的，退出不是清本地那一份，而是把账号的会话版本 +1
@@ -1209,7 +1221,11 @@ URL 上体现为 `?department=097`。切换后页面顶部会出现提示条，�
   中文标签）、对象类型与 id、来源 IP、以及一小袋 detail（如改规则的前后阈值、撤销批次删了多少行）。
   **不记密码、令牌、文件内容与明细金额**：`_scrub()` 会把键名含 `password/token/secret/authorization/api_key/hash`
   的字段整条丢掉（任意嵌套深度都丢）、字符串截断到 200 字、列表只留前 50 项。
-- 28 个动作在 `ACTIONS` 里登记（含 ⑩ 的 `job.retry` 重试后台任务）；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
+- 37 个动作在 `ACTIONS`（`backend/audit.py`）里登记（含 ⑩ 的 `job.retry` 重试后台任务、⑭ 的 `alert_channel.*` 与 `alert_delivery.retry`、⑮ 的 `agent_session.delete`、⑳ 的 `user.department_self_denied` 与 `user.admin_change`）；写一条未登记的动作不会失败，但会打 warning——避免埋点时漏改这里就静默少记。
+- ⑳ 起 `PATCH /auth/me` 一律 **403** 并留 `user.department_self_denied`（detail 带你打算改成什么）：
+  数据范围与管理员标识只能由管理员在 `PATCH /admin/users/{id}` 改，两条变化分别留
+  `user.department_change` / `user.admin_change`。`user.department_self` 保留但已无成功路径，
+  老库里的历史记录仍能按它筛出来。
 - **审计失败不影响业务**：`record()` 内部兜住所有异常，写日志失败只记 error，不会把接口带崩。
 - detail 与业务写在**同一个事务**里（`record(..., commit=False)`），业务回滚时日志也不落地；
   只有登录失败/被限流这两条走 `commit=True`（那时没有业务事务可依附）。
@@ -1442,17 +1458,30 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 
 ### 管理员入口
 
-权限模型没有引入角色字段，而是沿用上面同一条语义：**部门列表为空 = 不受部门限制 = 管理员**。
-权威值是 `User.departments`（JSONB 数组），老的单值列 `User.department` 保留为「第一个部门」的回落
-（列表为空时按它读）——这样多部门上线前建的账号**不需要数据迁移**，审计与导出文案读单值列也不会炸。
-这样不需要角色表就能落地，代价是所有新建账号默认都是管理员——所以它只是「数据可见范围」的开关，
-不是安全边界；`backend/api_admin.py` 的 `admin_user` 依赖对每个管理接口都做一次校验，
-非管理员拿到的是 **403（而不是空数据）**，避免「看不到」被误读成「没有」。
+权限模型曾经没有角色字段，而是沿用数据范围那条语义：**部门列表为空 = 不受部门限制 = 管理员**。
+那个设计有个真口子——`PATCH /auth/me` 允许账号改自己的部门，于是**任何新注册账号只要把自己部门清空
+（或干脆重发一个空数组）就成了管理员**，可读全库、可改别人账号、可撤销批次。⑳ 把它拆成两件事：
+
+- **权限**：显式的 `User.is_admin`（BOOLEAN NOT NULL DEFAULT false，⑳ 新增列）。管理接口的 `admin_user`
+  依赖只认它，非管理员拿到 **403（而不是空数据）**，避免「看不到」被误读成「没有」。
+- **数据范围**：`User.departments`（JSONB 数组，权威值）+ 老的单值列 `User.department`（「第一个部门」的
+  回落，列表为空时按它读）。空数组 = **未分配部门 = 什么都看不到**（空范围不是「不受限」）。
+
+两条规则各有各的入口：管理员标识只能由**另一个管理员**在 `PATCH /admin/users/{id}` 上改（或运维脚本
+`scripts/grant_admin.py <账号> [--revoke]`），数据范围同样只能由管理员分配。`PATCH /auth/me` 现在一律
+**403** 并留 `user.department_self_denied` 审计；只是想换一次查看口径，用请求里的 `?department=` 参数。
+
+迁移把老库按「原先不受部门限制 = 管理员」回填（`backend/migrations.py` 的 `BACKFILLS`：`departments`
+为空且 `department` 为空的账号 `is_admin = true`），所以升级后原管理员不会突然进不去；全新部署则靠
+`bootstrap_admin()`——**空库的第一个注册者**自动是管理员，表一旦非空就借不到第二次。
+收尾两条守卫：**不能收回/删除最后一个管理员**（接口 400，`grant_admin.py --revoke` 同样拒绝），
+免得出事后这个库再没有人能管。
 
 侧边栏「管理员」组（`管理概览 / 用户管理 / 部门权限 / 预警规则 / 审计日志 / 导入批次 / 知识库管理`）放在**最下面**（在「系统」之后）：
-它平时用不到，只有需要运维时才找。这一组只对管理员显示，但地址栏可以被
+它平时用不到，只有需要运维时才找。这一组只对**有管理员标识**的账号显示（`is_admin`，与数据范围无关：
+被收窄到某个部门的管理员照样进得来，只是数据只有那一个部门），但地址栏可以被
 手动输入，所以 `frontend/src/router/index.js` 的守卫对 `meta.admin` 路由会自己拉一次
-`/auth/me` 再判权限，不通过就跳回 `/dashboard?denied=admin`（看板顶部会解释原因）。
+`/auth/me` 再判 `is_admin`，不通过就跳回 `/dashboard?denied=admin`（看板顶部会解释原因）。
 前端把这次查询收敛在 `frontend/src/api/session.js`：模块级 ref + 进行中的 Promise 缓存，
 整站只请求一次，侧边栏和守卫读同一份。
 
@@ -1476,13 +1505,18 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
   按用户（未受限账号的部门列写「不受限」）与逐日明细，账单价与估算价分开报。
   它单独发一个请求、单独一套错误状态：**用量统计失败只让这张卡报错，整页概览照常显示**。
 - **用户管理**：改部门立即改变该账号**财务数据与知识库**的可见范围；部门栏可以填**多个**部门
-  （用「、」分隔，后端收 `departments` 数组），留空等于清空（升级为管理员）。多部门账号那一行的
-  角色列写「限定 N 个部门」。每行还有「会话」列（`未作废过` / `已作废 N 次`，读 `token_version`）
+  （用「、」分隔，后端收 `departments` 数组），**留空＝未分配（看不到任何数据），不再等于升级为管理员**。
+  每行的「权限」列是管理员徽章 + 一组按钮：`授予管理员` / `收回管理员` 只发 `{"is_admin": true|false}`
+  一个字段，**部门一个字都不动**（后端按 `model_fields_set` 判断客户端到底发没发部门字段，早先的
+  实现会把只发 `is_admin` 的请求当成「部门也是空的」、顺手把范围清掉）；`is_admin` 与 `unrestricted`
+  两列各自独立，被收窄到某个部门的管理员那一行会同时写「管理员」与「看 N 个部门」。
+  每行还有「会话」列（`未作废过` / `已作废 N 次`，读 `token_version`）
   与「强制下线」按钮（`POST /admin/users/{id}/logout`，把自己账号的会话版本 +1，见「会话版本号与强制下线」），
   自己那行禁用。
-  **不允许通过管理接口改自己或删自己**（`400`）：改自己的部门会立刻把自己锁在管理入口之外。
-  删除账号只移除登录凭据，财务数据是按批次入库的，不受影响。列表支持按用户名模糊搜、按部门
-  （含「未限定部门」这一项）筛选与翻页；按部门筛选用的是
+  **不允许通过管理接口改自己或删自己**（`400`）：改自己的部门会立刻把自己锁在管理入口之外（管理员标识
+  也不行——自助扩权是 ⑳ 修掉的那个口子，请找另一个管理员）。删除账号只移除登录凭据，财务数据是按批次
+  入库的，不受影响；**最后一个管理员删不得**（400）。列表支持按用户名模糊搜、按部门
+  （含「未分配部门」这一项）筛选与翻页；按部门筛选用的是
   `(department == X) | departments.contains([X])`，否则「018+097」这种账号在按 018 查时会被漏掉。
 - **部门权限**（`/admin/departments`）：`GET /admin/departments` 把「明细里的部门列 + 指标/预警的部门行 +
   被账号引用的部门」合并成一份部门清单，逐部门给出明细行数、收入/费用金额、期间区间、指标/预警行数、
@@ -1587,7 +1621,8 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 
 ## 部门数据权限
 
-权限模型见「管理员入口」一节：部门列表为空 = 不受限（管理员），有值 = 只看这些部门。
+权限模型见「管理员入口」一节：**权限**看显式的 `User.is_admin`（能不能进管理端），**数据范围**看
+`User.departments`（`None` = 不受限，有值 = 只看这些部门，**空数组 = 未分配部门 = 什么都看不到**）。
 知识库片段一直按部门过滤，**财务数据现在也按部门过滤**，而且过滤落在数据层而不是查询层：
 
 - 一次 `calculate()` 写**两套行**：全公司口径（`financial_metrics.department IS NULL`）与
@@ -1607,10 +1642,12 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
 
 `User.departments` 是权威值（JSONB 数组），含义从「一个部门」放宽成「一组部门」，实现上分三层：
 
-- **读权限**：`backend/scope.py` 的 `Scope` 类型是 `tuple[str, ...] | None`（`None` = 不受限）。
-  `scope_metric` / `scope_alert` 用 `.department.in_(scope)`（单部门退化成 `==`，无部门时仍是
-  `.is_(None)`），`scope_transactions` 用 `.in_(scope)`；`in_scope(scope, department)` 给预警这类
-  逐行判断用。RAG 侧同理：`filter_visible` 放行的条件是「片段没标部门 or 片段部门在元组里」。
+- **读权限**：`backend/scope.py` 的 `Scope` 类型是 `tuple[str, ...] | None`（`None` = 不受限，
+  **空元组 = 未分配部门 = 什么都看不到**）。`scope_metric` / `scope_alert` 用 `.department.in_(scope)`
+  （单部门退化成 `==`，不受限时是 `.is_(None)`，空元组时 `in_(())` 恒假），`scope_transactions`
+  用 `.in_(scope)`；`in_scope(scope, department)` 给预警这类逐行判断用（不受限恒真、空范围恒假）。
+  RAG 侧同理：`filter_visible` 放行的条件是「片段没标部门 or 片段部门在元组里」，所以空范围账号
+  只剩没标部门的公共资料。
 - **同期多行怎么算**：`metric_totals(rows, period_order=...)` 按期间聚合——**单行期间沿用库里存的
   比率**（避免与已经展示过的数字末位跳动），**多行期间金额相加、比率用相加后的金额重算**
   （比率不能相加，实测多部门「收支差额率」-422189.52% 与差额÷收入完全一致）。
@@ -1624,15 +1661,17 @@ JWT 是无状态的：**签出去就收不回来**。改密码、删账号都拦
   而它恰恰是最需要在两个部门之间来回收窄的那个账号；下拉首项也按账号类型换文案
   （不受限 =「全公司（全部部门）」，多部门 =「我绑定的 N 个部门（合计）」），
   否则受限账号会以为自己不选就是全公司口径。
-- **完整性判断**：`_totals_by_months` 要求「每月的行数 == 范围内部门数」（`expected = len(scope)`），
-  某一部门缺一期就不算环比——用 distinct 期间数会把缺数据当成完整，环比直接算错。
+- **完整性判断**：`_totals_by_months` 要求「每月的行数 == 范围内部门数」（`expected = 1 if scope is None
+  else len(scope)`；全公司一行、多部门一本账一行、空范围 0 行），某一部门缺一期就不算环比——用 distinct
+  期间数会把缺数据当成完整，环比直接算错。
 - 报告/PPT/导出的标题、副标题、文件名都带多部门口径：`scope_label`（「部门 018、097 等 N 个部门」）、
-  `scope_slug`（文件名用的 `018-097`）、`scope_text`（审计与封面用的 `018、097`）、
+  `scope_slug`（文件名用的 `018-097`，空范围是 `none`）、`scope_text`（审计与封面用的 `018、097`，
+  空范围是「未分配部门」而不是空串——审计详情里的 `scope` 空着就分不清「全公司」和「压根没范围」）、
   `row_label`（数据行级的「部门 097」）。**别把字符串传给收元组的 `scope_label`**——早先有一处
   这么写，结果按字符长度渲染出了「部门 097 等 3 个部门」。
 
-「限制部门账号」的代价是所有新建账号默认都是管理员（见「管理员入口」），
-所以这套东西管的是**数据可见范围**，不是安全边界。
+这套东西管的是**数据可见范围**，不是安全边界；能不能进管理端另看 `User.is_admin`（见「管理员入口」），
+两者的关系是「权限决定能进哪个页面、范围决定能读哪几行」，互相推不出来。
 
 把数据真正留在库里供前端浏览：
 

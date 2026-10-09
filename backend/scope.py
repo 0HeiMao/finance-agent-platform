@@ -1,9 +1,14 @@
 """数据范围（部门权限）——把「这个账号能看到哪些数据」收敛到一处。
 
-规则只有一条，财务数据与知识库共用：
+规则只有两条，财务数据与知识库共用：
 
-- 账号的部门列表为空 = 不受部门限制（财务管理员），看到全公司口径；
-- 有一个或多个部门 = 只看这些部门的明细，以及由这些明细重算出来的指标与预警。
+- **能不能管**看账号上的管理员标识（`is_admin`），与数据范围无关；
+- **能看哪些数据**看部门列表：有一个或多个部门 = 只看这些部门的明细，以及由这些明细重算出来的
+  指标与预警；一个部门都没有的普通账号**什么都看不到**（不是「不受限」）。
+
+⑳ 之前第二条只有「空 = 不受限」一种解释，权限也搭在上面（`is_admin()` = 没有部门限制）——
+结果是任何账号把自己的部门清空就等于升权，自助注册的新账号更是一注册就是全库管理员。
+现在「没配部门」对普通账号只表示「范围还没分配」，管理员标识由 `users.is_admin` 单独记。
 
 **为什么是一个列表而不是单个部门**：集团里一个分析员常同时管两三个部门，
 以前只能靠建三个账号或干脆放开成不受限（那等于把别的部门也看光）。多部门是
@@ -54,10 +59,30 @@ def departments_of(user) -> tuple[str, ...]:
     return tuple(items)
 
 
+def is_admin(user) -> bool:
+    """账号能不能管（显式的管理员标识），与「能看哪些数据」是两件事。
+
+    ⑳ 之前这里是 `not departments_of(user)`：权限搭在部门列表上，于是
+
+    - 任何登录账号 `PATCH /auth/me {"departments": []}` 就能把自己升成管理员；
+    - `POST /auth/register` 建的账号不带部门，**一注册就是**管理员（可读全库、可管用户）。
+
+    现在只读 `User.is_admin` 这一位；老库按「原先不受部门限制 = 管理员」回填
+    （见 `backend/migrations.py` 的 BACKFILLS），所以升级当天演示账号照旧是管理员。
+    `getattr(..., False)` 兜底：单元测试与一次性脚本里会拿 SimpleNamespace 之类的假对象进来。
+    """
+    return bool(getattr(user, "is_admin", False))
+
+
 def scope_of(user) -> Scope:
-    """当前账号的数据范围；None 表示不受部门限制（财务管理员）。"""
+    """当前账号的数据范围。
+
+    - 管理员**且**没配部门 → None（全公司口径；要看某个部门时用 `?department=` 收窄这一次请求）；
+    - 配了部门（管理员也可以被收窄） → 那几本部门账，管理权不受影响；
+    - 非管理员且没配部门 → 空元组：范围还没分配，**什么都看不到**（不是不受限）。
+    """
     items = departments_of(user)
-    return items or None
+    return items or (None if is_admin(user) else ())
 
 
 def scope_of_departments(departments: list[str] | tuple[str, ...] | None) -> Scope:
@@ -73,6 +98,10 @@ def scope_of_departments(departments: list[str] | tuple[str, ...] | None) -> Sco
 def scope_label(scope: Scope) -> str:
     if scope is None:
         return "全公司"
+    if not scope:
+        # 空范围不是「全公司」也不是「部门 」——文案里必须一眼看出是「还没分配」，
+        # 否则受限账号会把「什么都看不到」误读成「数据没了」。
+        return "未分配部门"
     if len(scope) == 1:
         return f"部门 {scope[0]}"
     head = "、".join(scope[:3])
@@ -81,13 +110,25 @@ def scope_label(scope: Scope) -> str:
 
 
 def scope_slug(scope: Scope) -> str:
-    """文件名里的口径片段：全部部门 -> all，单部门 -> 097，多部门 -> 018-097。"""
-    return "all" if scope is None else "-".join(scope)
+    """文件名里的口径片段：全部部门 -> all，单部门 -> 097，多部门 -> 018-097。
+
+    空范围给 `none` 而不是空串：导出文件名是 `...-{scope_slug}.csv`，空串会多出一个
+    连字符（`transactions-2026-07-.csv`），也让人分不清「没范围」和「模板拼错了」。
+    """
+    if scope is None:
+        return "all"
+    return "-".join(scope) or "none"
 
 
 def scope_text(scope: Scope) -> str:
-    """给人看/给审计详情存的口径文案：「全部部门」或「097」/「018、097」。"""
-    return "全部部门" if scope is None else "、".join(scope)
+    """给人看/给审计详情存的口径文案：「全部部门」、「097」/「018、097」或「未分配部门」。
+
+    空范围刻意**不**返回空串：审计详情里的 `scope` 字段空着，事后没人分得清是「全公司」
+    还是「这个账号压根没范围」——而这两件事在 ⑳ 之后是不同的东西。
+    """
+    if scope is None:
+        return "全部部门"
+    return "、".join(scope) or scope_label(scope)
 
 
 def row_label(department: str | None) -> str:
@@ -150,6 +191,9 @@ def scope_payload(scope: Scope, *, requested: str | None = None) -> dict:
 def _scope_note(scope: Scope) -> str:
     if scope is None:
         return "当前账号不受部门限制，看板与分析为全公司口径。"
+    if not scope:
+        return ("当前账号还没有分配部门，看不到任何财务数据；知识库只看到没标部门的公共资料 —— "
+                "数据范围由管理员在管理端的用户管理里分配。")
     if len(scope) == 1:
         return (f"当前账号只看到「部门 {scope[0]}」的明细与据此重算的指标、预警；"
                 "部门为空的数据行归全公司口径，不在本范围。")

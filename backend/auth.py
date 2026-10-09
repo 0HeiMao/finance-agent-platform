@@ -5,11 +5,11 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend import audit, lockout, passwords
+from backend import audit, lockout, passwords, scope
 from backend.config import get_settings
 from backend.db import get_db
 from backend.models import User
@@ -61,6 +61,18 @@ def revoke_tokens(user: User) -> int:
     user.token_version = token_version_of(user) + 1
     return user.token_version
 
+def bootstrap_admin(db: Session) -> bool:
+    """库里一个账号都没有时，第一个注册的人就是管理员。
+
+    这是**全新部署的引导路径**：老库靠 `backend/migrations.py::BACKFILLS` 把你原来「没配部门」
+    的账号回填成管理员，可一个空的库没有「原来」，不给人一条路的话新部署上线第一天就没人能进
+    /admin（连给账号分配部门都做不到）。规则只在表为空成立，所以它借不到第二次：临时注册一个
+    小号再回头想升权是不成立的。要是库非空却已经没人有管理员标识，用
+    `python scripts/grant_admin.py <用户名>` 救回来。
+    """
+    return (db.scalar(select(func.count()).select_from(User)) or 0) == 0
+
+
 @router.post("/register")
 def register(payload: Credentials, request: Request, db: Session = Depends(get_db)):
     """注册。弱口令在这里就被挡住（400），不留半条记录——见 `backend/passwords.py`。
@@ -82,7 +94,12 @@ def register(payload: Credentials, request: Request, db: Session = Depends(get_d
                      detail={"username": payload.username, "problems": issues},
                      request=request, commit=True)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "；".join(issues))
-    user = User(username=payload.username, password_hash=pwd_context.hash(payload.password))
+    user = User(username=payload.username, password_hash=pwd_context.hash(payload.password),
+                # ⑳ 注册出来的账号**不是**管理员，也**没有**任何部门范围。
+                # 这两件事以前是同一件（没有部门 = 不受限 = 管理员），于是注册接口本身就是个提权入口：
+                # 注册一个新名字就能读全库、进 /admin。现在新账号要由管理员分配部门才看得到数据。
+                # 唯一的例外是空库的第一个账号，见 bootstrap_admin()。
+                is_admin=bootstrap_admin(db))
     db.add(user)
     try:
         db.commit()
@@ -92,7 +109,8 @@ def register(payload: Credentials, request: Request, db: Session = Depends(get_d
     db.refresh(user)
     # 只记用户名，不记密码（audit._scrub 还会再兜一层）
     audit.record(db, user, "user.register", target_type="user", target_id=user.id,
-                 detail={"username": user.username}, request=request, commit=True)
+                 detail={"username": user.username, "is_admin": user.is_admin},
+                 request=request, commit=True)
     return {"id": user.id, "username": user.username}
 
 @router.post("/login")
@@ -187,12 +205,17 @@ class DepartmentInput(BaseModel):
 
 
 def _profile(user: User) -> dict:
-    """账号档案：部门列表是权威值，`department` 只是给老前端的单值回落。"""
+    """账号档案：部门列表是权威值，`department` 只是给老前端的单值回落。
+
+    `is_admin`（能不能管）与 `unrestricted`（当前是不是全公司口径）是**两个**字段，不能互相推：
+    管理员被收窄到某个部门时 `is_admin` 仍为 true，而 `unrestricted` 是 false。
+    """
     departments = list(departments_of(user))
     return {"id": user.id, "username": user.username,
             "department": departments[0] if departments else None,
             "departments": departments,
-            "unrestricted": not departments,
+            "is_admin": scope.is_admin(user),
+            "unrestricted": scope.scope_of(user) is None,
             # 会话版本号：每次退出登录/被强制下线 +1，用来解释「为什么旧令牌突然 401」
             "token_version": token_version_of(user)}
 
@@ -205,27 +228,31 @@ def read_me(user: User = Depends(current_user)) -> dict:
 @router.patch("/me")
 def update_me(payload: DepartmentInput, request: Request, user: User = Depends(current_user),
               db: Session = Depends(get_db)) -> dict:
-    """设置/清空自己的部门（可以一次给多个）。留空表示不限制部门（财务管理员口径）。
+    """**已停用**（⑳）：数据范围与管理员标识不能再由账号自己改。
 
-    刻意不让前端用请求头自述部门：那样任何登录用户都能伪造 finance-admin 看到全部资料。
+    ⑳ 之前这里允许任何登录用户设置/清空自己的部门，而 `is_admin()` 当时的定义是「没有部门限制」，
+    于是 `PATCH /auth/me {"departments": []}` 是一键升权：任何账号（包括刚在 `/auth/register`
+    注册出来的）都能把自己变成全库管理员，读所有人的明细、管所有账号、撤销批次。
+
+    之所以**保留路由并明确拒绝**，而不是删掉它：老客户端与脚本调到这里时会拿到一句能照着做的
+    错话，而不是一个莫名其妙的 404/405。两件真实需求各有去处：
+
+    - 「我是管理员，现在只想看某个部门」→ 页面顶部的口径下拉（`?department=`），只影响这一次查看；
+    - 「这个账号该看哪几个部门 / 该不该是管理员」→ 管理端用户管理（`PATCH /admin/users/{id}`），
+      由**另一个**管理员分配，并留审计。
+
+    被拒也留痕：这是「账号试图给自己扩权」的信号，值班时应该看得见。
     """
-    if payload.departments is not None:
-        wanted = [item.strip() for item in payload.departments if (item or "").strip()]
-    else:
-        single = (payload.department or "").strip()
-        wanted = [single] if single else []
-    previous = "、".join(departments_of(user)) or "不受限"
-    user.departments = wanted or None
-    # 单值列同步成第一个部门，只用于展示/审计文案（读权限一律走 scope_of）。
-    user.department = wanted[0] if wanted else None
-    db.add(user)
-    # 改自己的部门 = 改自己的可见范围，必须留痕（旧值 → 新值）
-    audit.record(db, user, "user.department_self", target_type="user", target_id=user.id,
-                 detail={"from": previous, "to": "、".join(wanted) or "不受限", "username": user.username},
-                 request=request)
-    db.commit()
-    db.refresh(user)
-    return _profile(user)
+    wanted = payload.departments if payload.departments is not None else [payload.department]
+    audit.record(db, user, "user.department_self_denied", target_type="user", target_id=user.id,
+                 detail={"username": user.username,
+                         "reason": "数据范围与管理员标识只能由管理员分配（⑳）",
+                         "attempted": [str(item or "") for item in wanted or []]},
+                 request=request, commit=True)
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        "数据范围与管理员标识只能由管理员在管理端的用户管理里分配；"
+        "只是想按某个部门看这一次，请用页面顶部的口径下拉。")
 
 
 @router.post("/logout")

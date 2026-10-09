@@ -169,7 +169,9 @@ def main() -> int:
           version_fresh == 1 and status == 200 and payload["token_version"] == 1,
           f"ver={version_fresh}，/auth/me → {status}")
 
-    status, payload = call("GET", "/admin/audit?action=user.logout", fresh_a)
+    # 审计只有管理员读得到：A 是自助注册的普通账号（⑳ 起注册≠管理员），
+    # 所以这里换管理员的令牌来读，读到的仍是 A 那条留痕。
+    status, payload = call("GET", "/admin/audit?action=user.logout", admin_token)
     entry = next((row for row in payload.get("data", []) if row.get("target_id") == str(id_a)), None)
     check("审计里留下 user.logout（中文标签 + 会话版本号）",
           status == 200 and entry is not None and entry["action_label"] == "退出登录"
@@ -230,9 +232,13 @@ def main() -> int:
     status, payload = call("POST", "/admin/users/99999999/logout", admin_token)
     check("对不存在的账号强制下线 → 404", status == 404, f"status={status} {payload}")
 
-    # 把 B 收窄成部门账号：无部门在这个项目里就等于管理员，不收窄就测不出 403
-    status, payload = call("PATCH", "/auth/me", again_b, {"departments": ["018"]})
+    # 把 B 收窄成部门账号：⑳ 起「没有部门」不再等于管理员（新注册账号默认就不是管理员），
+    # 但要测「部门账号不能强制下线别人」得让它是**受限**账号，由管理员来分配。
+    status, payload = call("PATCH", f"/admin/users/{id_b}", admin_token, {"departments": ["018"]})
     assert status == 200 and payload["unrestricted"] is False, payload
+    status, payload = call("PATCH", "/auth/me", again_b, {"departments": ["018"]})
+    check("受限账号自己改数据范围被拒（403，⑳ 起账号没有自改入口）",
+          status == 403 and "管理员" in str(payload.get("detail")), f"status={status} {payload}")
     status, payload = call("POST", f"/admin/users/{admin_me['id']}/logout", again_b)
     check("部门受限账号不能强制下线别人（403）",
           status == 403 and "管理员" in str(payload.get("detail")), f"status={status} {payload}")

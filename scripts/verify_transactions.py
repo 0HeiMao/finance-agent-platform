@@ -69,7 +69,11 @@ async def login(client: httpx.AsyncClient, username: str, password: str) -> bool
 
 
 async def make_scoped(client: httpx.AsyncClient, suffix: str, departments: list[str]) -> tuple[httpx.AsyncClient, int] | None:
-    """注册一个临时账号并限定部门，返回它自己的 client（带 token）与 id。"""
+    """注册一个临时账号并限定部门，返回它自己的 client（带 token）与 id。
+
+    `client` 必须是**管理员**的 client：⑳ 起数据范围只能由管理员分配，账号自己发
+    `PATCH /auth/me` 会 403。
+    """
     username = f"tx9_{suffix}"
     password = secrets.token_hex(8)
     # 注册不发 token（只回 id/username），必须再登录一次
@@ -82,12 +86,13 @@ async def make_scoped(client: httpx.AsyncClient, suffix: str, departments: list[
         check(f"登录临时账号 {username}", False, "登录失败")
         await scoped.aclose()
         return None
-    patched = await scoped.patch("/api/v1/auth/me", json={"departments": departments})
+    user_id = int(created.json()["id"])
+    patched = await client.patch(f"/api/v1/admin/users/{user_id}", json={"departments": departments})
     if patched.status_code != 200:
-        check(f"限定临时账号部门 {departments}", False, f"HTTP {patched.status_code} {patched.text[:120]}")
+        check(f"分配临时账号部门 {departments}", False, f"HTTP {patched.status_code} {patched.text[:120]}")
         await scoped.aclose()
         return None
-    return scoped, int(created.json()["id"])
+    return scoped, user_id
 
 
 async def wait_job(client: httpx.AsyncClient, job_id: int, deadline: float = 120.0) -> dict:

@@ -64,9 +64,11 @@ router.beforeEach(async (to) => {
   if (to.meta.requiresAuth && !loggedIn) return { path: '/login', query: { redirect: to.fullPath } }
   if (to.meta.guestOnly && loggedIn) return '/dashboard'
   if (to.meta.admin && loggedIn) {
-    // 侧边栏会把管理组藏起来，但地址栏仍然可以被手动输入，所以守卫这里必须自己判一次权限
+    // 侧边栏会把管理组藏起来，但地址栏仍然可以被手动输入，所以守卫这里必须自己判一次权限。
+    // ⑳ 起看的是 `is_admin`（能不能管），不是 `unrestricted`（当前是不是全公司口径）：
+    // 被收窄到某个部门的管理员依然该进得来。
     const me = await loadCurrentUser()
-    if (!me?.unrestricted) return { path: '/dashboard', query: { denied: 'admin' } }
+    if (!me?.is_admin) return { path: '/dashboard', query: { denied: 'admin' } }
   }
 })
 export default router

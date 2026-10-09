@@ -320,11 +320,15 @@ def departments(db: Session = Depends(get_db), user: User = Depends(current_user
     own = scope_of(user)
     if own:
         names = set(own)
-    else:
+    elif own is None:
         found = {(row or "").strip() for row in db.scalars(select(FinancialTransaction.department).distinct()).all()}
         found |= {(row or "").strip() for row in db.scalars(select(FinancialMetric.department).distinct()).all()}
         found |= {(row or "").strip() for row in db.scalars(select(FinancialAlert.department).distinct()).all()}
         names = {name for name in found if name}
+    else:
+        # 还没分配部门（`scope_of` 的空元组，⑳）：连「有哪些部门、各多少行」都不给 ——
+        # 什么都看不到的账号没必要看见这份目录，否则等于把公司组织结构白送出去。
+        names = set()
     return {"scope": scope_payload(own), "departments": _department_items(db, names),
             "switchable": own is None or len(own) > 1}
 

@@ -211,7 +211,7 @@ def _totals_by_months(db: Session, months: list[str], scope: Scope = None) -> tu
     「每月的行数等于范围内的部门数」：某个部门少一期就说明这一期不可比。
     """
     rows = db.scalars(scope_metric(select(FinancialMetric).where(FinancialMetric.period.in_(months)), scope)).all()
-    expected = len(scope) if scope else 1
+    expected = 1 if scope is None else len(scope)  # 全公司一行；多部门一本账一行；空范围 0 行
     counts: dict[str, int] = {}
     for row in rows:
         counts[row.period] = counts.get(row.period, 0) + 1

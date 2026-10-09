@@ -19,8 +19,8 @@
       "file": "admin_users_1440x900.png",
       "width": 1440,
       "height": 900,
-      "bytes": 219063,
-      "sha256": "994764ec239f76913c3fc68f0fa95bc5e647c080e5c53f5fd58140bd9816526c"
+      "bytes": 164501,
+      "sha256": "81cc12a267feaee1abea32eee253e56986b3ada8736b42cf099e0080fa93244b"
     },
     {
       "page": "/agent",
@@ -82,8 +82,8 @@
       "file": "settings_375x812.png",
       "width": 375,
       "height": 812,
-      "bytes": 78081,
-      "sha256": "722aeba3c870e82b3141e87dc522220ecbfc2b11a7f990ad4f4530ae9ef4e7b9"
+      "bytes": 86263,
+      "sha256": "49da5c7808ac0748041d4096c7e33e049bd65cd285586eed5141e711b745f43d"
     }
   ]
 }

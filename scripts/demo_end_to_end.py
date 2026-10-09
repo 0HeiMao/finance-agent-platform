@@ -76,6 +76,23 @@ async def demo(csv_path: Path, keep: bool) -> int:
         else:
             show(registered.json())
 
+        # ⑳ 起「没有部门」不再等于管理员：只有**空库第一个**注册的账号才自动是管理员
+        # （backend/auth.py 的 bootstrap_admin），别的情况下演示账号只是普通账号，后面几步的
+        # 管理接口会 403。本脚本在本机跑，直接改库最省事 —— 接口每次都从库里重读账号，
+        # 改完立刻生效。真机运维用它：python scripts/grant_admin.py demo_analyst
+        from backend.models import User  # noqa: PLC0415  与顶部模型导入同一处
+
+        with SessionLocal() as db:
+            demo_user = db.scalar(select(User).where(User.username == DEMO_USER))
+            if demo_user is None:
+                print("  找不到演示账号，跳过管理员检查", file=sys.stderr)
+            elif demo_user.is_admin:
+                print(f"  {DEMO_USER} 已经是管理员")
+            else:
+                demo_user.is_admin = True
+                db.commit()
+                print(f"  已把 {DEMO_USER} 设为管理员（否则演示到管理接口那几步会 403）")
+
         title("2", "登录换取 Bearer Token（有效期 12 小时）")
         login = await client.post("/api/v1/auth/login", json=credentials)
         print(f"POST /api/v1/auth/login -> HTTP {login.status_code}")

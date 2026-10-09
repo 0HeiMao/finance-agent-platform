@@ -30,11 +30,11 @@ Authorization: Bearer <access_token>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/auth/register` | 请求 `{"username","password"}`；**先查重名（409）再查口令强度**（顺序反了会让种子脚本重注册同名演示账号时突然报「密码太弱」）；弱口令 400 并给出中文原因，留 `user.register_rejected` 审计 |
+| POST | `/auth/register` | 请求 `{"username","password"}`，返回 `{"id","username"}`（**不发令牌**）；**先查重名（409）再查口令强度**（顺序反了会让种子脚本重注册同名演示账号时突然报「密码太弱」）；弱口令 400 并给出中文原因，留 `user.register_rejected` 审计。⑳ 起新账号默认 `is_admin=false`、没有任何部门（＝空范围，看不到数据）；只有**空库的第一个注册者**会被自动提升为管理员（`bootstrap_admin()`，给全新部署留一条能进管理端的路，表一旦非空就借不到第二次） |
 | POST | `/auth/login` | 请求 `{"username","password"}`（JSON，非 OAuth2 表单）；返回 `{"access_token","token_type","token_version"}`，成功时若清掉过失败计数还带 `failures_cleared`。失败 401 / 被锁或限流 429，见下 |
 | POST | `/auth/logout` | 退出登录：把该账号的会话版本 +1（此前签发的**每一份**令牌立即失效，含其它设备），返回 `{"username","token_version","logged_out":true}`；留 `user.logout` 审计 |
-| GET | `/auth/me` | 返回 `{id,username,department,departments,unrestricted}`；**权威值是数组 `departments`**，`department` 只是它的第一个元素（回落用），`departments` 为空表示不受限（财务管理员） |
-| PATCH | `/auth/me` | 请求 `{"departments": ["018","097"]}`（字符串形式 `{"department":"018"}` 仍兼容，≤100 字；`[]` 与空串等于清空）；部门只由服务端记录 **`User.departments`** 决定，最多 20 个 |
+| GET | `/auth/me` | 返回 `{id,username,department,departments,is_admin,unrestricted,token_version}`；**权威值是数组 `departments`**，`department` 只是它的第一个元素（回落用）。⑳ 起 `is_admin`（权限）与 `unrestricted`（数据范围，即 `scope_of(user) is None`）是两个独立的东西：`departments` 为空**不再**等于管理员，而是「未分配部门 ⇒ 什么都看不到」 |
+| PATCH | `/auth/me` | **⑳ 起一律 403**（审计 `user.department_self_denied`）：数据范围与管理员标识只能由管理员在 `PATCH /admin/users/{id}` 分配。只是想换一次口径，用请求里的 `department` 参数（见「数据范围」一节） |
 
 ### 会话版本号（令牌怎么被作废）
 
@@ -133,10 +133,11 @@ Retry-After: 42
 | 同路径告警间隔 | 60 秒 | `SLOW_PATH_LOG_SECONDS` | 窗口内的后续超阈值请求只记账（`suppressed`）、不重复写日志 |
 
 
-> 部门不要走请求头自述：早期实现用 `X-User-Department: finance-admin` 当管理员凭证，属于可伪造提权，
-> 现在只有「用户自己没设部门」时才兼容这个旧头，其他情况一律忽略（见 `backend/api_rag.py: user_department_of`）。
-> 财务数据也认**服务端记录的 `User.department`**，但不认请求头：`backend/api_ai.py` 里知识库片段允许走旧头
-> 兼容路径，而财务证据一律用 `scope_of(user)`，否则等于把「看全公司还是看本部门」的开关交给调用方。
+> 部门不要走请求头自述：早期实现用 `X-User-Department: finance-admin` 当管理员凭证，属于可伪造提权。
+> **⑳ 起这条兼容路径已彻底删除**（`backend/api_rag.py` 不再有 `DEPARTMENT_ADMIN`，五个检索/问答端点上
+> 连 `x_user_department` 参数都没有了）：知识库口径与财务证据一样只认服务端记录 `scope_of(user)`，
+> 请求头自述一律不算数。「没分配部门」也不是「不受限」——那是空范围，看不到任何部门数据，
+> 知识库里只剩**没标部门的公共资料**（`filter_visible` 里空元组 ⇒ 只见 `department IS NULL` 的片段）。
 
 ## 数据范围（scope）
 
@@ -147,14 +148,15 @@ Retry-After: 42
 | 函数 | 行为 |
 | --- | --- |
 | `departments_of(user)` | 读 `User.departments`（JSONB 数组），为空时回落到单值列 `user.department`；返回去重保序的元组 |
-| `scope_of(user)` | `tuple[str, ...] | None`；**空元组与 None 都表示不受限**（全公司），一个有值的元组 = 只看这几个部门 |
-| `scope_metric(stmt, scope)` / `scope_alert(stmt, scope)` | `scope` 为 None 时加 `department IS NULL`，单元素退化 `department = d`，多元素 `department IN (…)` |
-| `scope_transactions(stmt, scope)` | None 时不过滤；有值时 `FinancialTransaction.department IN (…)`（部门为空的行不属于任何部门） |
-| `in_scope(scope, department)` | 逐行判断（预警这类已经取出来的对象用），None 恒真 |
+| `is_admin(user)` | 读 `User.is_admin`（⑳ 新增的显式管理员标识，与数据范围完全无关） |
+| `scope_of(user)` | `tuple[str, ...] | None`；**None = 不受限**（全公司），有值 = 只看这几个部门，**空元组 = 未分配部门 ⇒ 什么都看不到**（⑳ 之前空元组被当成不受限，谁把自己部门清空谁就成了管理员） |
+| `scope_metric(stmt, scope)` / `scope_alert(stmt, scope)` | `scope` 为 None 时加 `department IS NULL`，单元素退化 `department = d`，多元素 `department IN (…)`，**空元组 ⇒ `department IN ()` 恒假、一行都不返回** |
+| `scope_transactions(stmt, scope)` | None 时不过滤；有值时 `FinancialTransaction.department IN (…)`（部门为空的行不属于任何部门），空元组同样恒假 |
+| `in_scope(scope, department)` | 逐行判断（预警这类已经取出来的对象用），None 恒真，空元组恒假 |
 | `metric_totals(rows, period_order=…)` | 按期间聚合：**单行期间沿用库里存的比率**，多行期间金额相加、比率按相加后的金额重算（比率不能相加） |
-| `scope_payload(scope, requested=…)` | `{department,departments,label,unrestricted,note}`，随看板/分析/报告/Agent/系统状态响应一起返回 |
-| `scope_label(scope)` / `scope_slug(scope)` / `scope_text(scope)` / `row_label(department)` | 文案与文件名的四种写法：「部门 018、097 等 N 个部门」/ 文件名的 `018-097` / 审计用的 `018、097` / 数据行级的「部门 097」。**`scope_label` 收的是元组，传字符串会按字符长度渲染成「部门 097 等 3 个部门」** |
-| `resolve_requested_scope(user, requested)` | 解析请求里的 `department`：不受限账号可指定任意部门；受限账号只允许在自己绑定的部门里**收窄**，其他值返回违规说明（端点转成 403） |
+| `scope_payload(scope, requested=…)` | `{department,departments,label,unrestricted,note}`，随看板/分析/报告/Agent/系统状态响应一起返回；空范围的 `note` 会说明「看不到任何财务数据，知识库只剩没标部门的公共资料」 |
+| `scope_label(scope)` / `scope_slug(scope)` / `scope_text(scope)` / `row_label(department)` | 文案与文件名的四种写法：「部门 018、097 等 N 个部门」/ 文件名的 `018-097`（空范围是 `none`）/ 审计用的 `018、097`（空范围是「未分配部门」，**不是空串**）/ 数据行级的「部门 097」。**`scope_label` 收的是元组，传字符串会按字符长度渲染成「部门 097 等 3 个部门」** |
+| `resolve_requested_scope(user, requested)` | 解析请求里的 `department`：不受限账号可指定任意部门；受限账号只允许在自己绑定的部门里**收窄**，其他值返回违规说明（端点转成 403）；空范围账号填任何部门都被拒 |
 
 > 多部门是「并集口径」而不是「取第一个部门」：多部门账号的看板/汇总/报告/Agent 证据/预测走的是同一份
 > `metric_totals`，所以四个页面同一个数。跨期间的完整性判断用「每月行数 == 范围内部门数」
@@ -165,17 +167,20 @@ Retry-After: 42
 `GET /dashboard`、`/analysis/summary`、`/analysis/alerts`、`/analysis/alerts/all`、`/reports/monthly`、
 `/reports/docx`、`/reports/pptx*`、`/ai/agent/chat/stream`、`/export/*` 都接受可选的 `?department=<名称>`：
 
-- **不受限账号**（`departments` 为空）：可以指定任意部门，响应里的 `scope` 会多一个 `"requested": true`
-  并把 `note` 换成「正在按「部门 X」口径查看…不是全公司口径。」——用于区分「本来就不受限」与「主动切到了某部门」。
+- **不受限账号**（`scope_of(user) is None`，即管理员且没被收窄）：可以指定任意部门，响应里的 `scope` 会多一个
+  `"requested": true` 并把 `note` 换成「正在按「部门 X」口径查看…不是全公司口径。」——用于区分
+  「本来就不受限」与「主动切到了某部门」。
 - **受限账号**：只能不带参数（＝自己绑定的全部部门，并集）或填**自己范围内的一个**部门收窄；
   填别人的部门一律 **403** `{"detail":"当前账号的数据范围是「部门 A、B」，不能查看「部门 C」"}`，
   而不是静默回落到自己的范围（静默回落会让人以为自己在看别人的数据）。
+- **未分配部门的账号**：数据本身就是空的（空范围恒假），填任何部门都 403，文案里的范围名是「未分配部门」。
 - 注意 `scope.unrestricted` 描述的是**这次响应覆盖的范围**是否为全公司，不是账号属性；
-  「账号本身不受限吗」看 `/auth/me` 的 `unrestricted`（前端口径下拉也用它决定是否显示）。
+  「账号本身不受限吗」看 `/auth/me` 的 `unrestricted`，而「账号能不能进管理端」看 `/auth/me` 的 `is_admin`
+  （⑳ 起这两件事分开：被收窄到某个部门的管理员照样能进管理端，只是数据只有那一个部门）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/analysis/departments` | 口径下拉的选项：`{"scope":…,"departments":[{"name":"097","label":"部门 097","transactions":1523}],"switchable":true}`；受限账号只会拿到自己绑定的那几个，`switchable` 只在**绑定数 > 1**（可收窄）或不受限时为 `true` |
+| GET | `/analysis/departments` | 口径下拉的选项：`{"scope":…,"departments":[{"name":"097","label":"部门 097","transactions":1523}],"switchable":true}`；受限账号只会拿到自己绑定的那几个，`switchable` 只在**绑定数 > 1**（可收窄）或不受限时为 `true`；**未分配部门的账号拿到 `departments: []`**（⑳ 起连「有哪些部门、各多少行」也不给） |
 
 受限账号拿别人的预警 id 调 `/analysis/alerts/{id}/transactions` 会得到 HTTP 200 + `{"data":[],"message":"该预警不在当前账号的数据范围内"}`（不泄漏"这条预警存在"以外的信息）。
 
@@ -488,8 +493,10 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 - `rag`：`max_distance`/`candidate_k`。
 - `directories[]`：`{name,path,configured,writable,error}`——`writable` 是真写一个探针文件再删的结果。
 - `data`：`periods`/`latest_period`/`counts{transactions,metrics,alerts,knowledge_chunks,users}`。
-- `me`：`{id,username,department,departments,unrestricted,token_version}`——设置页的「我的部门」与
-  「登录与令牌」卡片都读它；`token_version` 是当前账号的会话版本（令牌里的 `ver` 与它一致才放行）。
+- `me`：`{id,username,department,departments,is_admin,unrestricted,token_version}`——设置页的「当前账号 /
+  数据范围 / 管理员标识」三张卡都读它；`unrestricted` 是数据范围（⑳ 起 `departments` 空 = 未分配 = 看不到
+  数据，**不再**等于不受限），`is_admin` 才是权限（能不能进管理端），两者独立；
+  `token_version` 是当前账号的会话版本（令牌里的 `ver` 与它一致才放行）。
 - `config_problems[]`：复用启动时的 `Settings.validate()`（占位密钥、通配 CORS、非本机来源）。
 
 ## 知识库（RAG）
@@ -499,7 +506,7 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 | POST | `/rag/documents` | 直接写入文本片段；内容与已入库片段完全一致时跳过，返回 `{success,ids,skipped}` |
 | POST | `/rag/documents/upload` | 上传 txt/md/csv/pdf/docx；同来源同内容不重复入库，返回 `{success,source,chunks,skipped}` |
 | POST | `/rag/search` | `{query,top_k}`，先多召回再重排 |
-| POST | `/rag/answer` | `{query,top_k}`；按 `X-User-Department` 过滤（`finance-admin` 可见全部） |
+| POST | `/rag/answer` | `{query,top_k}`；按 `scope_of(user)` 过滤（不受限可见全部，未分配部门只剩 `department IS NULL` 的公共资料）；**⑳ 起请求头不再参与判定** |
 
 ## Agent 与问答
 
@@ -553,7 +560,8 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
   分组也在 SQL 里按业务时区切），没问的日子补 0。
 - **归属只有一条规则**：会话属于提问的人，别人的会话 id 一律 404（不区分「没有」与「不是你的」）。
   跨用户的用量只在管理员端点 `GET /admin/agent-usage` 看汇总。
-- 令牌与 `X-User-Department` 的口径与其它接口一致：会话的 `scope` 记的是提问时的口径快照。
+- 令牌与数据范围的口径与其它接口一致（⑳ 起只认服务端记录，请求头不算）：会话的 `scope` 记的是提问时的口径快照；
+  未分配部门的账号只检索得到没标部门的公共片段。
 - 完整前缀是 `/api/v1/ai/agent/...`（`backend/api_agent.py` 的 `prefix="/api/v1/ai"`），漏掉 `/ai` 会 404。
 
 ### 多轮上下文（追问时模型看得见前几轮）
@@ -580,9 +588,10 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 
 ## 管理员
 
-所有 `/admin/*` 接口都经过 `admin_user` 依赖：**`User.department` 为空 = 不受部门限制 = 管理员**
-（与 `GET /auth/me` 的 `unrestricted` 同一口径）。非管理员一律 `403 {"detail":"需要管理员权限：当前账号已限定部门"}`，
-匿名 `401`——返回 403 而不是空数据，是为了不让「看不到」被误读成「没有」。
+所有 `/admin/*` 接口都经过 `admin_user` 依赖：**⑳ 起只看显式的 `User.is_admin`**（以前「部门为空 = 不受限 =
+管理员」——那就等于任何账号把自己部门清空就能自升管理员）。非管理员一律 `403 {"detail":"需要管理员权限：
+当前账号没有管理员标识"}`，匿名 `401`——返回 403 而不是空数据，是为了不让「看不到」被误读成「没有」。
+管理员标识与数据范围是两件事：被收窄到某个部门的管理员照样进得来，只是数据只有那一个部门。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -590,11 +599,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | GET | `/admin/agent-usage?days=7` | **全员** Agent 用量（`days` 取 1..365，越界 422，窗口口径与 `GET /ai/agent/usage` 完全一致：业务时区的自然日、含今天）：`{data,series,status_labels}`，比 `GET /ai/agent/usage` 多一份按用户的 `data.by_user`（每行 `{user_id,username,department,answers,total_tokens}`，未受限账号的 `department` 是「不受限」）。管理概览页的「Agent 用量」卡就走它，**它挂掉不该影响整页概览** |
 | GET | `/admin/rollups?grain=quarter\|year` | 季度/年度落库清单：`{data, coverage, grains:[{value,label}]}`；每行含 `grain/period/period_label/department/department_label/months/covered_months/missing_months/complete/note/computed_at` 与金额比率 |
 | POST | `/admin/rollups/rebuild` | 重算落库：`{"grains":["quarter","year"], "periods":["2026-Q3","2026"]}`（都可省略＝全部）；写审计 `rollups.rebuild`；`grains` 非季/年 → 422，`periods` 里塞月口径 → 422 |
-| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_self`、`token_version`、登录态三个字段 `failed_attempts`/`locked_until`/`locked`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
-| PATCH | `/admin/users/{id}` | `{"department":"财务部"}`；空字符串＝清空（升级为管理员） |
+| GET | `/admin/users?query=&department=&unrestricted=&limit=&offset=` | 用户列表（含 `is_admin`、`is_self`、`token_version`、登录态三个字段 `failed_attempts`/`locked_until`/`locked`、`total`、`limit` 上限 500，以及筛选下拉用的 `departments` 与 `unrestricted_count`） |
+| PATCH | `/admin/users/{id}` | `{"department":"财务部"}` 相当于 `{"departments":["财务部"]}`；`{"departments":[]}`/空串 = **清空范围**（看不到任何数据，**不再**升级为管理员）；`{"is_admin":true\|false}` 单独发才授予/收回管理员标识。**只发 `is_admin` 时部门一个字都不动**（按 `model_fields_set` 判断客户端到底发没发部门字段）；`department_change`/`admin_change` 两条审计各自独立。收回/删除**最后一个管理员** → 400「不能…：收回后这个库再没有人能管」 |
 | POST | `/admin/users/{id}/unlock` | 解除账号锁定：清掉 `failed_attempts` 与 `locked_until`，返回 `{"id","username","failed_attempts":0,"locked_until":null,"locked":false,"cleared_attempts":N}`；留 `user.unlock` 审计（detail 含 `cleared_attempts`、`was_locked_for`、`effect`）。**不动口令、不动 `token_version`** |
 | POST | `/admin/users/{id}/logout` | 强制下线：把该账号的会话版本 +1（它此前签发的令牌全部立刻失效），返回 `{"id","username","token_version","logged_out":true}`；留 `user.force_logout` 审计（含 `from_version`/`to_version`）。对自己操作复用 `_target_user()` 的 **400**（想让自己下线用 `/auth/logout`，两者审计语义不同） |
-| DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据） |
+| DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据）；**最后一个管理员删不得** → 400「不能删除最后一个管理员：删掉后这个库再没有人能管」 |
 | GET | `/admin/batches?limit=&offset=` | 按 `import_batch` 分组的批次列表（`total` 是批次个数，`limit` 上限 200） |
 | DELETE | `/admin/batches/{batch}` | 撤销批次：删明细 + 重算或清空受影响期间 |
 | GET | `/admin/knowledge?source=&document_type=&limit=&offset=` | 按来源聚合的知识库片段（一行 = 一个来源；返回 `total` 来源数、`matched_chunks` 片段数、`all_chunks` 全库片段数、`document_types`，`limit` 上限 500） |
@@ -822,8 +831,11 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 
 管理接口的两个刻意约束（都有测试覆盖）：
 
-- **不能改自己/删自己**（`400`）：清空或填写自己的部门会立刻把自己锁在管理入口之外，属自伤操作，
-  需要自行调整时走 `PATCH /auth/me`（System 设置页的「我的部门」）。
+- **不能改自己/删自己**（`400`）：清空或收回自己的标识会立刻把自己锁在管理入口之外，属自伤操作，
+  要调整只能**换另一个管理员**来改（⑳ 起连 `PATCH /auth/me` 这条自助路径也封了：一律 403，
+  System 设置页上的「当前账号 / 数据范围 / 管理员标识」三格只读，只看不动）。
+  另外**最后一个管理员收不掉也删不掉**（`400`），否则这个库再没有人能管；
+  真到了那一步用 `python scripts/grant_admin.py <用户名>` 从命令行救回来。
 - **撤销批次必须重算期间**：只删明细不重算会在库里留下与明细对不上的历史指标（幽灵报表）。
 
 ### 预警外发通道（Webhook / 邮件）
@@ -868,12 +880,16 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 }
 ```
 
-- 登记的 28 个动作：`user.register`、`user.login`、`user.login_failed`、`user.login_blocked`、
-  `user.login_locked`、`user.unlock`、`user.register_rejected`、`user.department_self`、
-  `user.department_change`、`user.delete`、`user.logout`、`user.force_logout`、`data.import`、
+- 登记的动作（以 `backend/audit.py` 的 `ACTIONS` 为准，当前 **37** 条）：`user.register`、`user.login`、
+  `user.login_failed`、`user.login_blocked`、`user.login_locked`、`user.unlock`、`user.register_rejected`、
+  `user.department_self`（⑳ 起停用：不再有成功路径）、`user.department_self_denied`（⑳ 新增：自助改范围/
+  标识被拒，detail 含 `attempted`）、`user.department_change`、`user.admin_change`（⑳ 新增：授予/收回管理员
+  标识，detail 记 `from`/`to`）、`user.delete`、`user.logout`、`user.force_logout`、`data.import`、
   `data.export`、`transaction.update`、`transaction.reverse`、`metrics.calculate`、`rollups.rebuild`、
   `batch.revert`、`job.retry`、`knowledge.add`、`knowledge.delete`、`alert.review`、
-  `alert_rule.update`、`alert_rule.create`、`alert_rule.delete`、`audit.export`、`audit.purge`。
+  `alert_rule.update`、`alert_rule.create`、`alert_rule.delete`、`alert_channel.create`、
+  `alert_channel.update`、`alert_channel.delete`、`alert_channel.test`、`alert_delivery.retry`、
+  `alert.notify`、`agent_session.delete`、`audit.export`、`audit.purge`。
   写未登记的动作不会失败，但会在服务端打 warning。
 - `action` / `actor` / `target_type` 都是精确匹配；`ip` 是**前缀匹配**（前端下拉直接给整串，
   手工传 `127` 这种前缀也能用）；`limit` 默认 50，`offset` 用于翻页，`total` 不受 `limit` 影响

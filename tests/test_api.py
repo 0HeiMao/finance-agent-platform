@@ -79,24 +79,41 @@ async def test_register_login_and_duplicate(anon_client, credentials, db_session
     assert good.json()["access_token"]
 
 
-async def test_department_is_server_side_not_from_header(anon_client, auth_headers):
+async def test_self_service_scope_change_is_closed(anon_client, auth_headers, db_session):
+    """⑳：数据范围与权限都由服务端记，而且**自己改不了**。
+
+    这里同时是那个提权洞的回归测试：⑳ 之前 `PATCH /auth/me {"departments": []}` 等于一键升权
+    （当时「没有部门」就是「管理员」的定义），任何注册出来的账号都能读全库、进管理端。
+    """
+    from backend.models import AuditLog
+
     me = await anon_client.get("/api/v1/auth/me", headers=auth_headers)
     assert me.status_code == 200
     assert me.json()["department"] is None
     assert me.json()["unrestricted"] is True
+    assert me.json()["is_admin"] is True  # 夹具显式授予的管理员标识
 
-    # 伪造请求头自称管理员：不影响服务端记录的部门
+    # 伪造请求头自称管理员：不影响服务端记录
     forged = await anon_client.get("/api/v1/auth/me", headers={**auth_headers, "X-User-Department": "finance-admin"})
     assert forged.json()["department"] is None
 
-    updated = await anon_client.patch("/api/v1/auth/me", headers=auth_headers, json={"department": " 部门-097 "})
-    assert updated.status_code == 200
-    assert updated.json()["department"] == "部门-097"
-    assert updated.json()["unrestricted"] is False
+    # 给自己配部门、清空部门、顺手把管理员标识也带上：全部 403，且一个字段都没改
+    for body in ({"department": " 部门-097 "}, {"departments": ["部门A"]}, {"departments": []},
+                 {"departments": [], "is_admin": False}):
+        denied = await anon_client.patch("/api/v1/auth/me", headers=auth_headers, json=body)
+        assert denied.status_code == 403, (body, denied.text)
+        assert "只能由管理员" in denied.json()["detail"]
 
-    cleared = await anon_client.patch("/api/v1/auth/me", headers=auth_headers, json={"department": None})
-    assert cleared.json()["department"] is None
-    assert cleared.json()["unrestricted"] is True
+    after = (await anon_client.get("/api/v1/auth/me", headers=auth_headers)).json()
+    assert after["department"] is None and after["departments"] == []
+    assert after["unrestricted"] is True and after["is_admin"] is True
+
+    # 被拒也留痕：这是「账号试图给自己扩权」的信号，值班时要看得见
+    db_session.expire_all()
+    row = db_session.scalars(
+        select(AuditLog).where(AuditLog.action == "user.department_self_denied")
+        .order_by(AuditLog.id.desc())).first()
+    assert row is not None and row.detail["username"] == after["username"]
 
 
 async def test_expired_and_forged_tokens_are_rejected(anon_client):
@@ -384,7 +401,7 @@ def stub_retrieval(monkeypatch):
     return chunks
 
 
-async def test_rag_search_filters_by_department(anon_client, auth_headers, stub_retrieval):
+async def test_rag_search_filters_by_department(anon_client, api_app, auth_headers, stub_retrieval):
     response = await anon_client.post("/api/v1/rag/search", headers=auth_headers,
                                       json={"query": "奖金方案", "top_k": 5})
     assert response.status_code == 200, response.text
@@ -393,18 +410,38 @@ async def test_rag_search_filters_by_department(anon_client, auth_headers, stub_
     assert any("公共资料" in item for item in contents)
     assert any("部门A" in item for item in contents)
 
-    await anon_client.patch("/api/v1/auth/me", headers=auth_headers, json={"department": "部门A"})
-    scoped = await anon_client.post("/api/v1/rag/search", headers=auth_headers,
-                                    json={"query": "奖金方案", "top_k": 5})
-    contents = [item["content"] for item in scoped.json()["data"]]
-    assert any("部门A" in item for item in contents)
-    assert not any("部门B" in item for item in contents), "不应看到其他部门的资料"
+    # 收窄成部门账号这件事只能由管理员做（⑳），所以这里让夹具的管理员去分配，而不是自己 PATCH
+    scoped_headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
+    try:
+        scoped_response = await scoped.post("/api/v1/rag/search", headers=scoped_headers,
+                                           json={"query": "奖金方案", "top_k": 5})
+        contents = [item["content"] for item in scoped_response.json()["data"]]
+        assert any("部门A" in item for item in contents)
+        assert not any("部门B" in item for item in contents), "不应看到其他部门的资料"
 
-    # 伪造请求头不能提权
-    forged = await anon_client.post("/api/v1/rag/search",
-                                    headers={**auth_headers, "X-User-Department": "finance-admin"},
-                                    json={"query": "奖金方案", "top_k": 5})
-    assert not any("部门B" in item["content"] for item in forged.json()["data"])
+        # 伪造请求头不能提权
+        forged = await scoped.post("/api/v1/rag/search",
+                                   headers={**scoped_headers, "X-User-Department": "finance-admin"},
+                                   json={"query": "奖金方案", "top_k": 5})
+        assert not any("部门B" in item["content"] for item in forged.json()["data"])
+    finally:
+        await scoped.aclose()
+
+
+async def test_rag_search_gives_unassigned_accounts_only_public_chunks(anon_client, stub_retrieval):
+    """⑳：知识库口径也不再认请求头。
+
+    以前「没分配部门」= 空元组，`filter_visible` 把它当不受限放行，加上 `X-User-Department:
+    finance-admin` 这条兼容路径，任何新注册的账号带一个请求头就能读到全公司的片段。
+    """
+    headers = await _plain_headers(anon_client, prefix="rag-plain")
+    for extra in ({}, {"X-User-Department": "finance-admin"}):
+        response = await anon_client.post("/api/v1/rag/search", headers={**headers, **extra},
+                                          json={"query": "奖金方案", "top_k": 5})
+        assert response.status_code == 200, response.text
+        contents = [item["content"] for item in response.json()["data"]]
+        assert any("公共资料" in item for item in contents), "没标部门的公共资料仍然可读"
+        assert not any("部门A" in item or "部门B" in item for item in contents), f"没分配部门不该读到部门资料：{extra}"
 
 
 async def test_rag_search_rejects_mismatched_embedding_model(anon_client, auth_headers, stub_retrieval):
@@ -557,7 +594,7 @@ async def test_docx_report_requires_token_and_blocks_cross_department(anon_clien
                                                                      db_session):
     _seed_scoped_period(db_session, SCOPE_PERIOD)
     assert (await anon_client.get(f"/api/v1/reports/docx?period={SCOPE_PERIOD}")).status_code == 401
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         denied = await scoped.get(f"/api/v1/reports/docx?period={SCOPE_PERIOD}&department=部门B",
                                   headers=headers)
@@ -641,23 +678,27 @@ async def test_system_status_carries_full_department_list(anon_client, auth_head
     """多部门账号在 /system/status 的 me 里必须拿到**全部**部门。
 
     真机冒烟当场抓到的缺陷：只回单值列 `department` 时，设置页输入框预填成第一个部门，
-    页面上「当前：限定 部门A」，用户点一次保存就把自己从两个部门缩成了一个部门。
+    页面上「当前：限定 部门A」，用户点一次保存就把自己从两个部门缩成了一个部门
+    （⑳ 起设置页不再能保存，但「给全」这件事反而更硬：页面要如实显示管理员分配了什么）。
     """
-    patched = await anon_client.patch("/api/v1/auth/me",
-                                      json={"departments": ["部门A", "部门B"]},
-                                      headers=auth_headers)
-    assert patched.status_code == 200, patched.text
-    try:
-        status = await anon_client.get("/api/v1/system/status", headers=auth_headers)
-        assert status.status_code == 200, status.text
-        me = status.json()["me"]
-        assert me["departments"] == ["部门A", "部门B"]
-        assert me["department"] == "部门A"  # 单值列仍回落到第一个，供老文案使用
-        assert me["unrestricted"] is False
-    finally:
-        restored = await anon_client.patch("/api/v1/auth/me", json={"departments": []},
-                                           headers=auth_headers)
-        assert restored.status_code == 200, restored.text
+    credentials = {"username": f"multi_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
+    created = await anon_client.post("/api/v1/auth/register", json=credentials)
+    assert created.status_code == 200, created.text
+    token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assigned = await anon_client.patch(f"/api/v1/admin/users/{created.json()['id']}",
+                                       json={"departments": ["部门A", "部门B"]}, headers=auth_headers)
+    assert assigned.status_code == 200, assigned.text
+
+    status = await anon_client.get("/api/v1/system/status", headers=headers)
+    assert status.status_code == 200, status.text
+    me = status.json()["me"]
+    assert me["departments"] == ["部门A", "部门B"]
+    assert me["department"] == "部门A"  # 单值列仍回落到第一个，供老文案使用
+    assert me["unrestricted"] is False
+    # 被分配部门 ≠ 变成管理员：设置页要分别显示这两件事
+    assert me["is_admin"] is False
 
 
 async def test_system_status_requires_token(anon_client):
@@ -716,23 +757,28 @@ async def test_admin_endpoints_require_token(anon_client):
         assert (await anon_client.get(path)).status_code == 401, path
 
 
-async def test_admin_rejects_department_scoped_account(anon_client, api_app):
-    """部门不为空的账号必须 403，而不是拿到空数据（否则"看不到"会被误读成"没有"）。"""
-    credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
-    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
-    token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+async def test_admin_rejects_non_admin_account(anon_client, api_app, auth_headers):
+    """⑳：管理接口只看**管理员标识**，不看部门。
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
-                                 base_url="http://testserver", trust_env=False) as scoped:
-        headers = {"Authorization": f"Bearer {token}"}
-        me = await scoped.patch("/api/v1/auth/me", json={"department": "部门A"}, headers=headers)
-        assert me.status_code == 200, me.text
-        assert me.json()["unrestricted"] is False
+    以前「部门为空」就等于管理员，所以这条用例是「部门不为空的账号 403」；现在普通账号
+    （哪怕管理员刚给它分了部门）一样是 403 —— 范围收窄与能不能管是两件事，不能互相兑换。
+    仍然必须是 403 而不是空数据：否则「看不到」会被误读成「没有」。
+    """
+    plain = await _plain_headers(anon_client, prefix="scoped")
+    for path in ADMIN_PATHS:
+        response = await anon_client.get(path, headers=plain)
+        assert response.status_code == 403, path
+        assert "管理员" in response.json()["detail"]
+    assert (await anon_client.delete("/api/v1/admin/knowledge?source=x",
+                                     headers=plain)).status_code == 403
+
+    # 被分配了部门的账号也一样：有数据范围不等于有管理权
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
+    try:
         for path in ADMIN_PATHS:
-            response = await scoped.get(path, headers=headers)
-            assert response.status_code == 403, path
-            assert "管理员" in response.json()["detail"]
-        assert (await scoped.delete("/api/v1/admin/knowledge?source=x", headers=headers)).status_code == 403
+            assert (await scoped.get(path, headers=headers)).status_code == 403, path
+    finally:
+        await scoped.aclose()
 
 
 async def test_admin_overview_counts_and_quality_checks(anon_client, auth_headers, db_session):
@@ -820,7 +866,7 @@ async def test_admin_user_department_update_and_self_protection(anon_client, aut
     assert updated.status_code == 200, updated.text
     assert updated.json() == {"id": target_id, "username": target["username"],
                               "department": "部门B", "departments": ["部门B"],
-                              "unrestricted": False}
+                              "is_admin": False, "unrestricted": False}
 
     # 多部门：一次给两个部门，单值列同步成第一个（老前端与审计文案读它）
     multi = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
@@ -840,11 +886,28 @@ async def test_admin_user_department_update_and_self_protection(anon_client, aut
     assert target["username"] in {item["username"] for item in by_first.json()["data"]}
     assert "部门C" in by_first.json()["departments"]
 
+    # 只发管理员标识的请求不许碰数据范围：`department` 的字段默认值是空串，照默认值执行就会
+    # 把目标账号的部门一起清掉（前端「授予管理员」按钮发的正是这种请求）
+    granted = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
+                                      json={"is_admin": True}, headers=auth_headers)
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["is_admin"] is True
+    assert granted.json()["departments"] == ["部门B", "部门C"], granted.text
+    assert granted.json()["unrestricted"] is False
+    revoked = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
+                                      json={"is_admin": False}, headers=auth_headers)
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["is_admin"] is False
+    assert revoked.json()["departments"] == ["部门B", "部门C"], revoked.text
+
     cleared = await anon_client.patch(f"/api/v1/admin/users/{target_id}",
                                       json={"departments": []}, headers=auth_headers)
     assert cleared.json()["department"] == ""
     assert cleared.json()["departments"] == []
-    assert cleared.json()["unrestricted"] is True
+    # ⑳：清空部门**不再等于**变成管理员，只表示「什么都没分配，什么都看不到」。
+    # `unrestricted=False` + 空部门列表就是这个状态，能不能管看的是 is_admin 那一位。
+    assert cleared.json()["unrestricted"] is False
+    assert cleared.json()["is_admin"] is False
 
     # 自改部门会把管理员锁在管理入口之外，必须被拒绝
     mine = await anon_client.patch(f"/api/v1/admin/users/{me_id}",
@@ -1039,27 +1102,51 @@ def _seed_scoped_period(db, period: str):
     db.commit()
 
 
-async def _scoped_headers(anon_client, api_app, department: str) -> tuple[dict, httpx.AsyncClient]:
-    """注册一个账号、把部门写进服务端记录，返回带 token 的**独立**客户端。
+async def _plain_headers(anon_client, prefix: str = "plain") -> dict:
+    """注册并登录一个**普通账号**：不是管理员，也没有任何部门。
 
-    注意这个客户端已经在 PATCH /auth/me 时被用过，httpx 不允许再 `async with` 它
+    用来验「非管理员碰管理接口 = 403」和「没分配范围 = 什么都看不到」。
+    别拿 `auth_headers` 当这种账号 —— 那个夹具特意提升了管理员标识。
+    """
+    credentials = {"username": f"{prefix}_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
+    created = await anon_client.post("/api/v1/auth/register", json=credentials)
+    assert created.status_code == 200, created.text
+    token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _scoped_headers(anon_client, api_app, auth_headers, department: str,
+                          departments: list[str] | None = None) -> tuple[dict, httpx.AsyncClient]:
+    """注册一个普通账号 → 由**管理员**给它分配部门 → 返回带 token 的**独立**客户端。
+
+    ⑳ 之前这里是「新账号自己 PATCH /auth/me 把部门填上」；那条路已经封了（自我扩权），
+    所以连测试也得走管理端分配范围这条真实路径 —— 每次调用顺带又把「范围只能由管理员分配」
+    验了一遍。传 `departments` 可以一次分配多个部门。
+
+    注意这个客户端已经发过请求，httpx 不允许再 `async with` 它
     （RuntimeError: Cannot open a client instance more than once），用完 `await aclose()`。
     """
     credentials = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
-    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
+    created = await anon_client.post("/api/v1/auth/register", json=credentials)
+    assert created.status_code == 200, created.text
+    user_id = created.json()["id"]
     token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    assigned = await anon_client.patch(
+        f"/api/v1/admin/users/{user_id}",
+        json={"departments": departments if departments is not None else [department]},
+        headers=auth_headers)
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["unrestricted"] is False, "分配的部门没生效"
+    assert assigned.json()["is_admin"] is False, "分配部门不该顺带把人变成管理员"
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
                                base_url="http://testserver", trust_env=False)
     headers = {"Authorization": f"Bearer {token}"}
-    me = await client.patch("/api/v1/auth/me", json={"department": department}, headers=headers)
-    assert me.status_code == 200, me.text
-    assert me.json()["unrestricted"] is False
     return headers, client
 
 
 async def test_scoped_account_reads_only_its_own_department(anon_client, api_app, auth_headers, db_session):
     _seed_scoped_period(db_session, SCOPE_PERIOD)
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         # 全公司口径是 1000，部门A 是 300：读错行会变成 1300（加总）或 1000（没过滤）
         summary = await scoped.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}", headers=headers)
@@ -1107,7 +1194,7 @@ async def test_scoped_account_cannot_drill_into_other_department_alert(anon_clie
     own_alert_id = db_session.scalar(
         select(FinancialAlert.id).where(FinancialAlert.period == SCOPE_PERIOD,
                                         FinancialAlert.department == "部门A"))
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         denied = await scoped.get(f"/api/v1/analysis/alerts/{company_alert_id}/transactions", headers=headers)
         assert denied.status_code == 200, denied.text
@@ -1136,7 +1223,7 @@ async def test_admin_departments_groups_rows_and_rejects_scoped_account(anon_cli
     # 部门列表是按部门名归组的，不能被「未标注部门」之类的兜底值污染
     assert all(item["name"].strip() for item in payload["departments"])
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         assert (await scoped.get("/api/v1/admin/departments", headers=headers)).status_code == 403
     finally:
@@ -1271,7 +1358,7 @@ async def test_unrestricted_account_can_switch_scope(anon_client, auth_headers, 
 async def test_scoped_account_cannot_switch_scope(anon_client, api_app, auth_headers, db_session):
     """受限账号填别的部门必须 403（不是静默回落到自己的范围），否则会以为自己在看别人的数。"""
     _seed_scoped_period(db_session, SCOPE_PERIOD)
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         listing = await scoped.get("/api/v1/analysis/departments", headers=headers)
         assert listing.status_code == 200
@@ -1294,24 +1381,17 @@ async def test_scoped_account_cannot_switch_scope(anon_client, api_app, auth_hea
         await scoped.aclose()
 
 
-async def test_multi_department_account_can_narrow_its_own_scope(anon_client, api_app, db_session):
+async def test_multi_department_account_can_narrow_its_own_scope(anon_client, api_app, auth_headers, db_session):
     """绑定多个部门的账号在「自己那几个部门」之间可以换口径，所以下拉要对它开放。
 
     早先 `switchable` 只看「账号是否不受限」，多部门账号在看板上看不到口径下拉——
     而它恰恰是最需要在两个部门之间来回收窄的那个账号。
     """
     _seed_scoped_period(db_session, SCOPE_PERIOD)
-    credentials = {"username": f"multi_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
-    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
-    token = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app),
-                               base_url="http://testserver", trust_env=False)
-    headers = {"Authorization": f"Bearer {token}"}
+    # 部门由管理员分配（⑳ 起自己没有这个入口），一次给两个
+    headers, client = await _scoped_headers(anon_client, api_app, auth_headers, "部门A",
+                                            departments=["部门A", "部门B"])
     try:
-        patched = await client.patch("/api/v1/auth/me", json={"departments": ["部门A", "部门B"]}, headers=headers)
-        assert patched.status_code == 200, patched.text
-        assert patched.json()["departments"] == ["部门A", "部门B"]
-
         listing = await client.get("/api/v1/analysis/departments", headers=headers)
         assert listing.status_code == 200, listing.text
         assert listing.json()["switchable"] is True
@@ -1332,6 +1412,30 @@ async def test_multi_department_account_can_narrow_its_own_scope(anon_client, ap
         assert "不能查看" in beyond.json()["detail"]
     finally:
         await client.aclose()
+
+
+async def test_unassigned_account_sees_nothing_at_all(anon_client, db_session):
+    """⑳：没分配部门既不是「不受限」，也不该顺手把口径下拉喂给它。
+
+    这条以前是个真口子：`scope_of` 返回的空元组在 `if scope:` 判断里是假值，于是
+    `/analysis/departments` 会当它不受限、把全公司的部门名单和各部明细行数一起端出来。
+    """
+    _seed_scoped_period(db_session, SCOPE_PERIOD)
+    headers = await _plain_headers(anon_client, prefix="unassigned")
+    listing = await anon_client.get("/api/v1/analysis/departments", headers=headers)
+    assert listing.status_code == 200, listing.text
+    assert listing.json()["departments"] == []
+    assert listing.json()["switchable"] is False
+
+    summary = await anon_client.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}", headers=headers)
+    assert summary.status_code == 200, summary.text
+    assert Decimal(summary.json()["revenue_amount"]) == Decimal("0.00")
+    assert summary.json()["scope"]["unrestricted"] is False
+
+    picked = await anon_client.get(f"/api/v1/analysis/summary?period={SCOPE_PERIOD}&department=部门A",
+                                   headers=headers)
+    assert picked.status_code == 403
+    assert "不能查看" in picked.json()["detail"]
 
 
 # ---------------------------------------------------------------- 数据导出
@@ -1508,7 +1612,7 @@ async def test_export_only_contains_callers_scope(anon_client, api_app, auth_hea
     rebuild = await anon_client.post("/api/v1/admin/rollups/rebuild", headers=auth_headers,
                                      json={"periods": ["2097-Q3"]})
     assert rebuild.status_code == 200, rebuild.text
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         response = await scoped.get("/api/v1/export/transactions?format=csv", headers=headers)
         assert response.status_code == 200, response.text
@@ -1800,7 +1904,7 @@ async def test_scoped_account_cannot_review_another_scope_alert(anon_client, api
     company = await anon_client.get(f"/api/v1/analysis/alerts?period={SCOPE_PERIOD}", headers=auth_headers)
     company_alert = [item for item in company.json()["data"] if not item["department"]][0]
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         other = await scoped.patch(f"/api/v1/analysis/alerts/{company_alert['id']}",
                                    json={"status": "confirmed"}, headers=headers)
@@ -1884,7 +1988,7 @@ async def test_admin_alert_rules_are_editable_and_used_by_recalculation(anon_cli
 
 
 async def test_alert_rules_require_admin(anon_client, api_app, auth_headers):
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         listed = await scoped.get("/api/v1/admin/alert-rules", headers=headers)
         assert listed.status_code == 403
@@ -1937,8 +2041,8 @@ async def test_scoped_alert_rule_overrides_default_only_in_its_scope(anon_client
         ("部门B", "1000", "100", "0"),
         (None, "10000", "9000", "0"),
     ])
-    headers_a, client_a = await _scoped_headers(anon_client, api_app, "部门A")
-    headers_b, client_b = await _scoped_headers(anon_client, api_app, "部门B")
+    headers_a, client_a = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
+    headers_b, client_b = await _scoped_headers(anon_client, api_app, auth_headers, "部门B")
     first = await anon_client.post(f"/api/v1/analysis/calculate?period={TIER_PERIOD}", headers=auth_headers)
     assert first.status_code == 200, first.text
     # 默认规则下：部门A（0.9）报、部门B（0.1）不报、全公司（0.833）报
@@ -2110,6 +2214,9 @@ async def test_audit_log_records_admin_and_data_writes(anon_client, auth_headers
     changed = await anon_client.patch(f"/api/v1/admin/users/{victim_id}",
                                       json={"department": "审计测试部"}, headers=auth_headers)
     assert changed.status_code == 200, changed.text
+    grand = await anon_client.patch(f"/api/v1/admin/users/{victim_id}",
+                                    json={"is_admin": True}, headers=auth_headers)
+    assert grand.status_code == 200 and grand.json()["is_admin"] is True, grand.text
     removed = await anon_client.delete(f"/api/v1/admin/users/{victim_id}", headers=auth_headers)
     assert removed.status_code == 200, removed.text
 
@@ -2136,8 +2243,8 @@ async def test_audit_log_records_admin_and_data_writes(anon_client, auth_headers
 
     payload = await _audit(anon_client, auth_headers, limit=200)
     rows = payload["data"]
-    for action in ("alert_rule.update", "user.department_change", "user.delete", "knowledge.delete",
-                   "metrics.calculate", "alert.review", "data.export"):
+    for action in ("alert_rule.update", "user.department_change", "user.admin_change", "user.delete",
+                   "knowledge.delete", "metrics.calculate", "alert.review", "data.export"):
         assert _find(rows, action) is not None, f"缺少审计：{action}"
 
     rule_row = _find(rows, "alert_rule.update", "利润异常")
@@ -2147,8 +2254,12 @@ async def test_audit_log_records_admin_and_data_writes(anon_client, auth_headers
 
     department_row = _find(rows, "user.department_change", victim_id)
     assert department_row["detail"]["username"] == victim["username"]
-    assert department_row["detail"]["from"] == "不受限"
+    # ⑳ 起「没有部门」不再叫「不受限」：范围那件事叫「未分配」，能不能管是另一条审计
+    assert department_row["detail"]["from"] == "未分配"
     assert department_row["detail"]["to"] == "审计测试部"
+    admin_row = _find(rows, "user.admin_change", victim_id)
+    assert admin_row["detail"]["from"] == "普通账号"
+    assert admin_row["detail"]["to"] == "管理员"
 
     # 操作人一律是当前登录的管理员，不是被操作对象
     assert rule_row["actor"] == credentials["username"]
@@ -2203,7 +2314,7 @@ async def test_audit_log_filters_and_paginates(anon_client, auth_headers):
 
 
 async def test_audit_log_is_admin_only_and_read_only(anon_client, api_app, auth_headers):
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         denied = await scoped.get("/api/v1/admin/audit", headers=headers)
         assert denied.status_code == 403
@@ -2294,7 +2405,7 @@ async def test_audit_export_writes_csv_and_leaves_a_trail(anon_client, api_app, 
     assert latest["actor"] == me.json()["username"]
 
     # 受限账号既不能看也不能导
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         assert (await scoped.get("/api/v1/admin/audit/export", headers=headers)).status_code == 403
         assert (await scoped.post("/api/v1/admin/audit/purge", json={}, headers=headers)).status_code == 403
@@ -2767,7 +2878,7 @@ async def test_jobs_list_filters_and_restart_resume(anon_client, api_app, auth_h
     assert fetched.json()["status"] == "failed"
     assert "已经没有处理函数" in fetched.json()["error"]
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         forbidden = await scoped.get("/api/v1/admin/jobs", headers=headers)
         assert forbidden.status_code == 403
@@ -3528,7 +3639,7 @@ async def test_admin_rollup_rebuild_is_audited_and_admin_only(anon_client, api_a
         _seed_metric(db_session, month, revenue="500.00", expense="100.00")
         _seed_department_metric(db_session, month)
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         forbidden = await scoped.post("/api/v1/admin/rollups/rebuild", headers=headers, json={})
         assert forbidden.status_code == 403
@@ -3637,7 +3748,7 @@ async def test_transaction_list_is_scoped_and_filtered(anon_client, api_app, aut
     assert (await anon_client.get("/api/v1/financial/transactions?batch=不存在的批次",
                                   headers=auth_headers)).json()["total"] == 0
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门-097")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门-097")
     try:
         scoped_list = await scoped.get(f"/api/v1/financial/transactions?period={TX_PERIOD}", headers=headers)
         assert scoped_list.status_code == 200, scoped_list.text
@@ -3741,7 +3852,7 @@ async def test_transaction_correction_permissions_and_validation(anon_client, ap
     other = _seed_row(db_session, day=8, department="部门-999")
     company = _seed_row(db_session, day=9, department=None)
 
-    headers, scoped = await _scoped_headers(anon_client, api_app, "部门-097")
+    headers, scoped = await _scoped_headers(anon_client, api_app, auth_headers, "部门-097")
     try:
         # 别人的部门、以及「没有部门的全公司行」，受限账号都不能动（与读路径同一套口径）
         assert (await scoped.patch(f"/api/v1/financial/transactions/{other.id}", headers=headers,
@@ -3967,10 +4078,15 @@ def _legacy_token(user_id: int) -> str:
                            SECRET_KEY, algorithm=ALGORITHM)
 
 
-async def test_token_carries_session_version_and_logout_revokes_it(anon_client, credentials):
-    """退出登录要把**所有**已签发的令牌作废，而不只是清浏览器里那一份。"""
-    assert (await anon_client.post("/api/v1/auth/register", json=credentials)).status_code == 200
-    login = await anon_client.post("/api/v1/auth/login", json=credentials)
+async def test_token_carries_session_version_and_logout_revokes_it(anon_client, auth_headers):
+    """退出登录要把**所有**已签发的令牌作废，而不只是清浏览器里那一份。
+
+    这里的操作者是**普通账号**（自己注册的），读审计那一步才用 `auth_headers`
+    这个管理员夹具：⑳ 起「注册出来的账号」不再是管理员，也不能自己升。
+    """
+    account = {"username": f"token_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
+    assert (await anon_client.post("/api/v1/auth/register", json=account)).status_code == 200
+    login = await anon_client.post("/api/v1/auth/login", json=account)
     assert login.status_code == 200, login.text
     token = login.json()["access_token"]
     assert login.json()["token_version"] == 0
@@ -3980,12 +4096,12 @@ async def test_token_carries_session_version_and_logout_revokes_it(anon_client, 
     assert me.status_code == 200 and me.json()["token_version"] == 0
 
     # 同一个账号再登录一次（换一台设备）：两份令牌的 ver 都是 0，都能用
-    other = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    other = (await anon_client.post("/api/v1/auth/login", json=account)).json()["access_token"]
     assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(other))).status_code == 200
 
     logout = await anon_client.post("/api/v1/auth/logout", headers=headers)
     assert logout.status_code == 200, logout.text
-    assert logout.json() == {"username": credentials["username"], "token_version": 1, "logged_out": True}
+    assert logout.json() == {"username": account["username"], "token_version": 1, "logged_out": True}
 
     # 两台设备上的旧令牌一起失效，且报的是「已在别处退出」而不是含糊的「登录已失效」
     for stale in (token, other):
@@ -3994,15 +4110,15 @@ async def test_token_carries_session_version_and_logout_revokes_it(anon_client, 
         assert "已在别处退出" in denied.json()["detail"]
 
     # 重新登录拿到 ver=1 的新令牌，可以正常用
-    fresh = (await anon_client.post("/api/v1/auth/login", json=credentials)).json()["access_token"]
+    fresh = (await anon_client.post("/api/v1/auth/login", json=account)).json()["access_token"]
     assert _claims(fresh)["ver"] == 1
     assert (await anon_client.get("/api/v1/auth/me", headers=_bearer(fresh))).status_code == 200
 
-    # 留痕：谁在什么时候把自己下线了
-    rows = (await _audit(anon_client, _bearer(fresh), action="user.logout"))["data"]
+    # 留痕：谁在什么时候把自己下线了（审计只有管理员能读，用管理员夹具那副令牌）
+    rows = (await _audit(anon_client, auth_headers, action="user.logout"))["data"]
     row = _find(rows, "user.logout")
     assert row is not None, rows
-    assert row["actor"] == credentials["username"]
+    assert row["actor"] == account["username"]
     assert row["action_label"] == "退出登录"
     # 键名不含 "token"：audit._scrub() 会把含 token 的字段整条丢掉（所以叫 session_version）
     assert row["detail"]["session_version"] == 1
@@ -4054,8 +4170,10 @@ async def test_admin_can_force_logout_another_account(anon_client, auth_headers)
     assert row is not None, rows
     assert row["action_label"] == "强制下线"
     assert row["detail"]["to_version"] == 1
-    # 被踢的人自己也能在审计里看到这条（不能只让管理员知道）
-    assert (await _audit(anon_client, _bearer(again), action="user.force_logout"))["data"]
+    # 被踢的账号自己**读不到**审计：⑳ 起审计列表是管理员的口子。以前「没有部门」就等于管理员，
+    # 于是每个刚注册的账号都能翻全公司的操作记录 —— 那正是这一版要关掉的洞。
+    peek = await anon_client.get("/api/v1/admin/audit?action=user.force_logout", headers=_bearer(again))
+    assert peek.status_code == 403, peek.text
 
 
 async def test_force_logout_guards_self_non_admin_and_unknown(anon_client, auth_headers, db_session):
@@ -4067,15 +4185,10 @@ async def test_force_logout_guards_self_non_admin_and_unknown(anon_client, auth_
     assert "自己" in self_kick.json()["detail"]
     assert (await anon_client.post("/api/v1/admin/users/99999999/logout", headers=auth_headers)).status_code == 404
 
-    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "pytest-login-2026"}
-    assert (await anon_client.post("/api/v1/auth/register", json=scoped)).status_code == 200
-    token = (await anon_client.post("/api/v1/auth/login", json=scoped)).json()["access_token"]
-    # 新注册账号是没有部门的，而「无部门」在这个项目里就等于财务管理员 —— 必须先收窄成部门账号，
-    # 否则这个用例测的其实还是管理员，会「通过」得毫无意义。
-    narrowed = await anon_client.patch("/api/v1/auth/me", json={"departments": ["部门A"]},
-                                       headers=_bearer(token))
-    assert narrowed.status_code == 200 and narrowed.json()["unrestricted"] is False, narrowed.text
-    denied = await anon_client.post(f"/api/v1/admin/users/{my_id}/logout", headers=_bearer(token))
+    scoped = await _plain_headers(anon_client, prefix="scoped")
+    # ⑳ 起新注册的账号既不是管理员、也没有部门（以前「没有部门」就等于管理员，这个用例
+    # 反而测的正是管理员，会「通过」得毫无意义）。
+    denied = await anon_client.post(f"/api/v1/admin/users/{my_id}/logout", headers=scoped)
     assert denied.status_code == 403, denied.text
 
     # 名单接口带上会话版本号，管理页才能显示「这个账号被下线过几次」
@@ -4222,13 +4335,8 @@ async def test_unlock_guards_self_non_admin_and_unknown(anon_client, auth_header
     assert (await anon_client.post("/api/v1/admin/users/99999999/unlock",
                                    headers=auth_headers)).status_code == 404
 
-    scoped = {"username": f"scoped_{uuid.uuid4().hex[:8]}", "password": "scoped-login-2026"}
-    assert (await anon_client.post("/api/v1/auth/register", json=scoped)).status_code == 200
-    token = (await anon_client.post("/api/v1/auth/login", json=scoped)).json()["access_token"]
-    narrowed = await anon_client.patch("/api/v1/auth/me", json={"departments": ["部门A"]},
-                                       headers=_bearer(token))
-    assert narrowed.status_code == 200 and narrowed.json()["unrestricted"] is False, narrowed.text
-    denied = await anon_client.post(f"/api/v1/admin/users/{me['id']}/unlock", headers=_bearer(token))
+    scoped = await _plain_headers(anon_client, prefix="scoped")
+    denied = await anon_client.post(f"/api/v1/admin/users/{me['id']}/unlock", headers=scoped)
     assert denied.status_code == 403, denied.text
 
 
@@ -4719,7 +4827,7 @@ async def test_calculate_and_import_queue_outbound_deliveries(anon_client, auth_
             if row["period"] == HOOK_PERIOD]
 
 
-async def test_alert_channel_endpoints_require_admin(anon_client, api_app):
+async def test_alert_channel_endpoints_require_admin(anon_client, api_app, auth_headers):
     """通道能往任意地址 POST（含内网）、台账里有业务信息：只给管理员。"""
     for method, path in (("get", "/api/v1/admin/alert-channels"),
                          ("post", "/api/v1/admin/alert-channels"),
@@ -4729,7 +4837,7 @@ async def test_alert_channel_endpoints_require_admin(anon_client, api_app):
         response = await (call(path, json={}) if method == "post" else call(path))
         assert response.status_code == 401, (method, path, response.status_code)
 
-    headers, client = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, client = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         denied = await client.get("/api/v1/admin/alert-channels", headers=headers)
         assert denied.status_code == 403 and "需要管理员权限" in denied.json()["detail"]
@@ -4858,7 +4966,7 @@ async def test_agent_sessions_crud_ownership_and_audit(anon_client, api_app, aut
     assert untitled.json()["title"] == ""
     assert untitled.json()["display_title"] == "未命名会话"
 
-    headers, stranger = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, stranger = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         assert (await stranger.get(f"/api/v1/ai/agent/sessions/{session_id}",
                                    headers=headers)).status_code == 404
@@ -5050,7 +5158,7 @@ async def test_agent_endpoints_require_token_and_usage_scope(anon_client, api_ap
     assert (await anon_client.get("/api/v1/admin/agent-usage?days=0",
                                   headers=auth_headers)).status_code == 422
 
-    headers, client = await _scoped_headers(anon_client, api_app, "部门A")
+    headers, client = await _scoped_headers(anon_client, api_app, auth_headers, "部门A")
     try:
         denied = await client.get("/api/v1/admin/agent-usage", headers=headers)
         assert denied.status_code == 403 and "需要管理员权限" in denied.json()["detail"]

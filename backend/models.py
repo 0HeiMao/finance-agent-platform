@@ -1,7 +1,18 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,15 +24,21 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    # 部门可见性（多部门）：`departments` 是权威值，留空 = 不受部门限制（财务管理员）；
-    # 填了部门列表 = 只看这些部门的明细与据此重算的指标、预警（几本部门账相加），
-    # 知识库则是「这些部门 + 没标部门的公共资料」。由管理员在 /admin/users 维护，
-    # 不采信请求头里的自述部门。
+    # 部门可见性（多部门）：`departments` 是权威值，填了部门列表 = 只看这些部门的明细与据此
+    # 重算的指标、预警（几本部门账相加），知识库则是「这些部门 + 没标部门的公共资料」。
+    # 由管理员在 /admin/users 维护，不采信请求头里的自述部门。
+    # **留空不再等于不受限**（见下面的 is_admin）：留空只表示「还没分配范围」。
     departments: Mapped[list | None] = mapped_column(JSONB)
     # 单值列保留给老客户端与导出/审计里的展示（口径文案只有一行），语义 = 第一个部门。
     # 读权限**不要**用它，一律走 backend/scope.py 的 scope_of()（它会优先读 departments，
     # 列表为空时回落到这一列，所以多部门上线前建的账号行为不变）。
     department: Mapped[str | None] = mapped_column(String(100))
+    # 管理员标识（⑳）：权限是「能不能管」、部门是「能看哪些数据」，两件事分开记。
+    # ⑳ 之前 `is_admin()` 的定义是「没有部门限制」，于是任何账号把自己的部门清空就等于升权
+    # （自助注册的新账号更是天生如此，一注册就是全库管理员）。老库按「原先不受部门限制 =
+    # 管理员」回填，演示账号因此完全不变；此后新注册的账号默认 false。
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                           server_default="false")
     # 会话版本号：JWT 是无状态的，签发以后服务端收不回来（这正是它「不可撤销」的含义）。
     # 令牌里带上签发时的 `ver`，每个请求都和这一列比一次：不相等就是「这个令牌已经作废」。
     # 加一 = 该账号**所有**已发出的令牌立刻失效（退出登录、管理员强制下线都走它）。

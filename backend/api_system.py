@@ -19,6 +19,7 @@ from backend.rag.embeddings import get_embedding_service
 from backend.rag.pgvector_store import EMBEDDING_DIMENSION, DocumentChunk
 from backend.scope import (
     departments_of,
+    is_admin,
     scope_alert,
     scope_metric,
     scope_of,
@@ -136,10 +137,11 @@ def system_status(db: Session = Depends(get_db), user: User = Depends(current_us
             "id": user.id,
             "username": user.username,
             "department": user.department,
-            # 系统设置页要按这一份渲染「我的部门」输入框，只给单值列会让多部门账号
-            # 一进页面就只看到第一个部门，点保存就把自己缩成了一个部门。
+            # 设置页只**展示**这几个字段（⑳ 起本人改不了范围，入口在管理端），所以给全：
+            # `is_admin` 是权限、`unrestricted` 是当前口径，被收窄的管理员两个值不一样。
             "departments": list(departments_of(user)),
-            "unrestricted": not departments_of(user),
+            "is_admin": is_admin(user),
+            "unrestricted": scope_of(user) is None,
             # 会话版本号（退出登录/被强制下线的次数）：设置页要显示「我这份令牌是第几版」
             "token_version": int(user.token_version or 0),
         },

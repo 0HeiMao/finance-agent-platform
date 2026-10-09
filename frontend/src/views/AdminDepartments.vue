@@ -18,11 +18,20 @@ const drafts = reactive({})
 
 const RULES = [
   {
-    title: '不受限账号（部门留空）',
+    title: '管理员（有管理员标识）',
     tone: 'ok',
     items: [
-      '看板、收入/成本分析、预警、Word/PPT 报告、Agent 都是全公司口径（读 department 为空的那行指标）。',
-      '知识库检索返回所有片段；管理入口全部开放。'
+      '能不能管只看账号上的管理员标识：能进管理端、能给别的账号分配数据范围。',
+      '管理员如果自己也被分配了部门，它的数据范围同样收窄到那几个部门 —— 收窄不丢管理权。',
+      '没有被分配部门的管理员看的是全公司口径（读 department 为空的那行指标）。'
+    ]
+  },
+  {
+    title: '未分配部门的账号',
+    tone: 'warn',
+    items: [
+      '部门留空**不再等于管理员**：这种账号什么都看不到（指标、明细、预警、知识库片段都是空的）。',
+      '新建出来的账号就是这个状态，由管理员在用户管理里分配部门后才看得到数据。'
     ]
   },
   {
@@ -31,7 +40,7 @@ const RULES = [
     items: [
       '只统计该部门的数据行：指标与预警读该部门的 department 口径行，明细钻取只返回本部门交易。',
       '报告与 PPT 在标题/封面写明「数据范围：部门 X」，Agent 证据里也会带同一句，避免数字被当公司口径引用。',
-      '知识库只返回该部门与未标注部门的片段；管理接口一律 403。',
+      '知识库只返回该部门与未标注部门的片段；管理接口一律 403（除非它同时有管理员标识）。',
       '部门为空的数据行（未标注部门）归全公司口径，不属于任何部门账号。'
     ]
   },
@@ -85,7 +94,8 @@ async function load() {
     const response = await apiFetch('/admin/departments')
     const payload = await response.json()
     departments.value = payload.departments || []
-    unrestrictedUsers.value = payload.unrestricted_users || []
+    // 键名先认新的 `unassigned_users`，回落到老键（后端两个都发，这里只是别在旧后端上炸）
+    unrestrictedUsers.value = payload.unassigned_users || payload.unrestricted_users || []
     summary.value = payload.summary || null
     me.value = payload.me || null
     knownDepartments.value = departments.value.map((item) => item.name)
@@ -112,7 +122,7 @@ async function saveUser(user) {
     })
     const updated = await response.json()
     notice.value = updated.unrestricted
-      ? `已保存：${updated.username} 现在不受部门限制。`
+      ? `已保存：${updated.username} 现在没有分配部门，因此看不到任何数据（也不会因此变成管理员）。`
       : `已保存：${updated.username} 限定为「${departmentsText(updated.departments)}」。`
     await load()
   } catch (e) {
@@ -125,7 +135,7 @@ async function saveUser(user) {
 function useDepartment(name) {
   const target = unrestrictedUsers.value[0]
   if (target) drafts[target.id] = name
-  notice.value = `已把「部门 ${name}」填到 ${target ? target.username : '第一个不受限账号'} 的输入框，确认后点保存。`
+  notice.value = `已把「部门 ${name}」填到 ${target ? target.username : '第一个未分配部门的账号'} 的输入框，确认后点保存。`
 }
 
 onMounted(load)
@@ -141,7 +151,10 @@ onMounted(load)
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>部门权限设置</h1>
-            <p>部门决定财务数据与知识库的可见范围：留空＝不受限制（管理员），填写后只统计本部门口径。</p>
+            <p>
+              部门决定财务数据与知识库的可见范围；留空＝未分配（什么都看不到），不等于管理员 ——
+              能不能管看的是账号上的管理员标识。
+            </p>
           </div>
         </div>
         <div class="actions">
@@ -194,7 +207,11 @@ onMounted(load)
               <span>已绑定账号的部门</span><strong>{{ summary.departments_with_users }}</strong>
             </div>
             <div>
-              <span>不受限账号</span><strong>{{ summary.unrestricted_users }}</strong>
+              <span>未分配部门的账号</span
+              ><strong>{{ summary.unassigned_users ?? summary.unrestricted_users }}</strong>
+            </div>
+            <div>
+              <span>管理员</span><strong>{{ summary.admin_users }}</strong>
             </div>
             <div>
               <span>账号总数</span><strong>{{ summary.total_users }}</strong>
@@ -205,7 +222,7 @@ onMounted(load)
         <section class="page-card">
           <div class="card-head">
             <h2>账号 → 部门</h2>
-            <span>修改自己的部门请到 System 设置（管理接口拒绝自改，避免把自己锁在管理入口之外）</span>
+            <span>数据范围与管理员标识都只能由管理员改（⑳ 起账号没有自改入口）</span>
           </div>
           <div class="table-wrap">
             <table>
@@ -222,13 +239,16 @@ onMounted(load)
                   <td>
                     {{ user.username }}
                     <span v-if="user.is_self" class="level medium">当前账号</span>
+                    <span v-if="user.is_admin" class="level high">管理员</span>
                   </td>
                   <td>
                     <span class="level" :class="user.unrestricted ? 'low' : 'medium'">
                       {{
                         user.unrestricted
                           ? '全公司'
-                          : `部门 ${departmentsText(user.departments) || user.department}`
+                          : (user.departments || []).length
+                            ? `部门 ${departmentsText(user.departments)}`
+                            : '未分配'
                       }}
                     </span>
                   </td>
@@ -238,7 +258,7 @@ onMounted(load)
                       class="select"
                       list="department-options"
                       maxlength="500"
-                      placeholder="留空＝不受限；多个用「、」分隔"
+                      placeholder="留空＝未分配（看不到任何数据）；多个用「、」分隔"
                       :disabled="user.is_self"
                     />
                   </td>
