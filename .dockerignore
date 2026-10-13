@@ -21,3 +21,4 @@ pytest-of-*/
 torchinductor_*/
 *.log
 .env
+.env.*

@@ -249,6 +249,29 @@ sequenceDiagram
 
 ## 9 本地运行
 
+### 一键脚本
+
+Windows PowerShell 使用 `./scripts/setup.ps1`，Linux/macOS 使用 `bash scripts/setup.sh`。
+两套脚本使用相同的 Python 实现，可从任意目录调用；需要 Python 3.11+、Node.js/npm。
+`start` 和 `demo` 另需 Docker Compose v2（支持 `--wait`）。
+
+| 功能 | PowerShell | Bash |
+| --- | --- | --- |
+| 安装 Python/前端依赖，创建配置 | `./scripts/setup.ps1` | `bash scripts/setup.sh` |
+| 构建并启动常规 Docker 服务 | `./scripts/start.ps1` | `bash scripts/start.sh` |
+| 快速检查，不运行数据库测试 | `./scripts/check.ps1 --quick` | `bash scripts/check.sh --quick` |
+| 完整现有检查，需要测试数据库 | `./scripts/check.ps1` | `bash scripts/check.sh` |
+| 启动隔离演示并导入合成数据 | `./scripts/demo.ps1` | `bash scripts/demo.sh` |
+| 停止演示，保留数据卷 | `./scripts/demo.ps1 --stop` | `bash scripts/demo.sh --stop` |
+
+初始化不会覆盖已有 `.env`，首次创建时自动生成认证密钥；模型密钥和 384 维 Embedding 模型仍需自行配置。脚本遇到子命令失败会返回非零退出码。
+
+常规启动复用 `docker-compose.yml`，访问 `http://127.0.0.1:8080`，可能复用原有常规数据库；不要把它当成隔离环境。服务端口冲突由 Docker 报错，脚本不会终止占用端口的进程。
+
+演示使用独立的 `docker-compose.demo.yml`、数据库及上传卷，入口只绑定本机 `http://127.0.0.1:8081`。管理员为 `interview_admin`，随机密码存放在被 Git 忽略的 `.env.demo` 的 `DEMO_ADMIN_PASSWORD` 中。重复运行不重复导入同一 CSV；停止不会删除数据。首次构建需要联网下载镜像与依赖。
+
+演示环境默认只准备财务数据与账号，不配置模型、不自动上传制度。完整 AI 演示还需为演示容器配置模型和 Embedding，并按[演示指南](docs/interview-demo-guide.md)上传制度、配置部门账号。仅执行演示脚本不会产生外部模型调用费用。
+
 需要 Python 3.11、Node.js/npm，以及支持 pgvector 的 PostgreSQL。以下命令在仓库根目录运行（PowerShell）。
 
 ```powershell
