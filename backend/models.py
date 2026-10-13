@@ -352,6 +352,7 @@ class AgentSession(Base):
     空标题的会话在列表里显示成「未命名会话」。
     """
     __tablename__ = "agent_sessions"
+    scope_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     id: Mapped[int] = mapped_column(primary_key=True)
     # 用户被删时连同会话一起删（ondelete=CASCADE）：这是个人问答记录，不是审计证据
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -378,6 +379,8 @@ class AgentMessage(Base):
        把两者混在一起报账，等于把估算当账单。
     """
     __tablename__ = "agent_messages"
+    scope_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    execution_trace: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
     id: Mapped[int] = mapped_column(primary_key=True)
     session_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)

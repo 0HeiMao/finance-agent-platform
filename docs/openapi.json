@@ -506,10 +506,27 @@
       },
       "Body_upload_document_api_v1_rag_documents_upload_post": {
         "properties": {
+          "department": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Department"
+          },
           "file": {
             "contentMediaType": "application/octet-stream",
             "title": "File",
             "type": "string"
+          },
+          "publish_public": {
+            "default": false,
+            "title": "Publish Public",
+            "type": "boolean"
           }
         },
         "required": [
@@ -713,6 +730,11 @@
             ],
             "title": "Page"
           },
+          "publish_public": {
+            "default": false,
+            "title": "Publish Public",
+            "type": "boolean"
+          },
           "source": {
             "maxLength": 500,
             "minLength": 1,
@@ -742,6 +764,27 @@
       },
       "Question": {
         "properties": {
+          "alert_id": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alert Id"
+          },
+          "mode": {
+            "default": "workflow",
+            "enum": [
+              "workflow",
+              "agent"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
           "question": {
             "maxLength": 4000,
             "minLength": 1,
@@ -2680,7 +2723,7 @@
     },
     "/api/v1/admin/knowledge": {
       "delete": {
-        "description": "按来源整份删除知识库片段（管理员操作，不受部门限制）。\n\n片段删掉后，那次上传落盘的文档如果**没有别的来源再引用**，就成了谁也指不到的孤儿文件\n（路径只存在于刚被删掉的行里），所以这里顺手清理：先记下要删的片段引用了哪些路径，\n删除后再按路径数一遍引用数，归零才 unlink。",
+        "description": "按来源删除当前管理员可维护的知识库片段，不影响其他部门同名来源。\n\n片段删掉后，那次上传落盘的文档如果**没有别的来源再引用**，就成了谁也指不到的孤儿文件\n（路径只存在于刚被删掉的行里），所以这里顺手清理：先记下要删的片段引用了哪些路径，\n删除后再按路径数一遍引用数，归零才 unlink。",
         "operationId": "delete_knowledge_api_v1_admin_knowledge_delete",
         "parameters": [
           {
@@ -3242,6 +3285,51 @@
         ]
       }
     },
+    "/api/v1/ai/agent/alerts/{alert_id}/context": {
+      "get": {
+        "operationId": "get_alert_context_api_v1_ai_agent_alerts__alert_id__context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "alert_id",
+            "required": true,
+            "schema": {
+              "title": "Alert Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Get Alert Context",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
     "/api/v1/ai/agent/ask": {
       "post": {
         "operationId": "agent_ask_api_v1_ai_agent_ask_post",
@@ -3551,6 +3639,61 @@
           }
         ],
         "summary": "Get Agent Session",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/api/v1/ai/agent/sessions/{session_id}/messages/{message_id}": {
+      "get": {
+        "description": "断线后只读查询原回答状态；不重新调用模型，复核会话与消息当前权限。",
+        "operationId": "get_agent_message_api_v1_ai_agent_sessions__session_id__messages__message_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Get Agent Message",
         "tags": [
           "agent"
         ]
@@ -5593,6 +5736,30 @@
           }
         ],
         "summary": "Search Documents Api",
+        "tags": [
+          "rag"
+        ]
+      }
+    },
+    "/api/v1/rag/write-scope": {
+      "get": {
+        "operationId": "knowledge_write_scope_api_v1_rag_write_scope_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Knowledge Write Scope",
         "tags": [
           "rag"
         ]

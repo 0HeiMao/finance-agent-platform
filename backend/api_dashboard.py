@@ -99,6 +99,15 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
     profit = totals["profit"]
     net_ratio = (profit / revenue) if revenue else Decimal(0)
     cost_ratio = (cost / revenue) if revenue else Decimal(0)
+    cost_recorded = any(row.cost_amount for row in rows)
+    cash_recorded = any(row.cash_in_amount or row.cash_out_amount for row in rows)
+    quality = [{"code": "basis", "message": "期间以最新已导入数据为基准；收支差额是简化计算，不等同经审计净利润。"}]
+    if not cost_recorded:
+        quality.append({"code": "cost_unverified", "message": "当前明细的成本列均为 0；尚不能区分真实零成本与源数据未提供成本，不宜据此判断成本率正常。"})
+    if not cash_recorded:
+        quality.append({"code": "cash_unverified", "message": "当前明细没有非零现金流入/流出记录，无法区分真实零流水与字段未提供，暂不绘制现金流图。"})
+    if revenue > 0 and expense > revenue * 10:
+        quality.append({"code": "expense_scale", "message": "所选范围的费用超过收入 10 倍，请核对源数据单位、收入与支出分类及导入口径后再作解释。"})
 
     # 环比：与紧邻的上一期比。上一期必须有完整数据，否则不给数字（前端会整行不显示）。
     previous_months = _previous_months(months, period)
@@ -134,7 +143,8 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
         "range": {"year": year, "months": months, "label": f"{months[0]}~{months[-1]}"},
         "compare": compare,
         "scope": scope_payload(scope, requested=explicit),
-        "source_note": "政府会计总账公开数据（加拿大 Receiver General），口径见 data/processed/README.md",
+        "source_note": "来源：当前授权范围内已导入的财务明细；收支差额 = 收入 − 成本 − 费用。",
+        "data_quality": quality,
         "kpi": [
             _kpi("营业收入", revenue, "元", "↗", None, previous_value("revenue"), compare_label),
             _kpi("成本金额", cost, "元", "▣", None, previous_value("cost"), compare_label),
@@ -147,9 +157,9 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
         ],
         "chart_notes": {
             "revenue": f"按交易日期逐月汇总（{'、'.join(m[5:] for m in months)}），单位为元",
-            "expenses": "按支出金额最高的前 5 个部门汇总；源数据无成本科目，成本列恒为 0",
-            "cash": "源数据没有银行流水时间轴，现金流入/流出按 0 处理，此处仅显示未分类净额",
-            "cash_note": "现金流入/流出口径不可用",
+            "expenses": "按支出金额最高的前 5 个部门汇总；成本和费用分列统计。",
+            "cash": "按导入明细的现金流字段汇总；请核对源数据记账方向。" if cash_recorded else "现金流字段均为 0，数据完整性尚未确认。",
+            "cash_note": "已导入现金流字段汇总" if cash_recorded else "现金流口径待核验",
         },
         "months": list(monthly),
         # 金额一律用字符串输出：float 会在 5.8 万亿这种量级丢分位，看板和源文件就对不上了
@@ -160,6 +170,7 @@ def dashboard(period: str = "year", department: str | None = Query(None, max_len
             for name, value in top_departments
         ],
         "cash": {
+            "available": cash_recorded,
             "x": ["现金收支（未分类）"],
             "inflow": [str(_money(sum((row.cash_in_amount or Decimal(0) for row in rows), Decimal(0))))],
             "outflow": [str(_money(-sum((row.cash_out_amount or Decimal(0) for row in rows), Decimal(0))))],

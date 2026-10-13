@@ -1,14 +1,28 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import AppSidebar from '../components/AppSidebar.vue'
 import AgentChat from '../components/AgentChat.vue'
 import DataScopeNotice from '../components/DataScopeNotice.vue'
 import ScopeSwitcher from '../components/ScopeSwitcher.vue'
-import { apiFetch } from '../api/client'
+import {
+  listAgentSessions,
+  getAgentUsage,
+  createAgentSession,
+  getAgentSession,
+  deleteAgentSession,
+  getAlertContext
+} from '../api/agent'
 import { currentUser, loadCurrentUser } from '../api/session'
 import { departmentsText } from '../utils/format'
 
 const sidebarOpen = ref(false)
+const historyOpen = ref(false)
+const historyCollapsed = ref(false)
+const busy = ref(false)
+const listLoading = ref(true)
+const lifetime = new AbortController()
+onBeforeUnmount(() => lifetime.abort())
 const user = currentUser()
 onMounted(loadCurrentUser)
 
@@ -29,9 +43,9 @@ const scope = computed(() => {
   }
 })
 
-// 示例问题按「库里确实有数据」来写：都能命中财务证据层或知识库，不会一问就答不上来
+// 示例只表达查询意图，可用期间和实际证据由后端检查。
 const EXAMPLES = [
-  '2026-07 的费用异常在哪里？',
+  '有哪些可用的财务期间？',
   '本月收支差额是多少？',
   '哪些部门支出最高？',
   '成本率异常的预警阈值是多少？'
@@ -50,20 +64,60 @@ const history = ref([])
 const chatKey = ref(0)
 const usage = ref(null)
 const listError = ref('')
+const route = useRoute()
+const router = useRouter()
+const alertContext = ref(null)
+const contextLoading = ref(false)
+const contextError = ref('')
+let contextRequest = null
+onBeforeUnmount(() => contextRequest?.abort())
+async function loadContext() {
+  contextRequest?.abort()
+  const request = new AbortController()
+  contextRequest = request
+  alertContext.value = null
+  contextError.value = ''
+  contextLoading.value = false
+  resetChat(null, [])
+  const id = route.query.alert
+  if (!id) return
+  if (typeof id !== 'string' || !/^[1-9]\d*$/.test(id)) {
+    contextError.value = '预警编号无效，请从预警列表重新进入。'
+    return
+  }
+  contextLoading.value = true
+  try {
+    const payload = await getAlertContext(id, request.signal)
+    if (!request.signal.aborted) alertContext.value = payload
+  } catch (error) {
+    if (!request.signal.aborted) contextError.value = error.message || '无法读取预警'
+  } finally {
+    if (!request.signal.aborted) contextLoading.value = false
+  }
+}
+watch(() => route.query.alert, loadContext, { immediate: true })
+
+async function exitAlert() {
+  if (route.query.alert) await router.replace('/agent')
+  await loadContext()
+}
 
 async function loadSessions() {
   try {
-    const payload = await (await apiFetch('/ai/agent/sessions?limit=50')).json()
+    const payload = await listAgentSessions(lifetime.signal)
     sessions.value = payload.data || []
     listError.value = ''
   } catch (e) {
+    if (lifetime.signal.aborted) return
     listError.value = e.message || '会话列表读取失败'
+  } finally {
+    listLoading.value = false
   }
 }
 
 async function loadUsage() {
   try {
-    usage.value = await (await apiFetch('/ai/agent/usage?days=7')).json()
+    usage.value = await getAgentUsage(lifetime.signal)
   } catch {
     // 用量只是附带信息：取不到不该挡住问答
     usage.value = null
@@ -77,37 +131,61 @@ function resetChat(nextSessionId, messages) {
 }
 
 async function newSession() {
+  if (busy.value) return
+  busy.value = true
+  listError.value = ''
   try {
-    const created = await (
-      await apiFetch('/ai/agent/sessions', {
-        method: 'POST',
-        body: JSON.stringify({})
-      })
-    ).json()
+    const created = await createAgentSession(lifetime.signal)
+    if (route.query.alert) await router.replace('/agent')
+    alertContext.value = null
     resetChat(created.id, [])
+    historyOpen.value = false
     await loadSessions()
   } catch (e) {
+    if (lifetime.signal.aborted) return
     listError.value = e.message || '新建会话失败'
+  } finally {
+    busy.value = false
   }
 }
 
 async function openSession(id) {
+  if (busy.value) return
+  busy.value = true
+  listError.value = ''
   try {
-    const detail = await (await apiFetch(`/ai/agent/sessions/${id}`)).json()
+    const detail = await getAgentSession(id, lifetime.signal)
+    const savedContext = [...(detail.messages || [])]
+      .reverse()
+      .flatMap((message) => message.execution_trace || [])
+      .find((step) => step.kind === 'alert_context')
+    const verifiedContext = savedContext ? await getAlertContext(savedContext.id, lifetime.signal) : null
+    if (route.query.alert) await router.replace('/agent')
+    alertContext.value = verifiedContext
     resetChat(id, detail.messages || [])
+    historyOpen.value = false
   } catch (e) {
+    if (lifetime.signal.aborted) return
     listError.value = e.message || '打开会话失败'
+  } finally {
+    busy.value = false
   }
 }
 
 async function removeSession(id) {
+  if (busy.value) return
+  busy.value = true
+  listError.value = ''
   try {
-    await apiFetch(`/ai/agent/sessions/${id}`, { method: 'DELETE' })
+    await deleteAgentSession(id, lifetime.signal)
+    if (sessionId.value === id) resetChat(null, [])
+    await Promise.all([loadSessions(), loadUsage()])
   } catch (e) {
+    if (lifetime.signal.aborted) return
     listError.value = e.message || '删除会话失败'
+  } finally {
+    busy.value = false
   }
-  if (sessionId.value === id) resetChat(null, [])
-  await Promise.all([loadSessions(), loadUsage()])
 }
 
 function onSaved() {
@@ -123,7 +201,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app agent-page">
     <AppSidebar :open="sidebarOpen" @request-close="sidebarOpen = false" />
 
     <main>
@@ -132,43 +210,90 @@ onMounted(() => {
           <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">☰</button>
           <div>
             <h1>财务分析 Agent</h1>
-            <p>基于已导入的财务数据与知识库作答：金额与比率由程序确定性汇总，模型只做解释与归因。</p>
+            <p>把问题交给 Agent，将结论追溯到数据与制度。</p>
           </div>
         </div>
         <div class="actions">
-          <ScopeSwitcher />
+          <ScopeSwitcher v-if="!route.query.alert && !alertContext" />
         </div>
       </header>
 
-      <DataScopeNotice :scope="scope" />
+      <DataScopeNotice v-if="!route.query.alert && !alertContext" :scope="scope" />
+      <section v-if="contextLoading" class="state-box" role="status">正在核验预警权限与分析范围…</section>
+      <section v-else-if="contextError" class="state-box error-state" role="alert">
+        {{ contextError }} <button class="btn" @click="loadContext">重试</button
+        ><router-link class="btn" to="/agent">返回普通问答</router-link>
+      </section>
+      <section v-else-if="alertContext" class="alert-context card">
+        <div>
+          <span class="eyebrow">预警分析 · #{{ alertContext.id }}</span>
+          <h2>{{ alertContext.type }}</h2>
+          <p>{{ alertContext.period }} · {{ alertContext.scope_label }} · {{ alertContext.description }}</p>
+          <small>分析范围已按预警锁定。问题已填入输入框，确认后发送。</small>
+        </div>
+        <button class="btn" @click="exitAlert">退出预警分析</button>
+      </section>
 
-      <div class="agent-layout">
-        <section class="card session-card">
+      <div class="workbench-toolbar">
+        <span class="eyebrow">✦ AGENT WORKSPACE</span
+        ><button class="btn history-toggle" :aria-expanded="historyOpen" @click="historyOpen = !historyOpen">
+          会话记录</button
+        ><button
+          class="btn desktop-history-toggle"
+          :aria-expanded="!historyCollapsed"
+          @click="historyCollapsed = !historyCollapsed"
+        >
+          {{ historyCollapsed ? '展开会话' : '收起会话' }}
+        </button>
+      </div>
+      <button
+        v-if="historyOpen"
+        class="history-scrim"
+        aria-label="关闭会话记录"
+        @click="historyOpen = false"
+      />
+      <div class="agent-layout" :class="{ 'history-collapsed': historyCollapsed }">
+        <section
+          class="card session-card"
+          :class="{ 'history-open': historyOpen }"
+          @keydown.esc="historyOpen = false"
+        >
           <div class="card-head">
             <h2>会话历史</h2>
-            <button class="btn primary" @click="newSession">新建会话</button>
+            <button class="btn primary" :disabled="busy" @click="newSession">新建会话</button>
+            <button class="btn history-toggle" @click="historyOpen = false">关闭</button>
           </div>
-          <p v-if="listError" class="state-box error-state">{{ listError }}</p>
-          <ul v-if="sessions.length" class="session-list">
+          <div v-if="listError" class="state-box error-state" role="alert">
+            {{ listError }} <button class="btn" :disabled="busy" @click="loadSessions">刷新列表</button>
+          </div>
+          <p v-if="listLoading" class="muted" role="status">正在读取会话…</p>
+          <ul v-else-if="sessions.length" class="session-list">
             <li
               v-for="item in sessions"
               :key="item.id"
               class="session-row"
               :class="{ active: item.id === sessionId }"
             >
-              <button class="session-open" @click="openSession(item.id)">
+              <button class="session-open" :disabled="busy" @click="openSession(item.id)">
                 <span class="session-title">{{ item.display_title }}</span>
                 <span class="muted session-meta">
                   {{ item.answers }} 问 · {{ item.total_tokens }} tokens
                 </span>
               </button>
-              <button class="btn danger session-delete" @click="removeSession(item.id)">删除</button>
+              <button
+                class="btn danger session-delete"
+                :disabled="busy"
+                :aria-label="`删除会话：${item.display_title}`"
+                @click="removeSession(item.id)"
+              >
+                删除
+              </button>
             </li>
           </ul>
           <p v-else class="muted">还没有会话。问一句就会自动建一个，也可以点「新建会话」先占位再提问。</p>
 
-          <div v-if="usage" class="usage-panel">
-            <h3>近 7 天用量</h3>
+          <details v-if="usage" class="usage-panel">
+            <summary>近 7 天用量</summary>
             <p>{{ usage.data.answers }} 次回答 · {{ usage.data.total_tokens }} tokens</p>
             <p class="muted">
               其中 {{ usage.data.api_answers }} 次由接口上报真实用量，{{ usage.data.estimated_answers }}
@@ -184,16 +309,19 @@ onMounted(() => {
                 </li>
               </ul>
             </details>
-          </div>
+          </details>
         </section>
 
         <!-- key 换会话就重建：历史消息只在初始化时读一次 -->
         <AgentChat
+          v-if="!contextLoading && !contextError"
           :key="chatKey"
           full
           :examples="EXAMPLES"
           :session-id="sessionId"
           :history="history"
+          :initial-question="alertContext?.question || ''"
+          :alert-id="alertContext?.id || null"
           @update:session-id="sessionId = $event"
           @saved="onSaved"
         />

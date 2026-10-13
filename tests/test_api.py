@@ -219,6 +219,8 @@ async def test_dashboard_amounts_are_exact_strings(anon_client, auth_headers, db
         assert kpi["note"]
     assert set(payload["chart_notes"]) == {"revenue", "expenses", "cash", "cash_note"}
     assert payload["compare"]["available"] is False
+    assert payload["cash"]["available"] is False
+    assert {item["code"] for item in payload["data_quality"]} >= {"basis", "cost_unverified", "cash_unverified"}
     assert "原因" not in payload["compare"] and payload["compare"]["reason"]
 
 
@@ -4927,6 +4929,73 @@ def _agent_llm(chunks=("依据", "证据"), tokens=(12, 5), before_second=None) 
     return SimpleNamespace(stream=stream, calls=calls)
 
 
+async def test_tool_agent_trace_persists_and_scope_cannot_be_overridden(anon_client, api_app, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    responses = iter([
+        {"tool_calls": [{"id": "t1", "type": "function", "function": {
+            "name": "list_periods", "arguments": json.dumps({"department": "B"})}}]},
+        {"tool_calls": [{"id": "t2", "type": "function", "function": {
+            "name": "list_periods", "arguments": "{}"}}]},
+        {"content": json.dumps({"claims": [{"text": "当前没有可见财务数据，请先导入。", "evidence_ids": ["E2"]}]})},
+    ])
+    invoked = []
+    model = SimpleNamespace(tool_turn=lambda *args, **kwargs: (next(responses), {
+        "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}))
+    monkeypatch.setattr("backend.agent_task_api.get_llm", lambda: model)
+    monkeypatch.setattr("backend.agent_task_api.execute", lambda db, scope, name, args: invoked.append((scope, args)) or {"periods": []})
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        response = await anon_client.post("/api/v1/ai/agent/chat/stream", headers=headers,
+                                         json={"question": "查询可用期间", "mode": "agent"})
+        assert response.status_code == 200
+        events = _agent_events(response.text)
+        done = events[-1][1]
+        assert done["status"] == "ok"
+        assert len(invoked) == 1 and invoked[0][1] == {}
+        assert done["tokens"]["total_tokens"] == 45
+        steps = [item for kind, item in events if kind == "step" and item.get("kind") == "tool"]
+        assert [item["status"] for item in steps] == ["invalid", "ok"]
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{done['session_id']}", headers=headers)).json()
+        trace = detail["messages"][-1]["execution_trace"]
+        assert trace[-1]["status"] == "ok"
+        assert len([item for item in trace if item["kind"] == "tool"]) == 2
+        assert all("result" not in item for item in trace)
+
+
+async def test_agent_followup_restores_state_without_old_answer_evidence(anon_client, api_app, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    received = []
+    def turn(messages, tools, **kwargs):
+        received.append(list(messages))
+        period = "2026-Q2" if "第二季度" in messages[-1]["content"] else "2026-Q1"
+        if messages[-1]["role"] == "tool":
+            entry = json.loads(messages[-1]["content"])["facts"][0]
+            return {"content": json.dumps({"claims": [{"text": "收入", "evidence_ids": ["E1"], "fact_refs": [{"evidence_id": "E1", **{key: entry[key] for key in ('fact_id', 'metric', 'period', 'scope', 'value', 'unit')}}]}]})}, {}
+        return {"tool_calls": [{"id": "c", "type": "function", "function": {
+            "name": "query_metrics", "arguments": json.dumps({"periods": [period]})}}]}, {}
+    monkeypatch.setattr("backend.agent_task_api.get_llm", lambda: SimpleNamespace(tool_turn=turn))
+    from backend.agent_facts import fact
+    monkeypatch.setattr("backend.agent_task_api.execute", lambda db, scope, name, arguments: {"context": "收入100元", "has_data": True, "facts": [fact('revenue', 'revenue', '收入', arguments['periods'][0], scope, '100.00')]})
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        first = await anon_client.post("/api/v1/ai/agent/chat/stream", headers=headers,
+                                       json={"question": "2026年第一季度收入", "mode": "agent"})
+        sid = _agent_events(first.text)[-1][1]["session_id"]
+        second = await anon_client.post(f"/api/v1/ai/agent/chat/stream?session_id={sid}", headers=headers,
+                                        json={"question": "那第二季度呢？", "mode": "agent"})
+        done = _agent_events(second.text)[-1][1]
+        assert done["status"] == "ok" and done["state_inherited"]
+        trace = done["execution_trace"]
+        state = next(item for item in trace if item["kind"] == "state")
+        assert state["periods"] == ["2026-Q2"] and state["metrics"] == ["收入"]
+        assert len(received[2]) == 2  # 系统指令+解析后的本轮问题，不带上一轮回答
+        assert "2026年第二季度" in received[2][-1]["content"]
+
+
 class _RealAgentDatabase:
     """把整条请求链路切到真库（绕过 conftest 的 savepoint）。
 
@@ -5235,6 +5304,31 @@ async def test_agent_stop_before_the_first_chunk_wastes_nothing(anon_client, api
         assert answer["stop_requested"] is True
         assert answer["total_tokens"] == 0 and answer["usage_source"] == "", \
             "一次模型都没调用，不该凭空记一笔估算用量"
+
+
+async def test_agent_missing_month_streams_notice_without_model(anon_client, api_app, monkeypatch):
+    """缺失月份走真实 SSE 与会话落库，禁止借用知识库或调用模型。"""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("缺失月份不应该检索或调用模型")
+
+    monkeypatch.setattr("backend.api_ai._retrieve", forbidden)
+    monkeypatch.setattr("backend.api_ai.get_llm", forbidden)
+    async with _RealAgentDatabase(api_app) as real:
+        headers = await real.login(anon_client)
+        response = await anon_client.post("/api/v1/ai/agent/chat/stream", headers=headers,
+                                          json={"question": "1901-01收入是多少"})
+        assert response.status_code == 200
+        events = _agent_events(response.text)
+        assert "1901-01" in _agent_text(events)
+        assert "不能用其他月份代替" in _agent_text(events)
+        done = events[-1][1]
+        assert done["status"] == "ok"
+        assert done["tokens"]["total_tokens"] == 0
+        assert done["sources"] == []
+        detail = (await anon_client.get(f"/api/v1/ai/agent/sessions/{done['session_id']}",
+                                        headers=headers)).json()
+        assert detail["messages"][-1]["content"] == _agent_text(events)
+        assert detail["messages"][-1]["total_tokens"] == 0
 
 
 async def test_agent_endpoints_require_token_and_usage_scope(anon_client, api_app, auth_headers):

@@ -169,7 +169,7 @@ async def main() -> int:
                 check(r.status_code == 401, f"[鉴权] 匿名 {path} -> HTTP {r.status_code}")
 
             print("\n--- 4. RAG 去重：同一来源同一内容不重复入库 ---")
-            payload = {"content": f"{marker} 的临时制度片段：差旅费报销标准为每晚 500 元。", "source": f"{marker}-临时制度.md"}
+            payload = {"content": f"{marker} 的临时制度片段：差旅费报销标准为每晚 500 元。", "source": f"{marker}-临时制度.md", "publish_public": True}
             r1 = await call(client, "/api/v1/rag/documents", token, payload)
             r2 = await call(client, "/api/v1/rag/documents", token, payload)
             check(r1.status_code == 200 and len(r1.json().get("ids", [])) == 1, f"[去重] 首次入库 {r1.json()}")
@@ -181,10 +181,10 @@ async def main() -> int:
                 sample = Path(tmp) / f"{marker}-制度.md"
                 sample.write_text("差旅费报销标准为每晚 500 元。\n住宿发票需与行程单一致。\n", encoding="utf-8")
                 files = {"file": (sample.name, io.BytesIO(sample.read_bytes()), "text/markdown")}
-                up1 = await client.post("/api/v1/rag/documents/upload", files=files, headers={"Authorization": f"Bearer {token}"})
+                up1 = await client.post("/api/v1/rag/documents/upload", files=files, data={"publish_public": "true"}, headers={"Authorization": f"Bearer {token}"})
                 body1 = up1.json()
                 files = {"file": (sample.name, io.BytesIO(sample.read_bytes()), "text/markdown")}
-                up2 = await client.post("/api/v1/rag/documents/upload", files=files, headers={"Authorization": f"Bearer {token}"})
+                up2 = await client.post("/api/v1/rag/documents/upload", files=files, data={"publish_public": "true"}, headers={"Authorization": f"Bearer {token}"})
                 body2 = up2.json()
             check(up1.status_code == 200 and body1.get("chunks", 0) >= 1, f"[上传] 首次入库 {body1.get('chunks')} 段")
             check(up2.status_code == 200 and body2.get("chunks") == 0 and body2.get("skipped", 0) >= 1,

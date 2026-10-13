@@ -229,6 +229,49 @@ function makeRouter() {
   })
 }
 
+test('知识库上传：部门管理员不能选择公共发布，提交时带所属部门', async () => {
+  await seedUser({ is_admin: true, unrestricted: false, departments: ['A'] })
+  useRoutes([
+    {
+      path: '/api/v1/rag/write-scope',
+      response: () => jsonResponse({ can_write: true, can_publish_public: false, departments: ['A'] })
+    },
+    { path: '/api/v1/admin/knowledge', response: () => jsonResponse({ data: [], total: 0 }) },
+    {
+      path: '/api/v1/rag/documents/upload',
+      method: 'POST',
+      response: () => jsonResponse({ source: 'policy.txt', chunks: 1, skipped: 0 })
+    }
+  ])
+  const router = makeRouter()
+  await router.push('/admin')
+  const Knowledge = (await import('../src/views/AdminKnowledge.vue')).default
+  const view = mount(Knowledge, { global: { plugins: [router] } })
+  try {
+    assert.ok(await waitFor(() => view.text().includes('指定部门')))
+    assert.doesNotMatch(view.text(), /所有登录用户/)
+    const visibility = view.select()
+    await view.input(visibility, 'department')
+    const departmentSelect = view.all((node) => node.type === 'select')[1]
+    await view.input(departmentSelect, 'A')
+    const fileInput = view.find((node) => node.type === 'input' && node.props.type === 'file')
+    await view.fire('change', fileInput, {
+      target: { files: [new File(['policy'], 'policy.txt', { type: 'text/plain' })] }
+    })
+    await view.fire(
+      'submit',
+      view.find((node) => node.type === 'form'),
+      { preventDefault() {}, stopPropagation() {} }
+    )
+    assert.ok(await waitFor(() => view.text().includes('新增 1 条片段')))
+    const request = fetchImpl.calls.find((call) => call.path.includes('/rag/documents/upload'))
+    assert.equal(request.body.get('department'), 'A')
+    assert.equal(request.body.get('publish_public'), 'false')
+  } finally {
+    view.app.unmount()
+  }
+})
+
 test('侧边栏：有管理员标识才看到「管理员」组，只看「不受限」不再算管理员', async () => {
   await seedUser({ is_admin: true, unrestricted: true, departments: [] })
   const adminRouter = makeRouter()
@@ -333,6 +376,8 @@ test('Agent 对话框：点示例问题走流式回答，依据按类型打标�
       path: '/api/v1/ai/agent/chat/stream',
       response: () =>
         sseResponse([
+          'event: step\ndata: {"kind":"tool_start","step":1,"tool":"query_metrics","status":"running"}\n\n',
+          'event: step\ndata: {"kind":"tool","step":1,"tool":"query_metrics","status":"ok","duration_ms":12,"summary":"查询完成"}\n\n',
           'event: delta\ndata: {"text":"本月"}\n\n',
           'event: delta\ndata: {"text":"收支差额为 -5,357,304,117,380.05。"}\n\n',
           'event: done\ndata: {"sources":[{"name":"财务汇总表 2026-07","kind":"financial_metric"},' +
@@ -352,13 +397,163 @@ test('Agent 对话框：点示例问题走流式回答，依据按类型打标�
   assert.ok(await waitFor(() => view.text().includes('依据：')), `实际渲染：${view.text()}`)
   const request = fetchImpl.calls.at(-1)
   assert.equal(request.path, '/api/v1/ai/agent/chat/stream?department=097')
-  assert.deepEqual(JSON.parse(request.body), { question: '本月收支差额是多少？' })
+  assert.deepEqual(JSON.parse(request.body), { question: '本月收支差额是多少？', mode: 'agent' })
   assert.match(view.text(), /收支差额为 -5,357,304,117,380\.05/)
+  assert.match(view.text(), /执行记录 · 1 个查询步骤/)
+  assert.match(view.text(), /查询财务指标 · 完成 · 12 ms/)
   // 后端给财务证据的名字本身以类型开头，不能再补前缀；知识库片段才补「知识库·」；同一文件去重
   assert.match(view.text(), /依据：财务汇总表 2026-07、知识库·成本表\.xlsx、明细账 2026-07/)
   assert.doesNotMatch(view.text(), /财务汇总表·/)
   assert.doesNotMatch(view.text(), /成本表\.xlsx、知识库·成本表/)
   setActiveScope('')
+})
+
+test('预警分析：发送服务端预填问题与编号，不携带全局部门；证据以文本展示', async () => {
+  setActiveScope('other-department')
+  const evidence = {
+    id: 'E1',
+    scope_label: '部门 A',
+    periods: ['2026-07'],
+    excerpts: [{ title: '制度片段', text: '<img src=x onerror=alert(1)>' }],
+    note: '本次查询快照'
+  }
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/chat/stream',
+      response: () =>
+        sseResponse([
+          `event: step\ndata: ${JSON.stringify({ kind: 'tool', step: 1, tool: 'query_metrics', status: 'ok', evidence })}\n\n`,
+          'event: delta\ndata: {"text":"请复核"}\n\n',
+          'event: done\ndata: {"sources":[]}\n\n'
+        ])
+    }
+  ])
+  const view = mount(AgentChat, { props: { full: true, alertId: 7, initialQuestion: '核对 2026-07 预警' } })
+  await view.click('发送')
+  assert.ok(await waitFor(() => view.text().includes('查询快照')))
+  assert.equal(fetchImpl.calls.at(-1).path, '/api/v1/ai/agent/chat/stream')
+  assert.deepEqual(JSON.parse(fetchImpl.calls.at(-1).body), {
+    question: '核对 2026-07 预警',
+    mode: 'agent',
+    alert_id: 7
+  })
+  assert.match(view.text(), /部门 A/)
+  assert.match(view.text(), /<img src=x onerror=alert\(1\)>/)
+  assert.equal(
+    view.find((node) => node.type === 'img'),
+    null
+  )
+  view.app.unmount()
+  setActiveScope('')
+})
+
+test('历史会话恢复已保存的证据快照，未完成步骤不冒充成功', () => {
+  const view = mount(AgentChat, {
+    props: {
+      full: true,
+      history: [
+        {
+          role: 'assistant',
+          content: '已停止',
+          status: 'stopped',
+          execution_trace: [
+            {
+              kind: 'tool',
+              step: 1,
+              tool: 'query_metrics',
+              status: 'ok',
+              evidence: {
+                id: 'E1',
+                scope_label: '全公司',
+                periods: ['2026-07'],
+                excerpts: [{ title: '财务指标', text: '收入 120 元' }],
+                note: '历史快照'
+              }
+            },
+            { kind: 'tool_start', step: 2, tool: 'search_policies', status: 'running' }
+          ]
+        }
+      ]
+    }
+  })
+  assert.match(view.text(), /收入 120 元/)
+  assert.match(view.text(), /该步骤没有完成记录/)
+  assert.match(view.text(), /检索相关制度 · 未完成/)
+  view.app.unmount()
+})
+
+test('断线恢复只读取原回答，不再次 POST 模型请求', async () => {
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/chat/stream',
+      response: () =>
+        sseResponse([
+          'event: start\ndata: {"session_id":9,"message_id":31}\n\n',
+          'event: delta\ndata: {"text":"未完整内容"}\n\n'
+        ])
+    },
+    {
+      path: '/api/v1/ai/agent/sessions/9/messages/31',
+      response: () =>
+        jsonResponse({
+          id: 31,
+          role: 'assistant',
+          status: 'ok',
+          content: '已保存的完整回答',
+          sources: [],
+          execution_trace: []
+        })
+    }
+  ])
+  const view = mount(AgentChat, { props: { full: true, examples: ['恢复测试'] } })
+  await view.click('恢复测试')
+  assert.ok(await waitFor(() => view.text().includes('已恢复保存的回答')))
+  assert.match(view.text(), /已保存的完整回答/)
+  assert.doesNotMatch(view.text(), /未完整内容/)
+  assert.equal(fetchImpl.calls.filter((call) => call.method === 'POST').length, 1)
+  view.app.unmount()
+})
+
+test('原回答仍在生成时阻止重复发送；恢复接口权限拒绝后清除缓存正文', async () => {
+  let denied = false
+  useRoutes([
+    {
+      method: 'POST',
+      path: '/api/v1/ai/agent/chat/stream',
+      response: () =>
+        sseResponse([
+          'event: start\ndata: {"session_id":9,"message_id":31}\n\n',
+          'event: delta\ndata: {"text":"PRIVATE_PARTIAL"}\n\n'
+        ])
+    },
+    {
+      path: '/api/v1/ai/agent/sessions/9/messages/31',
+      response: () =>
+        denied
+          ? jsonResponse({ detail: '权限已变化' }, { status: 403 })
+          : jsonResponse({
+              id: 31,
+              role: 'assistant',
+              status: 'streaming',
+              content: 'PRIVATE_PARTIAL',
+              sources: [],
+              execution_trace: []
+            })
+    }
+  ])
+  const view = mount(AgentChat, { props: { full: true, examples: ['恢复测试'] } })
+  await view.click('恢复测试')
+  assert.ok(await waitFor(() => view.text().includes('原回答仍在生成')))
+  await view.click('发送')
+  assert.equal(fetchImpl.calls.filter((call) => call.method === 'POST').length, 1)
+  denied = true
+  await view.click('检查已保存结果')
+  assert.ok(await waitFor(() => view.text().includes('权限已变化')))
+  assert.doesNotMatch(view.text(), /PRIVATE_PARTIAL/)
+  assert.equal(view.button('重试'), null)
+  view.app.unmount()
 })
 
 test('Agent 对话框：流断掉时显示错误并可重试，清空会话只在有消息后出现', async () => {
@@ -871,7 +1066,7 @@ test('Agent 会话（⑮）：开始事件把会话 id 抛回上层，追问带�
   await view.click('发送')
   assert.ok(await waitFor(() => view.text().includes('按字数估算')), `实际渲染：${view.text()}`)
   assert.equal(fetchImpl.calls.at(-1).path, '/api/v1/ai/agent/chat/stream?session_id=9')
-  assert.deepEqual(JSON.parse(fetchImpl.calls.at(-1).body), { question: '那 7 月呢？' })
+  assert.deepEqual(JSON.parse(fetchImpl.calls.at(-1).body), { question: '那 7 月呢？', mode: 'agent' })
   assert.match(view.text(), /本回答 40 tokens（按字数估算）/)
   // ⑰：模型这一轮究竟带上了几轮历史，要写在回答下面（预算截断也要说清楚）
   assert.match(view.text(), /已带上前 1 轮对话（更早的已省略）/)

@@ -1,5 +1,7 @@
 # 密钥与本地环境
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc
@@ -29,6 +31,7 @@ frontend/.build-tmp/
 .vscode/
 
 # 运行期生成物：验收截图每次都会被 check_pages.py 覆盖，报告也随时可重新导出
+output/
 output/charts/
 output/reports/
 output/_*

@@ -3,7 +3,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import { getDashboard } from '../api/dashboard'
-import AgentChat from '../components/AgentChat.vue'
 import AppSidebar from '../components/AppSidebar.vue'
 import DataScopeNotice from '../components/DataScopeNotice.vue'
 import ScopeSwitcher from '../components/ScopeSwitcher.vue'
@@ -18,6 +17,7 @@ const data = ref(null)
 const loading = ref(false)
 const error = ref('')
 const updatedAt = ref('')
+let request = null
 
 const kpis = computed(() => (data.value && data.value.kpi) || [])
 const alerts = computed(() => ((data.value && data.value.alerts) || []).slice(0, 6))
@@ -35,7 +35,7 @@ const updatedText = computed(() => (updatedAt.value ? `数据更新于 ${updated
 // 图表只画最近 6 个月，说明文字也跟着收窄，避免出现图上没有的月份
 const revenueNote = computed(() => {
   const months = tail.value.months.map((m) => m.slice(5)).join('、')
-  return months ? `按交易日期逐月汇总（${months}），单位为元` : notes.value.revenue
+  return months ? `按交易日期逐月汇总（${months}），单位为${scaleUnit.value.name}` : notes.value.revenue
 })
 
 const revenueEl = ref(null)
@@ -71,12 +71,6 @@ function humanTime(value) {
   const text = String(value).replace('T', ' ')
   return text.length >= 16 ? text.slice(0, 16) : text
 }
-function wan(value) {
-  return Number((Number(value || 0) / 10000).toFixed(2)).toLocaleString('zh-CN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  })
-}
 function fmtTime(value) {
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return '—'
@@ -104,7 +98,7 @@ function renderCharts() {
   r.setOption({
     color: ['#397fb5'],
     tooltip: { ...tooltip, valueFormatter: (v) => `${v} ${scaleUnit.value.name}` },
-    grid: { left: 62, right: 18, top: 30, bottom: 28 },
+    grid: { left: 12, right: 32, top: 30, bottom: 12, containLabel: true },
     xAxis: {
       type: 'category',
       data: tail.value.months,
@@ -128,45 +122,35 @@ function renderCharts() {
 
   const e = echarts.init(expenseEl.value)
   const expenses = data.value.expenses || []
-  const single = expenses.length === 1
   e.setOption({
-    color: ['#397fb5', '#52a77b', '#e7a844', '#8e83c4', '#9fb3c8'],
+    color: ['#6186dd'],
     tooltip: {
-      trigger: 'item',
-      backgroundColor: '#173b5d',
-      textStyle: { color: '#fff' },
-      formatter: (p) => `${p.name}<br/>${wan(p.value)} 万元（${p.percent}%）`
+      trigger: 'axis',
+      renderMode: 'richText',
+      valueFormatter: (v) => `${v} ${scaleUnit.value.name}`
     },
-    legend: single
-      ? { show: false }
-      : {
-          orient: 'vertical',
-          left: 0,
-          top: 'middle',
-          itemWidth: 10,
-          itemHeight: 10,
-          textStyle: { color: '#718096', fontSize: 11 }
-        },
+    grid: { left: 12, right: 20, top: 28, bottom: 12, containLabel: true },
+    xAxis: { ...yAxis, name: '' },
+    yAxis: {
+      type: 'category',
+      inverse: true,
+      data: expenses.map((item) => item.name),
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: '#718096', width: 80, overflow: 'truncate' }
+    },
     series: [
       {
-        type: 'pie',
-        radius: single ? ['0%', '60%'] : ['45%', '70%'],
-        center: single ? ['50%', '48%'] : ['66%', '48%'],
-        itemStyle: { borderColor: '#fff', borderWidth: 3 },
-        label: {
-          show: true,
-          color: '#5b6b7d',
-          fontSize: 11,
-          formatter: (p) => (p.percent >= 5 ? `${p.percent}%` : '')
-        },
-        labelLine: { length: 6, length2: 6 },
-        data: expenses
+        type: 'bar',
+        barMaxWidth: 18,
+        itemStyle: { borderRadius: 4 },
+        data: expenses.map((item) => scaled(item.value))
       }
     ]
   })
 
-  const c = echarts.init(cashEl.value)
-  c.setOption({
+  const c = data.value.cash.available === false ? null : echarts.init(cashEl.value)
+  c?.setOption({
     color: ['#52a77b', '#e98989'],
     tooltip: { ...tooltip, valueFormatter: (v) => `${v} ${scaleUnit.value.name}` },
     legend: { top: 22, right: 0, textStyle: { color: '#718096', fontSize: 11 } },
@@ -178,7 +162,7 @@ function renderCharts() {
       { name: '流出', type: 'bar', barWidth: 18, data: data.value.cash.outflow.map(scaled) }
     ]
   })
-  charts = [r, e, c]
+  charts = [r, e, c].filter(Boolean)
   observers = [revenueEl, expenseEl, cashEl]
     .filter((el) => el.value)
     .map((el) => {
@@ -195,31 +179,40 @@ function disposeCharts() {
 }
 
 async function loadData() {
+  request?.abort()
+  const current = new AbortController()
+  request = current
   loading.value = true
   error.value = ''
   try {
-    const payload = await getDashboard(period.value)
+    const payload = await getDashboard(period.value, current.signal)
+    if (current.signal.aborted) return
     data.value = payload || null
     updatedAt.value = payload && payload.updated_at ? fmtTime(payload.updated_at) : ''
   } catch (err) {
+    if (current.signal.aborted) return
     data.value = null
     updatedAt.value = ''
     error.value = err && err.message ? err.message : '加载失败，请稍后重试'
   } finally {
-    loading.value = false
+    if (request === current) loading.value = false
   }
   await nextTick()
+  if (current.signal.aborted) return
   renderCharts()
 }
 function refresh() {
   if (!loading.value) loadData()
 }
 
-watch(period, refresh)
+watch(period, loadData)
 // 口径切换后必须重新取数：看板的每个数字都依赖口径，留着旧数据会出现「标签说部门、数字是全公司」。
-watch(activeScope, refresh)
+watch(activeScope, loadData)
 onMounted(loadData)
-onBeforeUnmount(disposeCharts)
+onBeforeUnmount(() => {
+  request?.abort()
+  disposeCharts()
+})
 
 // 预警卡显示的是「本期范围」内的全部预警；导出要用同一范围，所以给的是区间而不是单个期间，
 // 用 `data.period`（值是 month/quarter/year，那是期间类型不是期间）会被后端按格式挡回 422。
@@ -230,7 +223,7 @@ const alertRange = computed(() => {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app dashboard-page">
     <AppSidebar :open="sidebarOpen" @request-close="sidebarOpen = false" />
 
     <main>
@@ -258,15 +251,30 @@ const alertRange = computed(() => {
         </div>
       </header>
 
+      <section class="overview-intro">
+        <div>
+          <span class="eyebrow">财务工作空间 / OVERVIEW</span>
+          <h2>看清经营变化，找到下一步。</h2>
+          <p>从核心指标到异常明细，让每一次分析都有数据依据。</p>
+        </div>
+        <div class="overview-links">
+          <router-link class="btn" to="/financial/import">导入数据</router-link
+          ><router-link class="btn primary" to="/agent">✦ 开始 AI 分析 →</router-link>
+        </div>
+      </section>
+
       <section v-if="route.query.denied === 'admin'" class="state-box notice">
         <strong>管理入口不可访问</strong>
-        <p>
-          当前账号已限定部门，只能查看本部门数据；需要管理权限请在 System 设置里清空「我的部门」
-          或让管理员在用户管理里调整。
-        </p>
+        <p>当前账号没有访问此管理入口的权限，请联系管理员核对账号权限。</p>
       </section>
 
       <DataScopeNotice :scope="data && data.scope" />
+      <details v-if="data?.data_quality?.length" class="data-quality card">
+        <summary>数据口径与完整性 · {{ data.data_quality.length }} 项说明</summary>
+        <ul>
+          <li v-for="item in data.data_quality" :key="item.code">{{ item.message }}</li>
+        </ul>
+      </details>
 
       <section v-if="error" class="state-box error-state">
         <strong>数据加载失败</strong>
@@ -329,7 +337,7 @@ const alertRange = computed(() => {
             <article class="card chart-card">
               <div class="card-head">
                 <h2>费用构成</h2>
-                <span>按部门 Top 5</span>
+                <span>按部门 Top 5 · {{ scaleUnit.name }}</span>
               </div>
               <div ref="expenseEl" class="chart" />
               <p class="chart-note">{{ notes.expenses }}</p>
@@ -339,7 +347,11 @@ const alertRange = computed(() => {
                 <h2>现金流对比</h2>
                 <span>单位：{{ scaleUnit.name }}</span>
               </div>
-              <div ref="cashEl" class="chart" />
+              <div v-if="data.cash.available !== false" ref="cashEl" class="chart" />
+              <div v-else class="chart chart-unavailable">
+                <strong>现金流口径待核验</strong>
+                <p>当前字段均为零，不能据此认定实际现金流为零。</p>
+              </div>
               <p class="chart-note">{{ notes.cash }}</p>
             </article>
           </section>
@@ -353,9 +365,7 @@ const alertRange = computed(() => {
               <button class="btn" @click="router.push('/analysis/alerts')">查看全部</button>
             </div>
             <div v-if="!alerts.length" class="state-box notice">
-              <p>
-                所选期间没有触发预警。源数据没有成本科目，「成本率异常」不会触发，只有「利润异常」可能命中。
-              </p>
+              <p>所选期间未触发已配置的预警规则，可继续查看明细或发起 AI 分析。</p>
             </div>
             <div v-else class="table-wrap">
               <table>
@@ -380,7 +390,14 @@ const alertRange = computed(() => {
                     </td>
                     <td>{{ a.period || '—' }}</td>
                     <td>{{ humanTime(a.time) }}</td>
-                    <td><router-link class="link" :to="`/alerts/${a.id}`">查看明细 →</router-link></td>
+                    <td>
+                      <div class="alert-actions">
+                        <router-link class="link" :to="`/alerts/${a.id}`">查看明细 →</router-link
+                        ><router-link class="link" :to="{ path: '/agent', query: { alert: a.id } }"
+                          >✦ 分析此异常</router-link
+                        >
+                      </div>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -391,7 +408,14 @@ const alertRange = computed(() => {
         </template>
       </template>
 
-      <AgentChat />
+      <section class="analysis-entry card">
+        <div>
+          <span class="eyebrow">✦ AI 分析助手</span>
+          <h2>数字背后，还有哪些值得追问？</h2>
+          <p>查询财务指标、对比费用明细，并查阅相关制度依据。</p>
+        </div>
+        <router-link class="btn primary" to="/agent">进入 Agent 工作台 →</router-link>
+      </section>
       <div class="footer">智能财务分析平台 · 数据仅供经营分析参考</div>
     </main>
   </div>

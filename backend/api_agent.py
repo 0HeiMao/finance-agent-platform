@@ -15,9 +15,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend import agent_sessions, audit
+from backend.agent_access import require_access, snapshot
 from backend.auth import current_user
 from backend.db import get_db
-from backend.models import AgentSession, User
+from backend.models import AgentMessage, AgentSession, User
 from backend.scope import scope_of
 
 router = APIRouter(prefix="/api/v1/ai", tags=["agent"])
@@ -36,13 +37,14 @@ def _session_or_404(db: Session, user: User, session_id: int) -> AgentSession:
     session = db.get(AgentSession, session_id)
     if session is None or session.user_id != user.id:
         raise HTTPException(404, f"会话 {session_id} 不存在")
+    require_access(user, session)
     return session
 
 
 @router.get("/agent/sessions")
 def list_agent_sessions(limit: int = Query(50, ge=1, le=PAGE_MAX), offset: int = Query(0, ge=0),
                         user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rows, total = agent_sessions.list_sessions(db, user_id=user.id, limit=limit, offset=offset)
+    rows, total = agent_sessions.list_sessions(db, user_id=user.id, limit=limit, offset=offset, user=user)
     counts = agent_sessions.session_counts(db, [row.id for row in rows])
     return {"data": [agent_sessions.session_payload(row, counts.get(row.id)) for row in rows],
             "total": total, "limit": limit, "offset": offset, "untitled": agent_sessions.UNTITLED}
@@ -52,7 +54,7 @@ def list_agent_sessions(limit: int = Query(50, ge=1, le=PAGE_MAX), offset: int =
 def create_agent_session(payload: SessionCreate, user: User = Depends(current_user),
                          db: Session = Depends(get_db)):
     session = AgentSession(user_id=user.id, title=payload.title.strip(),
-                           scope=agent_sessions.scope_text(scope_of(user)))
+                           scope=agent_sessions.scope_text(scope_of(user)), scope_snapshot=snapshot(scope_of(user)))
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -79,6 +81,19 @@ def delete_agent_session(session_id: int, user: User = Depends(current_user),
                  detail={"title": title, "messages": removed})
     db.commit()
     return {"id": session_id, "title": title, "deleted_messages": removed, "deleted": True}
+
+
+@router.get("/agent/sessions/{session_id}/messages/{message_id}")
+def get_agent_message(session_id: int, message_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """断线后只读查询原回答状态；不重新调用模型，复核会话与消息当前权限。"""
+    from backend.agent_access import allows
+    _session_or_404(db, user, session_id)
+    message = db.get(AgentMessage, message_id)
+    if message is None or message.session_id != session_id or message.user_id != user.id:
+        raise HTTPException(404, "回答不存在")
+    if not allows(user, message.scope_snapshot):
+        raise HTTPException(403, "当前权限不允许读取该回答")
+    return agent_sessions.message_payload(message)
 
 
 @router.post("/agent/sessions/{session_id}/stop")

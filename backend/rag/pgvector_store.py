@@ -5,7 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Integer, String, Text, func, select
+from sqlalchemy import DateTime, Integer, String, Text, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -34,13 +34,17 @@ def add_documents(db: Session, documents: Iterable[dict[str, Any]]) -> list[str]
     return [row.id for row in rows]
 
 
-def search_documents(db: Session, embedding: list[float], top_k: int = 5, max_distance: float | None = None, *, embedding_model: str) -> list[DocumentChunk]:
+def search_documents(db: Session, embedding: list[float], top_k: int = 5, max_distance: float | None = None, *, embedding_model: str, departments: tuple[str, ...] | None = None) -> list[DocumentChunk]:
     if len(embedding) != EMBEDDING_DIMENSION:
         raise ValueError(f"embedding 必须包含 {EMBEDDING_DIMENSION} 个浮点数")
     distance = DocumentChunk.embedding.cosine_distance(embedding).label("distance")
     # 同维度不代表同一向量空间；旧模型及未标记的索引不能参与检索。
     statement = (select(DocumentChunk, distance)
-                 .where(DocumentChunk.metadata_json["embedding_model"].astext == embedding_model)
-                 .order_by(distance).limit(top_k))
+                 .where(DocumentChunk.metadata_json["embedding_model"].astext == embedding_model))
+    # 必须先限制可见范围再截断，否则其他部门的片段会挤掉合法候选。
+    if departments is not None:
+        department = func.coalesce(DocumentChunk.metadata_json["department"].astext, "")
+        statement = statement.where(or_(department == "", department.in_(departments)))
+    statement = statement.order_by(distance).limit(top_k)
     rows = db.execute(statement).all()
     return [row[0] for row in rows if max_distance is None or row[1] <= max_distance]

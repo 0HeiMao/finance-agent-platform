@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-import re
+from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -16,13 +16,19 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from backend import periods as period_mod
+from backend.agent_facts import fact, metric_facts
 from backend.models import FinancialAlert, FinancialMetric, FinancialTransaction
+from backend.rag.question_periods import parse
 from backend.scope import Scope, metric_totals, scope_alert, scope_label, scope_metric, scope_transactions
 
 CENT = Decimal("0.01")
 MAX_TABLE_PERIODS = 24
 MAX_DETAIL_ROWS = 6
-_YEAR_MONTH = re.compile(r"(\d{4})\s*[-/年]\s*(0?[1-9]|1[0-2])\s*月?")
+
+
+def requested_periods(question: str) -> list[str]:
+    """将明确期间或相对期间展开为月份；不明确的时间要求澄清。"""
+    return list(parse(question).months)
 
 
 def money(value: Decimal | float | int | None) -> str:
@@ -39,14 +45,17 @@ def available_periods(db: Session, scope: Scope = None) -> list[str]:
 
 
 def pick_period(question: str, periods: list[str]) -> str | None:
-    """按问题里出现的期间选期，识别不到就回落到最新一期。"""
+    """仅在未指定月份时默认最新一期，指定但无数据时返回 None。"""
     if not periods:
         return None
-    matched = [f"{year}-{month.zfill(2)}" for year, month in _YEAR_MONTH.findall(question)]
+    try:
+        matched = requested_periods(question)
+    except ValueError:
+        return None
     for period in matched:
         if period in periods:
             return period
-    return periods[-1]
+    return None if matched else periods[-1]
 
 
 def _aggregate(db: Session, period: str, column, scope: Scope = None) -> list[tuple[str, Decimal, int]]:
@@ -67,7 +76,7 @@ def _aggregate(db: Session, period: str, column, scope: Scope = None) -> list[tu
 def _summary_lines(metrics: list) -> list[str]:
     shown = metrics[-MAX_TABLE_PERIODS:]
     lines = [
-        f"期间口径说明：全部金额为「元」，比率保留 4 位小数；共 {len(metrics)} 期已入库，下表为最近 {len(shown)} 期。",
+        f"期间口径说明：全部金额为「元」，比率保留 4 位小数；本轮选取 {len(metrics)} 期指标，下表展示其中 {len(shown)} 期，不代表数据库只有这些期间。",
         "",
         "| 期间 | 收入金额 | 成本金额 | 费用金额 | 收支差额(净额) | 收入成本率 | 收入净额率 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
@@ -81,7 +90,8 @@ def _summary_lines(metrics: list) -> list[str]:
 
 
 def _period_lines(db: Session, period: str, metric,
-                  scope: Scope = None) -> tuple[list[str], list[str]]:
+                  scope: Scope = None) -> tuple[list[str], list[str], list[dict]]:
+    facts = []
     lines = [
         f"### 当前期间明细（{period}）",
         f"- 收入金额 {money(metric.revenue_amount)} 元，成本金额 {money(metric.cost_amount)} 元，费用金额 {money(metric.expense_amount)} 元，收支差额 {money(metric.net_profit_amount)} 元。",
@@ -91,13 +101,16 @@ def _period_lines(db: Session, period: str, metric,
         "| 部门 | 收入金额 | 费用金额 | 笔数 |",
         "| --- | --- | --- | --- |",
     ]
-    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.department, scope):
+    for index, (name, revenue, expense, count) in enumerate(_aggregate(db, period, FinancialTransaction.department, scope)):
         lines.append(f"| {name} | {money(revenue)} | {money(expense)} | {count} |")
+        if index < 3:
+            facts.append(fact(f"{period}:department{index}:expense", "department_expense", "部门费用", period, (name,), money(expense), dimension=f"部门 {name}"))
     lines += ["", f"按科目汇总（{period}，按费用金额降序，最多 {MAX_DETAIL_ROWS} 行）：", "| 科目名称 | 收入金额 | 费用金额 | 笔数 |", "| --- | --- | --- | --- |"]
-    for name, revenue, expense, count in _aggregate(db, period, FinancialTransaction.account_name, scope):
+    for index, (name, revenue, expense, count) in enumerate(_aggregate(db, period, FinancialTransaction.account_name, scope)):
         lines.append(f"| {name} | {money(revenue)} | {money(expense)} | {count} |")
+        facts.append(fact(f"{period}:account{index}:expense", "account_expense", "科目费用", period, scope, money(expense), dimension=name))
     alerts = db.scalars(scope_alert(
-        select(FinancialAlert).where(FinancialAlert.period == period), scope)
+        select(FinancialAlert).where(FinancialAlert.period.in_(period_mod.months_of(period))), scope)
         .order_by(FinancialAlert.id)).all()
     lines += ["", f"本期系统预警（{len(alerts)} 条）："]
     if alerts:
@@ -113,7 +126,7 @@ def _period_lines(db: Session, period: str, metric,
         {"name": f"财务预警 {period}", "kind": "financial_alert"},
         {"name": f"明细账 {period}", "kind": "financial_transaction"},
     ]
-    return lines, sources
+    return lines, sources, facts
 
 
 def collect(db: Session, question: str, scope: Scope = None) -> dict[str, Any]:
@@ -123,30 +136,57 @@ def collect(db: Session, question: str, scope: Scope = None) -> dict[str, Any]:
     受限账号的 Agent 绝不能看到别人的数字，所以指标、明细、预警三处都要过 scope。
     """
     periods = available_periods(db, scope)
+    try:
+        selection = parse(question)
+    except ValueError as exc:
+        return {"has_data": False, "periods": periods, "period": None, "context": "", "sources": [],
+                "unavailable_message": str(exc)}
+    requested = list(selection.months)
+    missing = [period for period in requested if period not in periods]
+    if missing:
+        # 比较缺一端也不能借用其他月份；交给接口直接提示，不让模型猜。
+        message = f"当前可见数据中没有以下月份的数据：{'、'.join(missing)}。请补充数据或调整月份，不能用其他月份代替。"
+        return {"has_data": False, "periods": periods, "period": None,
+                "context": "", "sources": [], "missing_periods": missing,
+                "unavailable_message": message}
     if not periods:
         return {"has_data": False, "periods": [], "context": "", "sources": []}
+    selected = requested or periods
     rows = list(db.scalars(scope_metric(
-        select(FinancialMetric).where(FinancialMetric.period.in_(periods)), scope)
+        select(FinancialMetric).where(FinancialMetric.period.in_(selected)), scope)
         .order_by(FinancialMetric.period, FinancialMetric.id)))
     # 一期一行：多部门账号同期有多条部门行，直接取「最后一条」会静默丢掉另一本账，
     # 所以这里按期间聚合（金额相加、比率按合计重算），证据表里才是一个部门并集的数字。
-    totals = {item.period: item for item in metric_totals(rows, period_order=periods)}
-    ordered = [totals[period] for period in periods if period in totals]
-    period = pick_period(question, periods)
+    totals = {item.period: item for item in metric_totals(rows, period_order=selected)}
+    ordered = [totals[period] for period in selected if period in totals]
+    period = selection.groups[0] if selection.groups else periods[-1]
     scope_line = ("" if scope is None
                   else f"数据范围：本证据只包含「{scope_label(scope)}」的明细，不是全公司口径。")
     lines = ["【已导入财务数据（程序确定性计算，可直接引用）】"]
     if scope_line:
         lines.append(scope_line)
+    if requested:
+        lines.append(f"时间口径：{'、'.join(selection.groups)}；相对日期基准 {selection.reference_date}（{selection.timezone}）。")
+    if not requested:
+        lines.append(f"未指定明确月份，本轮明细默认使用最新一期 {period}。")
     lines += ["", "#### 各期间汇总", "", *_summary_lines(ordered)]
-    sources: list[dict[str, Any]] = [{"name": f"财务汇总表 {periods[0]}~{periods[-1]}", "kind": "financial_metric"}]
-    if period:
-        detail_lines, detail_sources = _period_lines(db, period, totals[period], scope)
+    sources: list[dict[str, Any]] = [{"name": f"财务汇总表 {'、'.join(selected)}", "kind": "financial_metric"}]
+    facts = []
+    for detail_period in selection.groups or ([period] if period else []):
+        if period_mod.is_month(detail_period):
+            detail_metric = totals[detail_period]
+        else:
+            # 季度/年度先合计金额再重算比率，不把月比率相加，也不交给模型求和。
+            members = [replace(totals[month], period=detail_period) for month in period_mod.months_of(detail_period)]
+            detail_metric = metric_totals(members, period_order=[detail_period])[0]
+        detail_lines, detail_sources, detail_facts = _period_lines(db, detail_period, detail_metric, scope)
+        facts.extend(metric_facts(detail_metric, scope))
+        facts.extend(detail_facts)
         lines += ["", *detail_lines]
         sources = detail_sources + sources
     lines += [
         "",
-        "使用口径提醒：收入金额来自源文件贷方(CR)记录，费用金额来自借方(DR)记录；源文件没有成本科目，"
-        "因此成本金额恒为 0，不能据此得出「成本极低」的结论。现金流入/流出未提供时间轴，一律按 0 处理，不代表无现金收付。",
+        "使用口径提醒：这里只包含已导入指标，不包含原因证明。成本为0可能来自源材料缺少成本科目，"
+        "不能仅凭0得出成本极低的结论。没有提供现金流时间轴，不得据此推断无现金收付。",
     ]
-    return {"has_data": True, "periods": periods, "period": period, "context": "\n".join(lines), "sources": sources}
+    return {"has_data": True, "periods": periods, "period": period, "context": "\n".join(lines), "sources": sources, "facts": facts}

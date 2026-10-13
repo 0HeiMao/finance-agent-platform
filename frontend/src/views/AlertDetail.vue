@@ -96,6 +96,9 @@ onMounted(load)
         </div>
         <div class="actions">
           <router-link class="btn" to="/analysis/alerts">← 返回预警监控</router-link>
+          <router-link v-if="alert" class="btn primary" :to="{ path: '/agent', query: { alert: alert.id } }"
+            >✦ 分析此异常</router-link
+          >
         </div>
       </header>
 

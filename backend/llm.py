@@ -76,6 +76,26 @@ class DeepSeekClient:
             usage.update(reported)
         return response.choices[0].message.content or "数据不足，无法生成可靠回答。"
 
+    def rank(self, question: str, instructions: str, model: str) -> str:
+        """重排使用独立指令及指定模型，不混入财务回答格式要求。"""
+        response = self.client.chat.completions.create(
+            model=model, temperature=0,
+            messages=[{"role": "system", "content": instructions},
+                      {"role": "user", "content": question}],
+        )
+        return response.choices[0].message.content or ""
+
+    def tool_turn(self, messages: list[dict], tools: list[dict], *, timeout: float,
+                  max_tokens: int) -> tuple[dict, dict]:
+        """一次原生工具选择；禁用 SDK 自动重试，重试预算由任务执行器管理。"""
+        response = self.client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
+            model=self.model, temperature=0, messages=messages, tools=tools,
+            max_tokens=max_tokens,
+        )
+        if not response.choices or response.choices[0].finish_reason == "length":
+            raise RuntimeError("模型响应为空或超过单轮输出上限")
+        return response.choices[0].message.model_dump(exclude_none=True), usage_of(response.usage)
+
     def _chunks(self, messages: list[dict], *, include_usage: bool):
         """逐块产出 `(文本, 用量)`：文本可能为 None（只有用量那个收尾块），用量通常是 {}。"""
         params = {"model": self.model, "temperature": 0.1, "stream": True, "messages": messages}

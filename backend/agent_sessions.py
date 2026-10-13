@@ -277,15 +277,19 @@ class SessionNotFound(LookupError):
 def resolve_session(db, user: User, session_id: int | None, question: str, scope=None) -> tuple[AgentSession, bool]:
     """取会话；没有就建一个（标题取第一条提问）。返回 (会话, 是否新建)。"""
     if session_id is not None:
-        session = db.get(AgentSession, session_id)
+        session = db.scalar(select(AgentSession).where(AgentSession.id == session_id).with_for_update())
         if session is None or session.user_id != user.id:
             raise SessionNotFound(f"会话 {session_id} 不存在")
+        from backend.agent_access import merge, require_access
+        require_access(user, session)
+        session.scope_snapshot = merge(session.scope_snapshot, scope)
         if not session.title:
             session.title = derive_title(question)
         if scope is not None and not session.scope:
             session.scope = scope_text(scope)
         return session, False
-    session = AgentSession(user_id=user.id, title=derive_title(question), scope=scope_text(scope))
+    from backend.agent_access import snapshot
+    session = AgentSession(user_id=user.id, title=derive_title(question), scope=scope_text(scope), scope_snapshot=snapshot(scope))
     db.add(session)
     db.flush()
     return session, True
@@ -299,13 +303,19 @@ def start_exchange(db, user: User, question: str, *, session_id: int | None = No
     否则生成器只能用自己那条连接去写一行还不存在（或不可见）的消息。
     """
     session, _ = resolve_session(db, user, session_id, question, scope=scope)
-    label = scope_text(scope) or session.scope
+    # resolve_session locks the row: concurrent tabs cannot launch another paid run in this session.
+    active = streaming_message(db, session.id)
+    if active is not None and effective_status(active) == "streaming":
+        from fastapi import HTTPException
+        raise HTTPException(409, "此会话仍有回答正在生成，请先恢复结果或停止生成")
+    from backend.agent_access import snapshot
+    label = scope_text(scope)
     user_message = AgentMessage(session_id=session.id, user_id=user.id, role="user",
                                 content=question, status="ok", scope=label,
-                                sources=[], knowledge_chunks=0)
+                                sources=[], knowledge_chunks=0, scope_snapshot=snapshot(scope))
     assistant = AgentMessage(session_id=session.id, user_id=user.id, role="assistant",
                              content="", status="streaming", scope=label,
-                             sources=[], knowledge_chunks=0)
+                             sources=[], knowledge_chunks=0, scope_snapshot=snapshot(scope))
     db.add_all([user_message, assistant])
     session.updated_at = datetime.now(UTC)
     # autoflush=False：不 flush 就拿不到两个新行的 id，SSE 的 event: start 也就报不出 message_id
@@ -405,6 +415,7 @@ def message_payload(message: AgentMessage, now: datetime | None = None) -> dict:
         "status_label": STATUS_LABELS.get(status, status),
         "error": message.error or "",
         "sources": list(message.sources or []),
+        "execution_trace": list(message.execution_trace or []),
         "period": message.period or "",
         "knowledge_chunks": int(message.knowledge_chunks or 0),
         "scope": message.scope or "",
@@ -420,10 +431,15 @@ def message_payload(message: AgentMessage, now: datetime | None = None) -> dict:
     }
 
 
-def list_sessions(db, *, user_id: int, limit: int = 50, offset: int = 0) -> tuple[list[AgentSession], int]:
-    total = db.execute(select(func.count(AgentSession.id)).where(AgentSession.user_id == user_id)).scalar_one()
+def list_sessions(db, *, user_id: int, limit: int = 50, offset: int = 0, user=None) -> tuple[list[AgentSession], int]:
+    from backend.scope import scope_of
+    filters = [AgentSession.user_id == user_id]
+    if user is not None and scope_of(user) is not None:
+        filters += [AgentSession.scope_snapshot["version"].as_integer() == 1,
+                    AgentSession.scope_snapshot["departments"].contained_by(list(scope_of(user)))]
+    total = db.execute(select(func.count(AgentSession.id)).where(*filters)).scalar_one()
     rows = db.execute(
-        select(AgentSession).where(AgentSession.user_id == user_id)
+        select(AgentSession).where(*filters)
         .order_by(AgentSession.updated_at.desc(), AgentSession.id.desc())
         .limit(limit).offset(offset)
     ).scalars().all()
@@ -440,7 +456,7 @@ def messages_of(db, session_id: int, *, limit: int = 400) -> list[AgentMessage]:
 
 
 def history_for(db, session_id: int, *, exclude_ids=(), max_turns: int, max_tokens: int,
-                limit: int = 400) -> dict:
+                limit: int = 400, user=None, scope_filter=None) -> dict:
     """挑出这个会话里能当上下文用的历史问答（⑰）——「那上个月呢？」能不能答，全看这里。
 
     三条规则，都是为了让「多带一点上下文」不变成「把成本带飞」：
@@ -456,11 +472,20 @@ def history_for(db, session_id: int, *, exclude_ids=(), max_turns: int, max_toke
     但显式排除能让"这一轮"与"历史"的边界由调用方说了算，而不是靠正文非空这个副作用。
     返回值里的 `truncated` 只表示"有更早的对话没带上"，不区分是被预算截断还是被关掉。
     """
+    from backend.agent_access import allows, require_access
+    if user is not None:
+        session = db.get(AgentSession, session_id)
+        if session is None or session.user_id != user.id:
+            raise SessionNotFound("会话不存在")
+        require_access(user, session)
     rows = messages_of(db, session_id, limit=limit)
     excluded = {int(item) for item in exclude_ids}
     pairs: list[list[AgentMessage]] = []
     pending: AgentMessage | None = None
     for row in rows:
+        if user is not None and (not allows(user, row.scope_snapshot) or (scope_filter is not None and row.scope_snapshot != scope_filter)):
+            pending = None
+            continue
         if row.id in excluded:
             continue
         if row.role == "user":

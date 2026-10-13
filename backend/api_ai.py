@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend import agent_sessions
+from backend.agent_access import snapshot
 from backend.ai_service import rag_answer
 from backend.api_rag import ChunkScope, retrieve_for_user, user_department_of
 from backend.auth import current_user
@@ -25,10 +27,18 @@ router = APIRouter(prefix="/api/v1/ai", tags=["ai"])
 
 class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
+    mode: Literal["workflow", "agent"] = "workflow"
+    alert_id: int | None = Field(None, ge=1)
+
+
+@router.get("/agent/alerts/{alert_id}/context")
+def get_alert_context(alert_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from backend.agent_context import alert_context
+    return alert_context(db, user, alert_id)[0]
 
 
 def _retrieve(question: str, db, user_department: ChunkScope = None) -> list:
-    """宽松阈值多召回 -> 部门过滤 -> 重排压缩到 5（规则与 /rag/answer 共用一份实现）。"""
+    """可见范围内召回 -> 防御性权限复核 -> 重排到至多 5 条。"""
     return retrieve_for_user(db, question, user_department, 5)
 
 
@@ -93,6 +103,11 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
     两件事因此成为可能——前端在流当中就知道 `message_id` 并能请求停止；
     进程半路没了也能在会话里看到一条"没写完的回答"，而不是什么都没有。
     """
+    if payload.mode == "agent":
+        from backend.agent_task_api import stream_task
+        return stream_task(payload.question, user, db, department, session_id, alert_id=payload.alert_id)
+    if payload.alert_id is not None:
+        raise HTTPException(400, "预警分析需要使用 Agent 模式")
     scope = user_department_of(user)
     # 财务数据的范围与知识库口径都只认服务端记录（scope_of），请求头自述一律不算数（⑳ 起连
     # 兼容参数都没有了）。department 只对不受限账号生效（受限账号填别的部门直接 403），
@@ -115,7 +130,8 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
     settings = get_settings()
     history = agent_sessions.history_for(
         db, session.id, exclude_ids=(user_message.id, assistant.id),
-        max_turns=settings.agent_history_max_turns, max_tokens=settings.agent_history_max_tokens)
+        max_turns=settings.agent_history_max_turns, max_tokens=settings.agent_history_max_tokens,
+        user=user, scope_filter=snapshot(financial_scope))
     history_text = "\n".join(f"{item['role']}：{item['content']}" for item in history["messages"])
 
     event = agent_sessions.register(assistant.id)
@@ -143,7 +159,7 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
             db2 = agent_sessions.open_session()
             try:
                 financial = collect_financial_evidence(db2, payload.question, financial_scope)
-                docs = _retrieve(payload.question, db2, scope)
+                docs = [] if financial.get("unavailable_message") else _retrieve(payload.question, db2, scope)
             finally:
                 db2.close()
             if financial["has_data"]:
@@ -162,7 +178,7 @@ def agent_stream(payload: Question, department: str | None = Query(None, max_len
             elif not financial["has_data"] and not docs:
                 # 没有证据就不花模型的 token，直接把平台自己的话吐出去（用量记 0，见 _persist）
                 count_estimate = False
-                text = "当前知识库里没有相关材料，系统内也没有已导入的财务数据，请先导入数据或补充材料后人工复核。"
+                text = financial.get("unavailable_message") or "当前知识库里没有相关材料，系统内也没有已导入的财务数据，请先导入数据或补充材料后人工复核。"
                 for part in [text[i:i+12] for i in range(0, len(text), 12)]:
                     if event.is_set():
                         status = "stopped"

@@ -294,6 +294,9 @@ watch(status, reload)
                     退回
                   </button>
                   <router-link class="link" :to="`/alerts/${a.id}`">明细 →</router-link>
+                  <router-link class="link" :to="{ path: '/agent', query: { alert: a.id } }"
+                    >分析此异常</router-link
+                  >
                 </td>
               </tr>
             </tbody>

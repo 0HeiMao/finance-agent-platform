@@ -33,6 +33,7 @@ from backend.alert_rules import COMPARATORS, ensure_rules, rule_scope_label
 from backend.auth import current_user, revoke_tokens, token_version_of
 from backend.config import get_settings
 from backend.db import get_db
+from backend.knowledge_access import manageable_chunks
 from backend.models import (
     AlertChannel,
     AlertDelivery,
@@ -753,7 +754,7 @@ def list_knowledge(
     limit: int = Query(50, ge=1, le=500),
     row_offset: int = Query(0, ge=0, alias="offset"),
     db: Session = Depends(get_db),
-    _: User = Depends(admin_user),
+    me: User = Depends(admin_user),
 ):
     """知识库来源聚合（分页 + 筛选）。
 
@@ -761,7 +762,7 @@ def list_knowledge(
     `matched_chunks` 是这些来源的片段数；再给一个全局 `all_chunks`，让页面能显示「命中 3 个来源 / 共 5 个片段」。
     片段级过滤（来源名、文档类型）必须在聚合前做 where，否则分页会把别人的片段算进命中数。
     """
-    clauses = []
+    clauses = [manageable_chunks(me)]
     if source:
         clauses.append(DocumentChunk.source.ilike(f"%{source}%"))
     if document_type:
@@ -798,17 +799,18 @@ def list_knowledge(
         for row in rows
     ]
     types = sorted(t for t in db.scalars(
-        select(func.distinct(DocumentChunk.document_type))).all() if t)
+        select(func.distinct(DocumentChunk.document_type)).where(manageable_chunks(me))).all() if t)
     return {"data": data, "total": total, "offset": row_offset, "limit": limit,
-            "matched_chunks": matched_chunks, "all_chunks": _count(db, DocumentChunk),
+            "matched_chunks": matched_chunks, "all_chunks": db.scalar(
+                select(func.count()).select_from(DocumentChunk).where(manageable_chunks(me))) or 0,
             "document_types": types}
 
 
-def _stored_paths(db: Session, source: str) -> set[str]:
+def _stored_paths(db: Session, source: str, *clauses) -> set[str]:
     """某个来源的片段引用到的上传件路径（`/rag/documents/upload` 写进 metadata 的那个）。"""
     rows = db.execute(
         select(DocumentChunk.metadata_json["stored_path"].astext)
-        .where(DocumentChunk.source == source)
+        .where(DocumentChunk.source == source, *clauses)
     ).all()
     return {row[0] for row in rows if row[0]}
 
@@ -843,15 +845,16 @@ def delete_knowledge(
     db: Session = Depends(get_db),
     me: User = Depends(admin_user),
 ):
-    """按来源整份删除知识库片段（管理员操作，不受部门限制）。
+    """按来源删除当前管理员可维护的知识库片段，不影响其他部门同名来源。
 
     片段删掉后，那次上传落盘的文档如果**没有别的来源再引用**，就成了谁也指不到的孤儿文件
     （路径只存在于刚被删掉的行里），所以这里顺手清理：先记下要删的片段引用了哪些路径，
     删除后再按路径数一遍引用数，归零才 unlink。
     """
-    candidates = _stored_paths(db, source)
+    condition = manageable_chunks(me)
+    candidates = _stored_paths(db, source, condition)
     deleted = db.execute(
-        delete(DocumentChunk).where(DocumentChunk.source == source)
+        delete(DocumentChunk).where(DocumentChunk.source == source, condition)
     ).rowcount or 0
     if not deleted:
         db.rollback()

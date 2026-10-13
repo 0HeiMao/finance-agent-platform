@@ -119,21 +119,33 @@ const visible = computed(() => (narrow.value ? props.open : true))
 </script>
 
 <template>
-  <aside class="sidebar" :class="{ open: visible }">
-    <div class="brand"><b>财</b><span>智能财务分析</span></div>
+  <button v-if="narrow && visible" class="nav-scrim" aria-label="关闭导航" @click="emit('request-close')" />
+  <aside
+    class="sidebar"
+    :class="{ open: visible }"
+    :inert="!visible"
+    aria-label="主导航"
+    @keydown.esc="emit('request-close')"
+  >
+    <div class="brand">
+      <b>财</b><span>智能财务分析<small>FINANCE WORKSPACE</small></span>
+    </div>
+    <button v-if="narrow && visible" class="nav-close" @click="emit('request-close')">关闭导航 ×</button>
     <section v-for="group in groups" :key="group.label" class="nav-group">
       <div class="nav-label">{{ group.label }}</div>
-      <div
+      <button
         v-for="item in group.items"
         :key="item.name"
         class="nav-item"
         :class="{ active: isActive(item), disabled: !item.path, accent: item.accent }"
         :title="item.note || item.name"
+        :aria-current="isActive(item) ? 'page' : undefined"
+        :disabled="!item.path"
         @click="go(item)"
       >
         <span class="icon">{{ item.icon || '▦' }}</span
         >{{ item.name }}
-      </div>
+      </button>
     </section>
     <slot />
   </aside>

@@ -228,6 +228,7 @@ async def demo(csv_path: Path, keep: bool) -> int:
             "/api/v1/rag/documents/upload",
             headers=headers,
             files={"file": (doc.name, doc.read_bytes(), "text/markdown")},
+            data={"publish_public": "true"},
         )
         print(f"POST /api/v1/rag/documents/upload -> HTTP {upd.status_code}")
         show(upd.json(), limit=12)

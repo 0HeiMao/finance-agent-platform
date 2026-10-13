@@ -34,6 +34,10 @@ function makeNode(type, text = '') {
     children: [],
     parent: null,
     value: '',
+    // vModelSelect 在 mounted/updated 中读取 options；保留真实候选节点供选择同步。
+    get options() {
+      return walk(this, (node) => node.type === 'option')
+    },
     addEventListener() {},
     removeEventListener() {},
     dispatchEvent() {
@@ -94,6 +98,7 @@ const renderer = createRenderer({
   },
   patchProp(el, key, _prev, next) {
     el.props[key] = next
+    if (key === 'value') el.value = next
     // `v-html` 的记录：对象树不解析 HTML，把它单独存一份给 textOf 用
     if (key === 'innerHTML') el.rawHtml = next
   }

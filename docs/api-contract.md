@@ -1,5 +1,9 @@
 # API 接口契约
 
+Agent模式的执行记录新增 state（程序解析条件）、tool_start（执行前状态）、validation（证据检查）和answer_check（supported/partial/insufficient_data/unverified等结果）。step事件可先发送同一步的running再发送终态，前端按step更新。done的history_turns为0：新模式仅恢复同口径任务条件，不传历史回答；state_inherited表示读取到了上轮条件。旧workflow模式的历史字段含义不变。
+
+Agent 工具模式：`POST /ai/agent/chat/stream` 请求增加可选 `mode: "agent" | "workflow"`（默认 workflow，前端显式选择 agent）。新增 SSE `progress` 和 `step`；done 增加 execution_trace 与 usage_complete。会话消息返回 execution_trace，读取权限与原消息一致。具体上限及兼容边界见 [Agent实现说明](agent-tool-workflow.md)。
+
 Base URL：`http://localhost:8000/api/v1`
 
 > 本文件是**手写**的散文契约（顺序、文案、脱敏这类「生成不出来的东西」都在这里）。机器可读的那一半由
@@ -518,8 +522,9 @@ HTTP 头只能是 latin-1，中文名直接写会让 Starlette 抛 `UnicodeEncod
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/rag/documents` | 直接写入文本片段；内容与已入库片段完全一致时跳过，返回 `{success,ids,skipped}` |
-| POST | `/rag/documents/upload` | 上传 txt/md/csv/pdf/docx；同来源同内容不重复入库，返回 `{success,source,chunks,skipped}` |
+| GET | `/rag/write-scope` | 返回 `{can_write,can_publish_public,departments}`；普通账号只读，部门管理员只维护授权部门，全公司管理员可发布公共资料 |
+| POST | `/rag/documents` | 管理员写入文本；须给 `department` 或明确 `publish_public=true`，缺少范围422、越权403；相同模型与部门范围内按内容去重，返回 `{success,ids,skipped}` |
+| POST | `/rag/documents/upload` | multipart上传 txt/md/csv/pdf/docx；须给表单 `department` 或 `publish_public=true`，与文本入口使用相同权限规则；返回 `{success,source,chunks,skipped}` |
 | POST | `/rag/search` | `{query,top_k}`，先多召回再重排 |
 | POST | `/rag/answer` | `{query,top_k}`；按 `scope_of(user)` 过滤（不受限可见全部，未分配部门只剩 `department IS NULL` 的公共资料）；**⑳ 起请求头不再参与判定** |
 
@@ -638,8 +643,8 @@ event: error\ndata: {"message":"模型暂时不可用"}\n\n
 | DELETE | `/admin/users/{id}` | 删除账号（只删登录凭据，不动财务数据）；**最后一个管理员删不得** → 400「不能删除最后一个管理员：删掉后这个库再没有人能管」 |
 | GET | `/admin/batches?limit=&offset=` | 按 `import_batch` 分组的批次列表（`total` 是批次个数，`limit` 上限 200） |
 | DELETE | `/admin/batches/{batch}` | 撤销批次：删明细 + 重算或清空受影响期间 |
-| GET | `/admin/knowledge?source=&document_type=&limit=&offset=` | 按来源聚合的知识库片段（一行 = 一个来源；返回 `total` 来源数、`matched_chunks` 片段数、`all_chunks` 全库片段数、`document_types`，`limit` 上限 500） |
-| DELETE | `/admin/knowledge?source=` | 按来源整份删除片段，并清理**没有别的来源再引用**的上传件（返回 `{"source","deleted_chunks","removed_files"}`；`stored_path` 落在 `rag_upload_dir` 之外的一律不删） |
+| GET | `/admin/knowledge?source=&document_type=&limit=&offset=` | 在管理员可维护范围内按来源聚合；返回 `total` 来源数、`matched_chunks` 片段数、`all_chunks` 可维护范围片段数及 `document_types`；部门过滤发生在聚合与分页之前，`limit` 上限500 |
+| DELETE | `/admin/knowledge?source=` | 只删除当前管理员可维护的同名来源片段，保留其他部门及无权限的公共片段；清理无其他引用的上传件，返回 `{source,deleted_chunks,removed_files}`，目录外文件不删除 |
 | GET | `/admin/alert-rules` | 预警规则一览（含 `comparators`、指标中文名 `metrics`、级别 `levels`、分档选项 `departments`/`periods`）；首次访问会补齐默认两条 |
 | POST | `/admin/alert-rules` | 新建**分档规则**：`{alert_type, department?, period?, metric_name, comparator, threshold_value, level, require_metric?, description?, enabled?}`，成功 **201** |
 | PUT | `/admin/alert-rules/id/{rule_id}` | 按 id 改一条规则（默认与分档同一端点）：`{department?, period?, metric_name?, comparator?, threshold_value?, level?, require_metric?, description?, enabled?}` |
@@ -975,3 +980,15 @@ detail 里记导出条数与当时的筛选条件。
 - `dry_run=true` 只统计不删除；`dry_run=false` 才真删，且**清理自己写一条 `audit.purge`**
   （detail：`keep_days`/`before`/`deleted`）。清理动作本身必须可查，否则它就是审计的漏洞。
 - 非管理员 `403`。
+
+### 预警进入 Agent 与可见证据
+
+- `GET /api/v1/ai/agent/sessions/{session_id}/messages/{message_id}`：只读恢复单条已落库消息，复核会话所有权和当前数据权限，不调用模型。返回消息状态、正文、来源及执行步骤；消息不属于该会话返回 404，权限收回返回 403。
+- 会话和消息新增内部 `scope_snapshot`（版本及完整部门列表）。历史列表在分页和计数之前过滤权限；读取及续聊再次核验。受限用户无法读取缺少可信范围快照的旧会话。
+- 同一会话已有有效的生成任务时，新生成返回 409。断线恢复使用消息 GET，不能用重新 POST 代替恢复；这不提供跨会话全局幂等保证。
+- 财务工具证据包含规范化 `facts`。模型输出 `fact_refs` 必须与证据的指标、期间、部门、数值和单位完全匹配，展示文字由后端生成；制度解释及因果推断仍需人工核验。
+
+- `GET /api/v1/ai/agent/alerts/{alert_id}/context`：Bearer 认证，返回服务器记录的预警编号、期间、部门、指标值、阈值和建议问题；不可见返回 403，不存在返回 404。
+- `POST /api/v1/ai/agent/chat/stream` 新增可选 `alert_id`（正整数，仅用于 `mode=agent`）。每次发送重新核验预警权限，工具查询范围锁定为该预警部门或全公司，不能通过全局部门选择器覆盖。
+- `step.evidence` 为有界的展示快照，包含 `id`、`scope_label`、`periods`、`excerpts`、`note`；同一内容保存到 `execution_trace`，旧记录可能没有此字段。片段按纯文本渲染。
+- 看板增加 `data_quality` 口径说明及 `cash.available`。现金流字段全部为零时 `available=false` 表示口径待核验，不代表真实现金流为零。成本全零也不直接认定为正常成本率。

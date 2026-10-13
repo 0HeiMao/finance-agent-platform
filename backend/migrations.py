@@ -50,6 +50,9 @@ from backend.rag import pgvector_store as _pgvector_store  # noqa: F401
 
 # (表名, 列名, DDL 片段)。DDL 里不要写 SQL 关键字大小写混用以外的花活，便于跨库阅读。
 COLUMNS: list[tuple[str, str, str]] = [
+    ("agent_sessions", "scope_snapshot", "JSONB"),
+    ("agent_messages", "scope_snapshot", "JSONB"),
+    ("agent_messages", "execution_trace", "JSONB DEFAULT '[]'::jsonb NOT NULL"),
     # 部门口径（部门行与全公司汇总行共存）
     ("financial_metrics", "department", "VARCHAR(100)"),
     ("financial_alerts", "department", "VARCHAR(100)"),

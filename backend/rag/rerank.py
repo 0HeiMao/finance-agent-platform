@@ -9,13 +9,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import Any
 
 from backend.config import get_settings
 
 RERANK_PROMPT = """你是检索重排器。下面有用户问题和若干编号文档片段。
-请只输出一个 JSON，形如 {"order": [编号,...]}，把与问题最相关的片段编号按相关度从高到低排列，只保留真正相关的编号，最多 {limit} 个。
+请只输出一个 JSON，形如 {{"order": [编号,...]}}，把与问题最相关的片段编号按相关度从高到低排列，只保留真正相关的编号，最多 {limit} 个。
 不要输出任何解释、Markdown 代码块或其他文字。"""
 
 
@@ -24,20 +25,16 @@ def _order_from_text(text: str, count: int) -> list[int]:
     import re
 
     cleaned = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.MULTILINE).strip()
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        parsed = None
-    candidates: Any = parsed.get("order") if isinstance(parsed, dict) else parsed
-    if candidates is None:
-        candidates = re.findall(r"\d+", cleaned)
+    parsed = json.loads(cleaned)
+    candidates: Any = parsed.get("order") if isinstance(parsed, dict) else None
+    if not isinstance(candidates, list):
+        raise ValueError("重排结果缺少 order 数组")
     order: list[int] = []
-    for item in candidates if isinstance(candidates, list) else []:
-        try:
-            index = int(item) - 1
-        except (TypeError, ValueError):
-            continue
-        if 0 <= index < count and index not in order:
+    for item in candidates:
+        if type(item) is not int or not 1 <= item <= count:
+            raise ValueError("重排结果包含非法编号")
+        index = item - 1
+        if index not in order:
             order.append(index)
     return order
 
@@ -54,17 +51,10 @@ def rerank(question: str, chunks: Sequence[Any], top_k: int) -> list[Any]:
             for index, chunk in enumerate(chunks)
         )
         prompt = f"用户问题：{question}\n\n文档片段：\n{catalog}"
-        text = get_llm().answer(prompt, RERANK_PROMPT.format(limit=top_k))
+        text = get_llm().rank(prompt, RERANK_PROMPT.format(limit=top_k), get_settings().rerank_model)
         order = _order_from_text(text, len(chunks))
     except Exception:
+        logging.getLogger("finance-ai").warning("检索重排失败，回退到向量排序")
         return list(chunks[:top_k])
-    if not order:
-        return list(chunks[:top_k])
-    picked = [chunks[index] for index in order[:top_k]]
-    taken = set(order[:top_k])
-    for index in range(len(chunks)):  # 重排模型漏掉的候选，按余弦顺序补齐到 top_k
-        if len(picked) >= top_k:
-            break
-        if index not in taken:
-            picked.append(chunks[index])
-    return picked
+    # 合法空数组表示没有相关片段，不再把模型剔除的噪声补回来。
+    return [chunks[index] for index in order[:top_k]]

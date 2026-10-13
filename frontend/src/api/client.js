@@ -35,11 +35,15 @@ export async function apiFetch(path, options = {}) {
     window.location.assign('/login')
     throw new Error('登录已过期')
   }
-  if (!response.ok) throw new Error(errorMessage((await response.json().catch(() => ({}))).detail))
+  if (!response.ok) {
+    const error = new Error(errorMessage((await response.json().catch(() => ({}))).detail))
+    error.status = response.status
+    throw error
+  }
   return response
 }
 
-export async function readSSE(path, body, { onStart, onDelta, onDone, onError, signal }) {
+export async function readSSE(path, body, { onStart, onDelta, onDone, onError, onStep, onProgress, signal }) {
   const response = await apiFetch(path, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -47,11 +51,17 @@ export async function readSSE(path, body, { onStart, onDelta, onDone, onError, s
     headers: { Accept: 'text/event-stream' }
   })
   const reader = response.body.getReader()
+  const cancel = () => {
+    reader.cancel().catch(() => {})
+  }
+  signal?.addEventListener('abort', cancel, { once: true })
   const decoder = new TextDecoder()
   let buffer = ''
+  let completed = false
   try {
     while (true) {
       const { value, done } = await reader.read()
+      if (signal?.aborted) throw new DOMException('已停止', 'AbortError')
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       const events = buffer.split('\n\n')
@@ -62,13 +72,24 @@ export async function readSSE(path, body, { onStart, onDelta, onDone, onError, s
         if (!data) continue
         const payload = JSON.parse(data)
         if (event === 'start') onStart?.(payload)
+        else if (event === 'step') onStep?.(payload)
+        else if (event === 'progress') onProgress?.(payload)
         else if (event === 'delta') onDelta?.(payload.text || '')
-        else if (event === 'done') onDone?.(payload)
-        else if (event === 'error') onError?.(payload)
+        else if (event === 'done') {
+          completed = true
+          onDone?.(payload)
+        } else if (event === 'error') {
+          completed = true
+          onError?.(payload)
+        }
       }
     }
+    if (!completed) throw new Error('连接提前结束，请重试或查看会话记录')
   } catch (error) {
-    onError?.({ message: error.message || '流式连接中断' })
+    if (error.name !== 'AbortError') onError?.({ message: error.message || '流式连接中断' })
     throw error
+  } finally {
+    signal?.removeEventListener('abort', cancel)
+    reader.releaseLock()
   }
 }

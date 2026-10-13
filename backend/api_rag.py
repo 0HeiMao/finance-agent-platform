@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from backend import audit
 from backend.auth import current_user
 from backend.config import get_settings
 from backend.db import get_db
+from backend.knowledge_access import write_department
 from backend.limits import ai_quota
 from backend.models import User
 from backend.rag.answer import generate_answer
@@ -24,7 +25,7 @@ from backend.rag.document_parser import extract_text, split_text
 from backend.rag.embeddings import get_embedding_service
 from backend.rag.pgvector_store import DocumentChunk, add_documents, search_documents
 from backend.rag.rerank import rerank
-from backend.scope import scope_of
+from backend.scope import is_admin, scope_of
 
 router = APIRouter(prefix="/api/v1/rag", tags=["rag"])
 
@@ -35,6 +36,7 @@ class DocumentInput(BaseModel):
     page: int | None = Field(default=None, ge=1)
     document_type: str | None = None
     department: str | None = Field(default=None, max_length=100)
+    publish_public: bool = False
 
 
 class SearchInput(BaseModel):
@@ -87,16 +89,18 @@ def filter_visible(chunks: Iterable, user_department: ChunkScope) -> list:
     ]
 
 
-def retrieve_for_user(db: Session, query: str, user_department: ChunkScope, top_k: int) -> list:
-    """宽松阈值多召回候选 -> 部门过滤 -> 重排压缩到 top_k。"""
+def retrieve_for_user(db: Session, query: str, user_department: ChunkScope, top_k: int, *, use_rerank: bool = True) -> list:
+    """在部门可见集合内召回候选 -> 防御性权限复核 -> 重排到至多 top_k。"""
     settings = get_settings()
     service = get_embedding_service()
     embedding = service.encode([query])[0]
     candidates = search_documents(
         db, embedding, max(settings.rag_candidate_k, min(top_k * 3, 50)),
         max_distance=settings.rag_max_distance, embedding_model=service.model_name,
+        departments=user_department,
     )
-    return rerank(query, filter_visible(candidates, user_department), top_k)
+    visible = filter_visible(candidates, user_department)
+    return rerank(query, visible, top_k) if use_rerank else visible[:top_k]
 
 
 def _existing_hashes(db: Session, embedding_model: str, department: str | None) -> set[str]:
@@ -116,30 +120,41 @@ def _existing_hashes(db: Session, embedding_model: str, department: str | None) 
 @router.post("/documents")
 def index_document(payload: DocumentInput, request: Request, db: Session = Depends(get_db),
                    user: User = Depends(current_user), _quota: None = Depends(ai_quota)) -> dict:
+    department = write_department(user, payload.department, payload.publish_public)
     try:
         model_name = get_embedding_service().model_name
         digest = _content_hash(payload.content)
-        if digest in _existing_hashes(db, model_name, payload.department):
+        if digest in _existing_hashes(db, model_name, department):
             return {"success": True, "ids": [], "skipped": 1,
                     "message": "内容与已入库片段完全一致（不看文件名），未重复入库"}
         ids = add_documents(db, [{"content": payload.content, "source": payload.source,
                                   "page": payload.page, "document_type": payload.document_type,
-                                  "metadata_json": {"department": payload.department, "embedding_model": model_name,
+                                  "metadata_json": {"department": department, "embedding_model": model_name,
                                                     "content_hash": digest},
                                   "embedding": get_embedding_service().encode([payload.content])[0]}])
         # 知识库内容会进入 Agent 的证据，写入必须留痕（记来源与片段数，不记正文）
         audit.record(db, user, "knowledge.add", target_type="knowledge", target_id=payload.source,
                      detail={"source": payload.source, "chunks": len(ids),
-                             "department": payload.department or "不受限"}, request=request, commit=True)
+                             "department": department, "public": department is None}, request=request, commit=True)
         return {"success": True, "ids": ids, "skipped": 0}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"向量入库失败：{exc}") from exc
 
 
+@router.get("/write-scope")
+def knowledge_write_scope(user: User = Depends(current_user)):
+    scope = scope_of(user)
+    return {"can_write": is_admin(user), "can_publish_public": is_admin(user) and scope is None,
+            "departments": scope}
+
+
 @router.post("/documents/upload")
 async def upload_document(request: Request, file: UploadFile = File(...),
+                          department: str | None = Form(None, max_length=100),
+                          publish_public: bool = Form(False),
                           db: Session = Depends(get_db), user: User = Depends(current_user),
                           _quota: None = Depends(ai_quota)) -> dict:
+    department = write_department(user, department, publish_public)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".txt", ".md", ".csv", ".pdf", ".docx"}:
         raise HTTPException(status_code=400, detail="仅支持 txt、md、csv、pdf、docx 文件")
@@ -154,8 +169,7 @@ async def upload_document(request: Request, file: UploadFile = File(...),
         if not chunks:
             raise ValueError("文档没有可索引的文本")
         model_name = get_embedding_service().model_name
-        # 上传的文件不带部门字段（metadata 里没有 department），所以按「不受限」范围去重。
-        existing = _existing_hashes(db, model_name, None)
+        existing = _existing_hashes(db, model_name, department)
         pending = [(index, chunk) for index, chunk in enumerate(chunks) if _content_hash(chunk) not in existing]
         skipped = len(chunks) - len(pending)
         if not pending:
@@ -164,14 +178,15 @@ async def upload_document(request: Request, file: UploadFile = File(...),
         embeddings = get_embedding_service().encode([chunk for _, chunk in pending])
         ids = add_documents(db, [
             {"content": chunk, "source": source,
-             "metadata_json": {"stored_path": str(target), "chunk_index": index,
+             "metadata_json": {"stored_path": str(target), "chunk_index": index, "department": department,
                                "embedding_model": model_name, "content_hash": _content_hash(chunk)},
              "embedding": embeddings[position]}
             for position, (index, chunk) in enumerate(pending)
         ])
         audit.record(db, user, "knowledge.add", target_type="knowledge", target_id=source,
                      detail={"source": source, "chunks": len(ids), "skipped": skipped,
-                             "filename": file.filename}, request=request, commit=True)
+                             "filename": file.filename, "department": department,
+                             "public": department is None}, request=request, commit=True)
         return {"success": True, "source": source, "chunks": len(ids), "skipped": skipped, "ids": ids}
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"文档处理失败：{exc}") from exc
@@ -189,10 +204,11 @@ def search_documents_api(payload: SearchInput, db: Session = Depends(get_db), us
             results = retrieve_for_user(db, payload.query, scope, payload.top_k)
             candidate_count = settings.rag_candidate_k
         else:
-            # 调用方自带向量（例如离线批量检索）：仍然先多召回、再按部门过滤、最后重排。
+            # 自带向量也必须在 SQL 内先限定可见范围；后置过滤作为防御性复核。
             candidates = search_documents(db, payload.embedding, settings.rag_candidate_k,
                                           max_distance=settings.rag_max_distance,
-                                          embedding_model=get_embedding_service().model_name)
+                                          embedding_model=get_embedding_service().model_name,
+                                          departments=scope)
             results = rerank(payload.query, filter_visible(candidates, scope), payload.top_k)
             candidate_count = len(candidates)
         return {
